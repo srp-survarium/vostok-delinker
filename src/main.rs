@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use capstone::arch::x86::{ArchMode, ArchSyntax};
+use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::arch::ArchOperand;
 use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
 
@@ -31,52 +32,90 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         .build()
         .expect("Cannot create Capstone context");
     print_instructions(functions, &capstone);
+}
 
-}
-type FilteredInstructions = Vec<u8>;
-fn filter_instructions(exe: Executable, capstone: &Capstone) -> FilteredInstructions {
-    for (_, fns) in &exe.functions {
-        for fun in fns {
-            if !fun.name.starts_with("vostok::") && !fun.name.starts_with("survarium::") {
-                continue;
-            }
-            let disassembleds = capstone
-                .disasm_all(&fun.data, fun.address as u64)
-                .expect("oopsie");
-            println!("{}  ", fun.name);
-            if fun.name.starts_with("vostok") || fun.name.starts_with("survarium") {
-                for disassembled in disassembleds.as_ref() {
-                    println!(
-                        "  {:#010x}: {} {}",
-                        disassembled.address(),
-                        disassembled.mnemonic().unwrap_or(""),
-                        disassembled.op_str().unwrap_or("")
-                    );
+fn print_instructions(exe: Executable, ctx: &Capstone) {
+    use capstone::arch::x86::X86InsnGroup::*;
+    use capstone::InsnGroupType::*;
+
+    let object = object::write::Object::new(
+        object::BinaryFormat::Coff,
+        object::Architecture::I386,
+        object::Endianness::Little,
+    );
+
+    let object_data = object.write().unwrap();
+    std::fs::write("./object.obj", object_data).unwrap();
+
+    const KNOWN_FUNCTIONS: &[&str] = &[
+        "vostok::render::static_render_model_instance::static_render_model_instance",
+        "btCollisionWorld::RayResultCallback::getShapeId",
+        // "vostok::network_core::buffer_to_send",
+    ];
+
+    let iter = exe
+        .functions
+        .values()
+        .filter(|funs| {
+            funs.iter()
+                .any(|fun| KNOWN_FUNCTIONS.contains(&fun.name.as_str()))
+        })
+        .map(|funs| &funs[0])
+        .take(10);
+
+    for fun in iter {
+        let disassembleds = ctx
+            .disasm_all(&fun.data, fun.address as u64)
+            .expect("oopsie");
+
+        println!(
+            "\n{} - {:#010x} <> {:#010x} ",
+            fun.name,
+            fun.address,
+            fun.address + fun.data.len(),
+        );
+        for ix in disassembleds.as_ref() {
+            let detail = ctx.insn_detail(ix).unwrap();
+            let groups = detail.groups().iter().map(|v| u32::from(v.0));
+            let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
+
+            let mut fn_name = None;
+            if is_branch {
+                let arch_detail = detail.arch_detail();
+                let ops = arch_detail.operands();
+                assert_eq!(ops.len(), 1);
+
+                let ArchOperand::X86Operand(X86Operand {
+                    op_type: X86OperandType::Imm(target_address),
+                    ..
+                }) = ops[0]
+                else {
+                    unreachable!()
+                };
+
+                let target_address = usize::try_from(target_address).unwrap();
+
+                let internal_branch =
+                    (fun.address..fun.address + fun.data.len()).contains(&target_address);
+
+                if !internal_branch {
+                    let target_fun = exe.functions.get(&target_address);
+                    if let Some(target_fun) = target_fun {
+                        fn_name = Some(&target_fun[0].name)
+                    }
                 }
             }
-        }
-    }
-}
-fn print_instructions(exe: Executable, capstone: &Capstone) {
-    for (_, fns) in &exe.functions {
-        for fun in fns {
-            if !fun.name.starts_with("vostok::") && !fun.name.starts_with("survarium::") {
-                continue;
-            }
-            let disassembleds = capstone
-                .disasm_all(&fun.data, fun.address as u64)
-                .expect("oopsie");
-            println!("{}  ", fun.name);
-            if fun.name.starts_with("vostok") || fun.name.starts_with("survarium") {
-                for disassembled in disassembleds.as_ref() {
-                    println!(
-                        "  {:#010x}: {} {}",
-                        disassembled.address(),
-                        disassembled.mnemonic().unwrap_or(""),
-                        disassembled.op_str().unwrap_or("")
-                    );
-                }
-            }
+
+            println!(
+                "  {:#010x}: {} {}{}",
+                ix.address(),
+                ix.mnemonic().unwrap_or(""),
+                ix.op_str().unwrap_or(""),
+                match fn_name {
+                    None => format!(""),
+                    Some(fn_name) => format!(" | CALLING {fn_name}"),
+                },
+            )
         }
     }
 }
