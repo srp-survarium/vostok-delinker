@@ -22,7 +22,6 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     pdb: pdb2::PDB<'static, S>,
 ) {
     let functions = extract_function(exe, pdb).unwrap();
-    println!("{}", functions.functions.len());
 
     let capstone = Capstone::new()
         .x86()
@@ -31,6 +30,55 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         .detail(true)
         .build()
         .expect("Cannot create Capstone context");
+    print_instructions(functions, &capstone);
+
+}
+type FilteredInstructions = Vec<u8>;
+fn filter_instructions(exe: Executable, capstone: &Capstone) -> FilteredInstructions {
+    for (_, fns) in &exe.functions {
+        for fun in fns {
+            if !fun.name.starts_with("vostok::") && !fun.name.starts_with("survarium::") {
+                continue;
+            }
+            let disassembleds = capstone
+                .disasm_all(&fun.data, fun.address as u64)
+                .expect("oopsie");
+            println!("{}  ", fun.name);
+            if fun.name.starts_with("vostok") || fun.name.starts_with("survarium") {
+                for disassembled in disassembleds.as_ref() {
+                    println!(
+                        "  {:#010x}: {} {}",
+                        disassembled.address(),
+                        disassembled.mnemonic().unwrap_or(""),
+                        disassembled.op_str().unwrap_or("")
+                    );
+                }
+            }
+        }
+    }
+}
+fn print_instructions(exe: Executable, capstone: &Capstone) {
+    for (_, fns) in &exe.functions {
+        for fun in fns {
+            if !fun.name.starts_with("vostok::") && !fun.name.starts_with("survarium::") {
+                continue;
+            }
+            let disassembleds = capstone
+                .disasm_all(&fun.data, fun.address as u64)
+                .expect("oopsie");
+            println!("{}  ", fun.name);
+            if fun.name.starts_with("vostok") || fun.name.starts_with("survarium") {
+                for disassembled in disassembleds.as_ref() {
+                    println!(
+                        "  {:#010x}: {} {}",
+                        disassembled.address(),
+                        disassembled.mnemonic().unwrap_or(""),
+                        disassembled.op_str().unwrap_or("")
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Default, Debug)]
