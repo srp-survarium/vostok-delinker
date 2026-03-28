@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 
+use capstone::arch::x86::{ArchMode, ArchSyntax};
+use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
+use capstone::Capstone;
+
 use object::{Object, ObjectSection};
 use pdb2::FallibleIterator;
 
@@ -19,6 +23,14 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 ) {
     let functions = extract_function(exe, pdb).unwrap();
     println!("{}", functions.functions.len());
+
+    let capstone = Capstone::new()
+        .x86()
+        .mode(ArchMode::Mode32)
+        .syntax(ArchSyntax::Intel)
+        .detail(true)
+        .build()
+        .expect("Cannot create Capstone context");
 }
 
 #[derive(Clone, Default, Debug)]
