@@ -1,0 +1,8 @@
+[package]
+name = "vostok-delinker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+capstone = "0.14.0"
+object = "0.38.1"
