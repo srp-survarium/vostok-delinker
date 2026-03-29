@@ -73,6 +73,8 @@ pub struct Function<'a> {
 //
 // 1. They suffer the same problem as mangled symbols search.
 // 2. It would be a good assumption to jump to a function in the same class.
+// 3. Which is currently not what is happening. This can be implemented with `msvc_demangler`
+//    crate, which allows parsing mangled functions to exact class and namespace names.
 //
 //
 // ## 4. sushi@TODO: Object file symbol generation
@@ -384,11 +386,13 @@ impl Executable<'static> {
                 *text_section_id,
                 object::write::Relocation {
                     offset: offset + reloc_start as u64,
-                    size: 32,
-                    kind: object::RelocationKind::Relative,
-                    encoding: object::RelocationEncoding::Generic,
                     symbol: reloc_symbol,
                     addend: -4,
+                    flags: object::RelocationFlags::Generic {
+                        kind: object::RelocationKind::Relative,
+                        encoding: object::RelocationEncoding::Generic,
+                        size: 32,
+                    },
                 },
             )?;
         }

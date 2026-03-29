@@ -5670,6 +5670,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?process_ray_query@bullet@survarium@@AAE?AW4collision_result@2@ABUclosest_ray_result@physics@vostok@@MAAVfloat3@math@6@1AAM2@Z": "_?process_ray_query@bullet@survarium@@AAE?AW4collision_result@2@ABUclosest_ray_result@physics@vostok@@MAAVfloat3@math@6@1AAM2@Z"
       }
     },
     {
