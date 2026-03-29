@@ -1,28 +1,29 @@
-#![expect(dead_code)]
-#![allow(unused_assignments)]
-#![allow(unused_imports)]
-#![allow(unused_mut)]
-#![allow(unused_variables)]
+#![feature(os_string_truncate)]
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
-use capstone::arch::x86::X86InsnGroup::*;
 use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
 use capstone::arch::ArchOperand;
 use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
 use capstone::InsnGroupType::*;
 
-use object::write::StandardSegment;
 use object::{Object, ObjectSection, SectionKind};
+
 use pdb2::{FallibleIterator, RawString};
 
 const EXECUTABLE: &[u8] = include_bytes!("../resources/survarium.exe");
 const DEBUG_SYMBOLS: &[u8] = include_bytes!("../resources/survarium.pdb");
 
 pub struct ObjectFiles<'a> {
-    pub objects: std::collections::HashMap<&'a [u8], object::write::Object<'static>>,
+    pub objects: HashMap<&'a [u8], ObjectFile>,
+}
+
+pub struct ObjectFile {
+    pub object: object::write::Object<'static>,
+    pub data_section_id: object::write::SectionId,
+    pub rdata_section_id: object::write::SectionId,
+    pub text_section_id: object::write::SectionId,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -31,7 +32,7 @@ pub struct Executable<'a> {
     // based on what function calls or jumps to.
     //
     // `Vec` is always `NonEmpty`.
-    pub functions: std::collections::HashMap<usize, Vec<Function<'a>>>,
+    pub functions: HashMap<usize, Vec<Function<'a>>>,
     // constants?
     // statics?
 }
@@ -43,7 +44,6 @@ pub struct Function<'a> {
     pub filename: Option<RawString<'a>>,
 
     pub address: usize,
-
     pub data: &'a [u8],
 }
 
@@ -88,180 +88,13 @@ pub struct Function<'a> {
 //  =. We most likely DON'T need anything in boost or Scaleform. All of that just takes precious time.
 //  =. We might still want `bullet` functions, since devs were updating its source code manually.
 
-fn main() {
-    let exe = object::File::parse(EXECUTABLE).unwrap();
-    let pdb = pdb2::PDB::open(std::io::Cursor::new(DEBUG_SYMBOLS)).unwrap();
+fn main() -> anyhow::Result<()> {
+    let exe = object::File::parse(EXECUTABLE)?;
+    let pdb = pdb2::PDB::open(std::io::Cursor::new(DEBUG_SYMBOLS))?;
 
-    // play_with_demangler();
-    process_executable(exe, pdb).unwrap();
-    // build_dummy_object_file();
-}
+    process_executable(exe, pdb)?;
 
-fn play_with_demangler() {
-    let mangled_names = [
-        "??0box_geometry_instance@collision@vostok@@QAE@ABVfloat4x4@math@2@@Z",
-        "??1box_geometry_instance@collision@vostok@@UAE@XZ",
-        "??_Gbox_geometry_instance@collision@vostok@@UAEPAXI@Z",
-        "?aabb_test@box_geometry_instance@collision@vostok@@UBE_NABVaabb@math@3@@Z",
-    ];
-    for mangled_name in mangled_names {
-        let name =
-            msvc_demangler::demangle(mangled_name, msvc_demangler::DemangleFlags::empty()).unwrap();
-        println!("{name}");
-
-        let data = msvc_demangler::parse(mangled_name).unwrap();
-        println!("{data:#?}\n");
-    }
-}
-
-fn build_dummy_object_file() {
-    let mut object = object::write::Object::new(
-        object::BinaryFormat::Coff,
-        object::Architecture::I386,
-        object::Endianness::Little,
-    );
-
-    let data_section_id = object.add_section(vec![], b".data".into(), SectionKind::Data);
-    let rdata_section_id = object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
-    let text_section_id = object.add_section(vec![], b".text".into(), SectionKind::Text);
-
-    let static_offset = object.append_section_data(
-        data_section_id,
-        &0x14_u32.to_le_bytes(),
-        std::mem::align_of::<u32>() as u64,
-    );
-
-    object.add_symbol(object::write::Symbol {
-        name: b"s_static_int".to_vec(),
-        value: static_offset, // offset of the symbol. Seems like needs to be tracked
-        size: u64::MAX,       // seems to be unused for COFF
-        kind: object::SymbolKind::Data,
-        scope: object::SymbolScope::Compilation,
-        weak: false,
-        section: object::write::SymbolSection::Section(data_section_id),
-        flags: object::SymbolFlags::None,
-    });
-
-    //
-    //
-    //
-
-    let hello_offset = object.append_section_data(
-        rdata_section_id,
-        b"Hello, World!\n\0",
-        std::mem::align_of::<u32>() as u64,
-    );
-    let bye_offset = object.append_section_data(
-        rdata_section_id,
-        b"Bye, World!\n\0",
-        std::mem::align_of::<u32>() as u64,
-    );
-
-    object.add_symbol(object::write::Symbol {
-        name: b"$SG3918".to_vec(),
-        value: hello_offset, // offset of the symbol. Seems like needs to be tracked
-        size: u64::MAX,      // seems to be unused for COFF
-        kind: object::SymbolKind::Data,
-        scope: object::SymbolScope::Compilation,
-        weak: false,
-        section: object::write::SymbolSection::Section(rdata_section_id),
-        flags: object::SymbolFlags::None,
-    });
-
-    object.add_symbol(object::write::Symbol {
-        name: b"$SG3919".to_vec(),
-        value: bye_offset, // offset of the symbol. Seems like needs to be tracked
-        size: u64::MAX,    // seems to be unused for COFF
-        kind: object::SymbolKind::Data,
-        scope: object::SymbolScope::Compilation,
-        weak: false,
-        section: object::write::SymbolSection::Section(rdata_section_id),
-        flags: object::SymbolFlags::None,
-    });
-
-    //
-    //
-    //
-
-    let fun1_offset = object.append_section_data(
-        text_section_id,
-        &[
-            0x55, 0x8B, 0xEC, 0x5D, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
-            0xCC, 0xCC,
-        ],
-        std::mem::align_of::<u32>() as u64,
-    );
-
-    let fun1_sym = object.add_symbol(object::write::Symbol {
-        name: b"?inner@detail@test@@YAXXZ".to_vec(),
-        value: fun1_offset, // offset of the symbol. Seems like needs to be tracked
-        size: u64::MAX,     // seems to be unused for COFF
-        kind: object::SymbolKind::Text,
-        scope: object::SymbolScope::Linkage,
-        weak: false,
-        section: object::write::SymbolSection::Section(text_section_id),
-        flags: object::SymbolFlags::None,
-    });
-
-    //
-
-    #[rustfmt::skip]
-    let fun2_offset = object.append_section_data(
-        text_section_id,
-        &[
-            0x55, 0x8B, 0xEC,              // prolog -- push ebp ; mov ebp, esp
-            0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
-            0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
-            0x5D, 0xC3, 0xCC,              // epilog -- pop ebp ; ret ; int3
-        ],
-        std::mem::align_of::<u32>() as u64,
-    );
-
-    let fun2_sym = object.add_symbol(object::write::Symbol {
-        name: b"?print_hello2@@YAXXZ".to_vec(),
-        value: fun2_offset, // offset of the symbol. Seems like needs to be tracked
-        size: u64::MAX,     // seems to be unused for COFF
-        kind: object::SymbolKind::Text,
-        scope: object::SymbolScope::Linkage,
-        weak: false,
-        section: object::write::SymbolSection::Section(text_section_id),
-        flags: object::SymbolFlags::None,
-    });
-
-    object
-        .add_relocation(
-            text_section_id,
-            object::write::Relocation {
-                offset: fun2_offset + 4,
-                size: 32,
-                kind: object::RelocationKind::Relative,
-                encoding: object::RelocationEncoding::Generic,
-                symbol: fun1_sym,
-                addend: -4,
-            },
-        )
-        .unwrap();
-
-    object
-        .add_relocation(
-            text_section_id,
-            object::write::Relocation {
-                offset: fun2_offset + 9,
-                size: 32,
-                kind: object::RelocationKind::Relative,
-                encoding: object::RelocationEncoding::Generic,
-                symbol: fun1_sym,
-                addend: -4,
-            },
-        )
-        .unwrap();
-
-    //
-    //
-    //
-
-    let object_data = object.write().unwrap();
-    std::fs::write("./objdiff/base/data.obj", object_data).unwrap();
+    Ok(())
 }
 
 fn process_executable<S: pdb2::Source<'static> + 'static>(
@@ -278,12 +111,14 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 
     let exe: &'static object::File = leak(exe);
 
-    Executable::parse(exe, pdb)?.build_object_files(&ctx)?;
+    let object_files = Executable::parse(exe, pdb)?.build_object_files(&ctx)?;
+
+    object_files.write(std::path::Path::new("objdiff/target"))?;
 
     Ok(())
 }
 
-impl<'a: 'static> Executable<'a> {
+impl Executable<'static> {
     fn parse<S: pdb2::Source<'static> + 'static>(
         exe: &'static object::File,
         mut pdb: pdb2::PDB<'static, S>,
@@ -377,31 +212,36 @@ impl<'a: 'static> Executable<'a> {
         };
 
         for fun in self.functions.values().flatten() {
-            const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok";
+            const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok\\";
             let filename: &'static [u8] = match fun.filename {
                 Some(filename) => match filename.as_bytes().strip_prefix(VOSTOK_PREFIX) {
                     Some(filename) => filename,
-                    None => continue,
+                    None => b"msvc_internal\\functions",
                 },
                 // See [2]
                 None => continue,
             };
 
             let object_file = object_files.objects.entry(filename).or_insert_with(|| {
-                let mut object_file = object::write::Object::new(
+                let mut object = object::write::Object::new(
                     object::BinaryFormat::Coff,
                     object::Architecture::I386,
                     object::Endianness::Little,
                 );
 
-                let _data_section_id =
-                    object_file.add_section(vec![], b".data".into(), SectionKind::Data);
-                let _rdata_section_id =
-                    object_file.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
-                let _text_section_id =
-                    object_file.add_section(vec![], b".text".into(), SectionKind::Text);
+                let data_section_id =
+                    object.add_section(vec![], b".data".into(), SectionKind::Data);
+                let rdata_section_id =
+                    object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
+                let text_section_id =
+                    object.add_section(vec![], b".text".into(), SectionKind::Text);
 
-                object_file
+                ObjectFile {
+                    object,
+                    data_section_id,
+                    rdata_section_id,
+                    text_section_id,
+                }
             });
 
             self.append_to_object_file(object_file, ctx, fun)?;
@@ -412,65 +252,126 @@ impl<'a: 'static> Executable<'a> {
 
     fn append_to_object_file(
         &self,
-        object_file: &mut object::write::Object,
+        object_file: &mut ObjectFile,
         ctx: &Capstone,
         fun: &Function,
     ) -> anyhow::Result<()> {
-        let mut data: Vec<u8> = Vec::new();
-        let mut rdata: Vec<u8> = Vec::new();
+        // let mut data: Vec<u8> = Vec::new();
+        // let mut rdata: Vec<u8> = Vec::new();
         let mut text: Vec<u8> = Vec::new();
+
+        let mut relocations: Vec<(usize, RawString)> = Vec::new();
 
         let ixs = ctx.disasm_all(&fun.data, fun.address as u64)?;
         for ix in ixs.iter() {
             let detail = ctx.insn_detail(ix)?;
+
             let groups = detail.groups().iter().map(|v| u32::from(v.0));
             let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
 
-            let mut fn_name = None;
-            if is_branch {
-                let arch_detail = detail.arch_detail();
-                let ops = arch_detail.operands();
-                assert_eq!(ops.len(), 1);
-
-                let ArchOperand::X86Operand(X86Operand {
-                    op_type: X86OperandType::Imm(target_address),
-                    ..
-                }) = ops[0]
-                else {
-                    unreachable!()
-                };
-
-                let target_address = usize::try_from(target_address)?;
-
-                let internal_branch =
-                    (fun.address..fun.address + fun.data.len()).contains(&target_address);
-                if !internal_branch {
-                    let target_fun = self.functions.get(&target_address);
-
-                    if let Some(target_fun) = target_fun {
-                        fn_name = Some(target_fun[0].name.clone());
-                    } else {
-                        // This happens in multiple cases:
-                        // * the decompiled assembly is actually not a code, but data (most often jump tables for switches)
-                        // * the target points to compiler generated(?) function, which doesn't seem to be in debug files.
-                        //  For example, vostok::network_core::http_client::handle_read_content
-                        //
-                        // This is fine, since this is rare, and we do not care for exact - 100% match of the assembly in all cases.
-                    };
-                }
+            if !is_branch {
+                text.extend_from_slice(ix.bytes());
+                continue;
             }
 
-            // println!(
-            //     "  {:#010x}: {} {}{}",
-            //     ix.address(),
-            //     ix.mnemonic().unwrap_or(""),
-            //     ix.op_str().unwrap_or(""),
-            //     match fn_name {
-            //         None => format!(""),
-            //         Some(fn_name) => format!(" | CALLING {fn_name}"),
-            //     },
-            // )
+            let arch_detail = detail.arch_detail();
+            let ops = arch_detail.operands();
+            assert_eq!(ops.len(), 1);
+
+            let ArchOperand::X86Operand(X86Operand {
+                op_type: X86OperandType::Imm(target_address),
+                ..
+            }) = ops[0]
+            else {
+                unreachable!()
+            };
+            let target_address = usize::try_from(target_address)?;
+
+            let internal_branch =
+                (fun.address..fun.address + fun.data.len()).contains(&target_address);
+            if internal_branch {
+                // sushi@TODO: Should offset be fixed?
+                text.extend_from_slice(ix.bytes());
+                continue;
+            }
+
+            match self.functions.get(&target_address) {
+                Some(target_funs) if ix.len() > 5 => {
+                    let (op, _addr) = ix
+                        .bytes()
+                        .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
+                    text.extend_from_slice(op);
+                    text.extend_from_slice(&0_u32.to_le_bytes());
+
+                    // text.extend_from_slice(ix.bytes());
+
+                    let reloc_name = find_closest_symbol(
+                        fun.name,
+                        target_funs.iter().map(|target_funs| &target_funs.name),
+                    );
+                    let reloc_start = text.len() - std::mem::size_of::<u32>();
+
+                    relocations.push((reloc_start, reloc_name));
+                }
+                // This usually covers data which is not meant to be instructions.
+                Some(_) | None => {
+                    text.extend_from_slice(ix.bytes());
+
+                    // let (op, _addr) = ix
+                    //     .bytes()
+                    //     .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
+                    // text.extend_from_slice(op);
+                    // text.extend_from_slice(&0_u32.to_le_bytes());
+                }
+            }
         }
+
+        let ObjectFile {
+            object,
+            data_section_id: _,
+            rdata_section_id: _,
+            text_section_id,
+        } = object_file;
+
+        let offset =
+            object.append_section_data(*text_section_id, &text, std::mem::size_of::<u32>() as u64);
+
+        for (reloc_start, reloc_name) in relocations {
+            let reloc_symbol = object.add_symbol(object::write::Symbol {
+                name: reloc_name.as_bytes().to_vec(),
+                value: 0,       // @TODO: Where can I get offset, when it is external?
+                size: u64::MAX, // @TODO: Seems to be unused for COFF
+                kind: object::SymbolKind::Text, // @TODO: Text is for internal symbols, right?
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(*text_section_id),
+                flags: object::SymbolFlags::None,
+            });
+
+            object.add_relocation(
+                *text_section_id,
+                object::write::Relocation {
+                    offset: offset + reloc_start as u64,
+                    size: 32,
+                    kind: object::RelocationKind::Relative,
+                    encoding: object::RelocationEncoding::Generic,
+                    symbol: reloc_symbol,
+                    addend: -4,
+                },
+            )?;
+        }
+
+        object.add_symbol(object::write::Symbol {
+            name: fun.mangled_name.unwrap_or(fun.name).as_bytes().to_vec(),
+            value: offset,
+            size: u64::MAX,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(*text_section_id),
+            flags: object::SymbolFlags::None,
+        });
+
         Ok(())
     }
 }
@@ -506,7 +407,7 @@ impl Function<'static> {
 
         let mangled_name: Option<RawString> = match mangled_table.get(&offset) {
             Some(symbols) if symbols.len() == 1 => Some(symbols[0]),
-            Some(symbols) => Some(find_closest_symbol(name, &symbols)),
+            Some(symbols) => Some(find_closest_symbol(name, symbols.iter())),
             None => None,
         };
 
@@ -520,9 +421,31 @@ impl Function<'static> {
     }
 }
 
+impl ObjectFiles<'_> {
+    fn write(self, base: &std::path::Path) -> anyhow::Result<()> {
+        let base_len = base.as_os_str().as_encoded_bytes().len();
+        let mut path = base.to_path_buf();
+
+        for (prefix, object_file) in self.objects {
+            path.as_mut_os_string().truncate(base_len);
+
+            path.push(std::str::from_utf8(prefix)?);
+            path.as_mut_os_string().push(".obj");
+
+            std::fs::create_dir_all(&path.parent().unwrap())?;
+            std::fs::write(&path, object_file.object.write()?)?;
+        }
+        Ok(())
+    }
+}
+
 // rfind + contains works for `&str`
 // windows + rposition works for `&[u8]`
-fn find_closest_symbol<'a, 'p>(name: RawString, symbols: &'a [RawString<'p>]) -> RawString<'p> {
+fn find_closest_symbol<'a, 'p, I>(name: RawString, symbols: I) -> RawString<'p>
+where
+    I: Iterator<Item = &'a RawString<'p>> + Clone,
+    'p: 'a,
+{
     let pure_name = {
         let idx = name
             .as_bytes()
@@ -533,7 +456,7 @@ fn find_closest_symbol<'a, 'p>(name: RawString, symbols: &'a [RawString<'p>]) ->
         &name.as_bytes()[idx..]
     };
     let closest_symbol = symbols
-        .iter()
+        .clone()
         .filter(|symbol| {
             symbol
                 .as_bytes()
@@ -545,9 +468,8 @@ fn find_closest_symbol<'a, 'p>(name: RawString, symbols: &'a [RawString<'p>]) ->
         return *closest_symbol;
     }
     *symbols
-        .iter()
         .min_by_key(|symbol| symbol.len())
-        .expect("Symbols might contain at least a single element")
+        .expect("Symbols must contain at least a single element")
 }
 
 // Most of those leaks have to exist to "leak" Streams which for some reason are owning in pdb crate.
@@ -591,7 +513,7 @@ fn leak<T>(object: T) -> &'static T {
 //
 // "vostok::render::static_render_model_instance::static_render_model_instance",
 // "btCollisionWorld::RayResultCallback::getShapeId",
-// "vostok::collision::object::object",
+//,
 // "vostok::network_core::buffer_to_send",
 // "vostok::animation::bone_names::create_internals_in_place",
 // "vostok::collision::box_geometry_instance",
@@ -636,4 +558,175 @@ fn leak<T>(object: T) -> &'static T {
 //         fun.address,
 //         fun.address + fun.data.len()
 //     );
+// }
+
+// [6]
+//
+// fn build_dummy_object_file() {
+//     let mut object = object::write::Object::new(
+//         object::BinaryFormat::Coff,
+//         object::Architecture::I386,
+//         object::Endianness::Little,
+//     );
+
+//     let data_section_id = object.add_section(vec![], b".data".into(), SectionKind::Data);
+//     let rdata_section_id = object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
+//     let text_section_id = object.add_section(vec![], b".text".into(), SectionKind::Text);
+
+//     let static_offset = object.append_section_data(
+//         data_section_id,
+//         &0x14_u32.to_le_bytes(),
+//         std::mem::align_of::<u32>() as u64,
+//     );
+
+//     object.add_symbol(object::write::Symbol {
+//         name: b"s_static_int".to_vec(),
+//         value: static_offset, // offset of the symbol. Seems like needs to be tracked
+//         size: u64::MAX,       // seems to be unused for COFF
+//         kind: object::SymbolKind::Data,
+//         scope: object::SymbolScope::Compilation,
+//         weak: false,
+//         section: object::write::SymbolSection::Section(data_section_id),
+//         flags: object::SymbolFlags::None,
+//     });
+
+//     //
+//     //
+//     //
+
+//     let hello_offset = object.append_section_data(
+//         rdata_section_id,
+//         b"Hello, World!\n\0",
+//         std::mem::align_of::<u32>() as u64,
+//     );
+//     let bye_offset = object.append_section_data(
+//         rdata_section_id,
+//         b"Bye, World!\n\0",
+//         std::mem::align_of::<u32>() as u64,
+//     );
+
+//     object.add_symbol(object::write::Symbol {
+//         name: b"$SG3918".to_vec(),
+//         value: hello_offset, // offset of the symbol. Seems like needs to be tracked
+//         size: u64::MAX,      // seems to be unused for COFF
+//         kind: object::SymbolKind::Data,
+//         scope: object::SymbolScope::Compilation,
+//         weak: false,
+//         section: object::write::SymbolSection::Section(rdata_section_id),
+//         flags: object::SymbolFlags::None,
+//     });
+
+//     object.add_symbol(object::write::Symbol {
+//         name: b"$SG3919".to_vec(),
+//         value: bye_offset, // offset of the symbol. Seems like needs to be tracked
+//         size: u64::MAX,    // seems to be unused for COFF
+//         kind: object::SymbolKind::Data,
+//         scope: object::SymbolScope::Compilation,
+//         weak: false,
+//         section: object::write::SymbolSection::Section(rdata_section_id),
+//         flags: object::SymbolFlags::None,
+//     });
+
+//     //
+//     //
+//     //
+
+//     let fun1_offset = object.append_section_data(
+//         text_section_id,
+//         &[
+//             0x55, 0x8B, 0xEC, 0x5D, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+//             0xCC, 0xCC,
+//         ],
+//         std::mem::align_of::<u32>() as u64,
+//     );
+
+//     let fun1_sym = object.add_symbol(object::write::Symbol {
+//         name: b"?inner@detail@test@@YAXXZ".to_vec(),
+//         value: fun1_offset, // offset of the symbol. Seems like needs to be tracked
+//         size: u64::MAX,     // seems to be unused for COFF
+//         kind: object::SymbolKind::Text,
+//         scope: object::SymbolScope::Linkage,
+//         weak: false,
+//         section: object::write::SymbolSection::Section(text_section_id),
+//         flags: object::SymbolFlags::None,
+//     });
+
+//     //
+
+//     #[rustfmt::skip]
+//     let fun2_offset = object.append_section_data(
+//         text_section_id,
+//         &[
+//             0x55, 0x8B, 0xEC,              // prolog -- push ebp ; mov ebp, esp
+//             0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
+//             0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
+//             0x5D, 0xC3, 0xCC,              // epilog -- pop ebp ; ret ; int3
+//         ],
+//         std::mem::align_of::<u32>() as u64,
+//     );
+
+//     let fun2_sym = object.add_symbol(object::write::Symbol {
+//         name: b"?print_hello2@@YAXXZ".to_vec(),
+//         value: fun2_offset, // offset of the symbol. Seems like needs to be tracked
+//         size: u64::MAX,     // seems to be unused for COFF
+//         kind: object::SymbolKind::Text,
+//         scope: object::SymbolScope::Linkage,
+//         weak: false,
+//         section: object::write::SymbolSection::Section(text_section_id),
+//         flags: object::SymbolFlags::None,
+//     });
+
+//     object
+//         .add_relocation(
+//             text_section_id,
+//             object::write::Relocation {
+//                 offset: fun2_offset + 4,
+//                 size: 32,
+//                 kind: object::RelocationKind::Relative,
+//                 encoding: object::RelocationEncoding::Generic,
+//                 symbol: fun1_sym,
+//                 addend: -4,
+//             },
+//         )
+//         .unwrap();
+
+//     object
+//         .add_relocation(
+//             text_section_id,
+//             object::write::Relocation {
+//                 offset: fun2_offset + 9,
+//                 size: 32,
+//                 kind: object::RelocationKind::Relative,
+//                 encoding: object::RelocationEncoding::Generic,
+//                 symbol: fun1_sym,
+//                 addend: -4,
+//             },
+//         )
+//         .unwrap();
+
+//     //
+//     //
+//     //
+
+//     let object_data = object.write().unwrap();
+//     std::fs::write("./objdiff/base/data.obj", object_data).unwrap();
+// }
+
+// 7
+//
+// fn play_with_demangler() {
+//     let mangled_names = [
+//         "??0box_geometry_instance@collision@vostok@@QAE@ABVfloat4x4@math@2@@Z",
+//         "??1box_geometry_instance@collision@vostok@@UAE@XZ",
+//         "??_Gbox_geometry_instance@collision@vostok@@UAEPAXI@Z",
+//         "?aabb_test@box_geometry_instance@collision@vostok@@UBE_NABVaabb@math@3@@Z",
+//     ];
+//     for mangled_name in mangled_names {
+//         let name =
+//             msvc_demangler::demangle(mangled_name, msvc_demangler::DemangleFlags::empty()).unwrap();
+//         println!("{name}");
+
+//         let data = msvc_demangler::parse(mangled_name).unwrap();
+//         println!("{data:#?}\n");
+//     }
 // }
