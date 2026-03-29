@@ -104,16 +104,52 @@ fn main() {
         flags: object::SymbolFlags::None,
     });
 
+    //
+
+    let fun2_offset = object.append_section_data(
+        text_section_id,
+        &[
+            0x55, 0x8B, 0xEC, 0xE8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5D,
+            0xC3, 0xCC,
+        ],
+        std::mem::align_of::<u32>() as u64,
+    );
+
+    let fun2_sym = object.add_symbol(object::write::Symbol {
+        name: b"?print_hello2@@YAXXZ".to_vec(),
+        value: fun2_offset, // offset of the symbol. Seems like needs to be tracked
+        size: u64::MAX,     // seems to be unused for COFF
+        kind: object::SymbolKind::Text,
+        scope: object::SymbolScope::Linkage,
+        weak: false,
+        section: object::write::SymbolSection::Section(text_section_id),
+        flags: object::SymbolFlags::None,
+    });
+
     object
         .add_relocation(
             text_section_id,
             object::write::Relocation {
-                offset: fun1_offset,
-                size: u8::MAX, // TODO
+                offset: fun2_offset + 4,
+                size: 32,
                 kind: object::RelocationKind::Relative,
                 encoding: object::RelocationEncoding::Generic,
                 symbol: fun1_sym,
-                addend: 4,
+                addend: -4,
+            },
+        )
+        .unwrap();
+
+    object
+        .add_relocation(
+            text_section_id,
+            object::write::Relocation {
+                offset: fun2_offset + 9,
+                size: 32,
+                kind: object::RelocationKind::Relative,
+                encoding: object::RelocationEncoding::Generic,
+                symbol: fun1_sym,
+                addend: -4,
             },
         )
         .unwrap();
@@ -123,11 +159,7 @@ fn main() {
     //
 
     let object_data = object.write().unwrap();
-    std::fs::write(
-        "E:\\Projects\\vostok-coff-delinker\\base\\data.obj",
-        object_data,
-    )
-    .unwrap();
+    std::fs::write("./objdiff/base/data.obj", object_data).unwrap();
 
     // process_executable(exe, pdb);
 }

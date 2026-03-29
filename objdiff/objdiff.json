@@ -1,0 +1,18 @@
+{
+  "build_base": false,
+  "build_target": false,
+  "units": [
+    {
+      "name": "data",
+      "target_path": "./target/data.obj",
+      "base_path": "./base/data.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?print_hello2@@YAXXZ": "_?print_hello2@@YAXXZ"
+      }
+    }
+  ]
+}
