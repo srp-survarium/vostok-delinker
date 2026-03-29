@@ -1,14 +1,18 @@
 #![expect(dead_code)]
+#![allow(unused_assignments)]
 #![allow(unused_imports)]
+#![allow(unused_mut)]
 #![allow(unused_variables)]
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use capstone::arch::x86::X86InsnGroup::*;
 use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
 use capstone::arch::ArchOperand;
 use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
+use capstone::InsnGroupType::*;
 
 use object::write::StandardSegment;
 use object::{Object, ObjectSection, SectionKind};
@@ -17,7 +21,9 @@ use pdb2::{FallibleIterator, RawString};
 const EXECUTABLE: &[u8] = include_bytes!("../resources/survarium.exe");
 const DEBUG_SYMBOLS: &[u8] = include_bytes!("../resources/survarium.pdb");
 
-// pub struct Objdiff
+pub struct ObjectFiles<'a> {
+    pub objects: std::collections::HashMap<&'a [u8], object::write::Object<'static>>,
+}
 
 #[derive(Clone, Default, Debug)]
 pub struct Executable<'a> {
@@ -272,7 +278,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 
     let exe: &'static object::File = leak(exe);
 
-    Executable::parse(exe, pdb)?.print_instructions(&ctx)?;
+    Executable::parse(exe, pdb)?.build_object_files(&ctx)?;
 
     Ok(())
 }
@@ -365,145 +371,105 @@ impl<'a: 'static> Executable<'a> {
         Ok(this)
     }
 
-    fn print_instructions(self, ctx: &Capstone) -> anyhow::Result<()> {
-        use capstone::arch::x86::X86InsnGroup::*;
-        use capstone::InsnGroupType::*;
+    fn build_object_files(self, ctx: &Capstone) -> anyhow::Result<ObjectFiles<'static>> {
+        let mut object_files = ObjectFiles {
+            objects: HashMap::new(),
+        };
 
-        const KNOWN_FUNCTIONS: &[&str] = &[
-        // "vostok::render::static_render_model_instance::static_render_model_instance",
-        // "btCollisionWorld::RayResultCallback::getShapeId",
-        // "vostok::collision::object::object",
-        // "vostok::network_core::buffer_to_send",
-        // "vostok::animation::bone_names::create_internals_in_place",
-        // "vostok::collision::box_geometry_instance",
-        // "vostok::",
-        // "survarium::",
-        ];
+        for fun in self.functions.values().flatten() {
+            const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok";
+            let filename: &'static [u8] = match fun.filename {
+                Some(filename) => match filename.as_bytes().strip_prefix(VOSTOK_PREFIX) {
+                    Some(filename) => filename,
+                    None => continue,
+                },
+                // See [2]
+                None => continue,
+            };
 
-        const SKIP_FUNCTIONS: &[&str] = &[
-            "boost::",
-            "Scaleform::",
-            "stlp_std::",
-            //
-            "survarium::",
-            "vostok::",
-            // "survarium::",
-        ];
-
-        // # Static function in namespace
-        //
-        // vostok::render::get_world_to_decal_matrix
-        // <NO MANGLED NAME>
-        // c:\survarium\sources\vostok\render\engine\sources\decal_instance.cpp
-        //
-        //
-        // # Static function without namespace
-        //
-        // free_region_impl
-        // <NO MANGLED NAME>
-        // c:\survarium\sources\vostok\core\sources\memory_win.cpp
-        //
-        //
-        // # Compiler generate function in namespace
-        //
-        // vostok::animation::`dynamic atexit destructor for 's_bi_spline_skeleton_animation_impl_cook''
-        // <NO MANGLED NAME>
-        // c:\survarium\sources\vostok\animation\sources\bi_spline_skeleton_animation_impl_cook.cpp
-
-        let iter = self
-            .functions
-            .values()
-            .flat_map(|funs| funs.iter()) // NOTE
-            .filter(|fun| {
-                let in_source_code = matches!(
-                    &fun.filename,
-                    Some(filename) if filename.as_bytes().starts_with(b"c:\\survarium\\sources\\vostok"),
+            let object_file = object_files.objects.entry(filename).or_insert_with(|| {
+                let mut object_file = object::write::Object::new(
+                    object::BinaryFormat::Coff,
+                    object::Architecture::I386,
+                    object::Endianness::Little,
                 );
-                if in_source_code {
-                    return true;
-                }
 
-                let fun_name = fun.name.as_bytes();
-                let in_known_modules = fun_name.starts_with(b"survarium::")
-                    || fun_name.starts_with(b"vostok::")
-                    || fun_name.starts_with(b"`survarium::")
-                    || fun_name.starts_with(b"`vostok::");
+                let _data_section_id =
+                    object_file.add_section(vec![], b".data".into(), SectionKind::Data);
+                let _rdata_section_id =
+                    object_file.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
+                let _text_section_id =
+                    object_file.add_section(vec![], b".text".into(), SectionKind::Text);
 
-                in_known_modules
+                object_file
             });
-        // .map(|funs| &funs[0]); // @NOTE
 
-        for fun in iter {
-            if fun.filename.is_some() {
-                continue; // NOTE
-            }
+            self.append_to_object_file(object_file, ctx, fun)?;
+        }
 
-            let disassembleds = ctx.disasm_all(&fun.data, fun.address as u64)?;
+        Ok(object_files)
+    }
 
-            let fun_name = fun.name.to_string();
+    fn append_to_object_file(
+        &self,
+        object_file: &mut object::write::Object,
+        ctx: &Capstone,
+        fun: &Function,
+    ) -> anyhow::Result<()> {
+        let mut data: Vec<u8> = Vec::new();
+        let mut rdata: Vec<u8> = Vec::new();
+        let mut text: Vec<u8> = Vec::new();
 
-            let fun_mangled_name = fun.mangled_name.map(|name| name.to_string());
-            let fun_mangled_name = fun_mangled_name.as_deref().unwrap_or("<NO MANGLED NAME>");
+        let ixs = ctx.disasm_all(&fun.data, fun.address as u64)?;
+        for ix in ixs.iter() {
+            let detail = ctx.insn_detail(ix)?;
+            let groups = detail.groups().iter().map(|v| u32::from(v.0));
+            let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
 
-            let fun_filename = fun.filename.map(|name| name.to_string());
-            let fun_filename = fun_filename.as_deref().unwrap_or("<NO FILNAME>");
+            let mut fn_name = None;
+            if is_branch {
+                let arch_detail = detail.arch_detail();
+                let ops = arch_detail.operands();
+                assert_eq!(ops.len(), 1);
 
-            println!(
-                "\n{fun_name}\n{fun_mangled_name}\n{fun_filename}\n{:#010x} {:#010x} ",
-                fun.address,
-                fun.address + fun.data.len()
-            );
+                let ArchOperand::X86Operand(X86Operand {
+                    op_type: X86OperandType::Imm(target_address),
+                    ..
+                }) = ops[0]
+                else {
+                    unreachable!()
+                };
 
-            for ix in disassembleds.as_ref() {
-                let detail = ctx.insn_detail(ix)?;
-                let groups = detail.groups().iter().map(|v| u32::from(v.0));
-                let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
+                let target_address = usize::try_from(target_address)?;
 
-                let mut fn_name = None;
-                if is_branch {
-                    let arch_detail = detail.arch_detail();
-                    let ops = arch_detail.operands();
-                    assert_eq!(ops.len(), 1);
+                let internal_branch =
+                    (fun.address..fun.address + fun.data.len()).contains(&target_address);
+                if !internal_branch {
+                    let target_fun = self.functions.get(&target_address);
 
-                    let ArchOperand::X86Operand(X86Operand {
-                        op_type: X86OperandType::Imm(target_address),
-                        ..
-                    }) = ops[0]
-                    else {
-                        unreachable!()
+                    if let Some(target_fun) = target_fun {
+                        fn_name = Some(target_fun[0].name.clone());
+                    } else {
+                        // This happens in multiple cases:
+                        // * the decompiled assembly is actually not a code, but data (most often jump tables for switches)
+                        // * the target points to compiler generated(?) function, which doesn't seem to be in debug files.
+                        //  For example, vostok::network_core::http_client::handle_read_content
+                        //
+                        // This is fine, since this is rare, and we do not care for exact - 100% match of the assembly in all cases.
                     };
-
-                    let target_address = usize::try_from(target_address)?;
-
-                    let internal_branch =
-                        (fun.address..fun.address + fun.data.len()).contains(&target_address);
-                    if !internal_branch {
-                        let target_fun = self.functions.get(&target_address);
-
-                        if let Some(target_fun) = target_fun {
-                            fn_name = Some(target_fun[0].name.clone());
-                        } else {
-                            // This happens in multiple cases:
-                            // * the decompiled assembly is actually not a code, but data (most often jump tables for switches)
-                            // * the target points to compiler generated(?) function, which doesn't seem to be in debug files.
-                            //  For example, vostok::network_core::http_client::handle_read_content
-                            //
-                            // This is fine, since this is rare, and we do not care for exact - 100% match of the assembly in all cases.
-                        };
-                    }
                 }
-
-                // println!(
-                //     "  {:#010x}: {} {}{}",
-                //     ix.address(),
-                //     ix.mnemonic().unwrap_or(""),
-                //     ix.op_str().unwrap_or(""),
-                //     match fn_name {
-                //         None => format!(""),
-                //         Some(fn_name) => format!(" | CALLING {fn_name}"),
-                //     },
-                // )
             }
+
+            // println!(
+            //     "  {:#010x}: {} {}{}",
+            //     ix.address(),
+            //     ix.mnemonic().unwrap_or(""),
+            //     ix.op_str().unwrap_or(""),
+            //     match fn_name {
+            //         None => format!(""),
+            //         Some(fn_name) => format!(" | CALLING {fn_name}"),
+            //     },
+            // )
         }
         Ok(())
     }
@@ -588,3 +554,86 @@ fn find_closest_symbol<'a, 'p>(name: RawString, symbols: &'a [RawString<'p>]) ->
 fn leak<T>(object: T) -> &'static T {
     Box::leak(Box::new(object))
 }
+
+// [2]
+//
+// survarium::game_scene::~game_scene
+// survarium::link_resolver::link_resolver
+// survarium::rifle_scope::~rifle_scope
+// survarium::simple_animation_controller_parameters::operator=
+// vostok::ai::fsm_state::fsm_state
+// vostok::ai::npc_statistics::npc_statistics
+// vostok::ai::npc_statistics::~npc_statistics
+// vostok::ai::planning::base_lexeme::`vcall'{12}'
+// vostok::ai::planning::base_lexeme::`vcall'{4}'
+// vostok::ai::planning::base_lexeme::`vcall'{8}'
+// vostok::ai::statistics_item<46,16>::~statistics_item<46,16>
+// vostok::animation::fermi_interpolator::~fermi_interpolator
+// vostok::animation::instant_interpolator::~instant_interpolator
+// vostok::animation::mixing::animation_interval::~animation_interval
+// vostok::fs_new::physical_path_info_data::physical_path_info_data
+// vostok::memory::stack_allocator::~stack_allocator
+// vostok::particle::lod_entry::lod_entry
+// vostok::render::environment_probe_properties::operator=
+// vostok::render::functor_command::~functor_command
+// vostok::render::sky_ambient_occlusion_properties::operator=
+// vostok::render::sky_dome_geometry::~sky_dome_geometry
+// vostok::render::sliced_cube_geometry::~sliced_cube_geometry
+// vostok::render::sphere_geometry::~sphere_geometry
+// vostok::render::stage_lights::lights_instance::lights_instance
+// vostok::render::stage_view_mode::~stage_view_mode
+// vostok::vfs::async_callbacks_data::~async_callbacks_data
+// vostok::vfs::find_environment::find_environment
+// vostok::vfs::query_mount_arguments::query_mount_arguments
+// vostok::vfs::virtual_file_system::~virtual_file_system
+
+// [3]
+//
+// "vostok::render::static_render_model_instance::static_render_model_instance",
+// "btCollisionWorld::RayResultCallback::getShapeId",
+// "vostok::collision::object::object",
+// "vostok::network_core::buffer_to_send",
+// "vostok::animation::bone_names::create_internals_in_place",
+// "vostok::collision::box_geometry_instance",
+// "vostok::",
+// "survarium::",
+
+// [4]
+//
+// # Static function in namespace
+//
+// vostok::render::get_world_to_decal_matrix
+// <NO MANGLED NAME>
+// c:\survarium\sources\vostok\render\engine\sources\decal_instance.cpp
+//
+//
+// # Static function without namespace
+//
+// free_region_impl
+// <NO MANGLED NAME>
+// c:\survarium\sources\vostok\core\sources\memory_win.cpp
+//
+//
+// # Compiler generate function in namespace
+//
+// vostok::animation::`dynamic atexit destructor for 's_bi_spline_skeleton_animation_impl_cook''
+// <NO MANGLED NAME>
+// c:\survarium\sources\vostok\animation\sources\bi_spline_skeleton_animation_impl_cook.cpp
+
+// [5]
+//
+// {
+//     let fun_name = fun.name.to_string();
+//
+//     let fun_mangled_name = fun.mangled_name.map(|name| name.to_string());
+//     let fun_mangled_name = fun_mangled_name.as_deref().unwrap_or("<NO MANGLED NAME>");
+//
+//     let fun_filename = fun.filename.map(|name| name.to_string());
+//     let fun_filename = fun_filename.as_deref().unwrap_or("<NO FILNAME>");
+//
+//     println!(
+//         "\n{fun_name}\n{fun_mangled_name}\n{fun_filename}\n{:#010x} {:#010x} ",
+//         fun.address,
+//         fun.address + fun.data.len()
+//     );
+// }
