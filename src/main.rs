@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
-use capstone::arch::ArchOperand;
-use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
+use capstone::arch::ArchOperand;
+use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 
 use object::write::StandardSegment;
 use object::{Object, ObjectSection, SectionKind};
@@ -106,11 +106,14 @@ fn main() {
 
     //
 
+    #[rustfmt::skip]
     let fun2_offset = object.append_section_data(
         text_section_id,
         &[
-            0x55, 0x8B, 0xEC, 0xE8, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5D,
-            0xC3, 0xCC,
+            0x55, 0x8B, 0xEC,              // prolog -- push ebp ; mov ebp, esp
+            0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
+            0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
+            0x5D, 0xC3, 0xCC,              // epilog -- pop ebp ; ret ; int3
         ],
         std::mem::align_of::<u32>() as u64,
     );
@@ -181,8 +184,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 }
 
 fn print_instructions(exe: Executable, ctx: &Capstone) {
-    use capstone::arch::x86::X86InsnGroup::*;
     use capstone::InsnGroupType::*;
+    use capstone::arch::x86::X86InsnGroup::*;
 
     const KNOWN_FUNCTIONS: &[&str] = &[
         // "vostok::render::static_render_model_instance::static_render_model_instance",
