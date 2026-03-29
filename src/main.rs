@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use capstone::Capstone;
-use capstone::arch::ArchOperand;
 use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::arch::ArchOperand;
 use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
+use capstone::Capstone;
 
 use object::write::StandardSegment;
 use object::{Object, ObjectSection, SectionKind};
@@ -181,8 +181,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 }
 
 fn print_instructions(exe: Executable, ctx: &Capstone) {
-    use capstone::InsnGroupType::*;
     use capstone::arch::x86::X86InsnGroup::*;
+    use capstone::InsnGroupType::*;
 
     const KNOWN_FUNCTIONS: &[&str] = &[
         // "vostok::render::static_render_model_instance::static_render_model_instance",
@@ -318,7 +318,6 @@ fn extract_function<S: pdb2::Source<'static> + 'static>(
     //
 
     let text_section_address = text_sec.address() as usize;
-    println!("TEXT SECTION ADDRESS {:#010x}", text_section_address);
     let text_data = text_sec.data()?;
 
     let dbi = pdb.debug_information()?;
