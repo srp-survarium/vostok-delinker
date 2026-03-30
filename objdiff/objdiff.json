@@ -63,6 +63,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?length@?$impl@Uvertex_type@search_service@search@sound@vostok@@@base@path_constructor@ai@vostok@@KAIPBUvertex_type@search_service@search@sound@5@@Z": "_?length@?$impl@Uvertex_type@search_base@planning@ai@vostok@@@base@path_constructor@ai@vostok@@KAIPBUvertex_type@search_base@planning@45@@Z"
       }
     },
     {
@@ -81,6 +84,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?construct_path@?$impl@Uvertex_type@search_base@planning@ai@vostok@@V?$vector@I@45@@planner_backward@path_constructor@ai@vostok@@QAEXAAUvertex_type@search_base@planning@45@@Z": "_?construct_path@?$impl@Uvertex_type@search_base@planning@ai@vostok@@V?$vector@I@45@@planner_backward@path_constructor@ai@vostok@@QAEXAAUvertex_type@search_base@planning@45@@Z"
       }
     },
     {
@@ -3834,6 +3840,11 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "??0custom_operation_query@fs_new@vostok@@QAE@ABUquery_custom_operation_args@12@PAVbase_allocator@memory@2@ABVdevice_file_system_no_watcher_proxy@12@@Z": "_operator delete",
+        "??_Gnull_device_query@fs_new@vostok@@UAEPAXI@Z": "_??_Gnull_device_query@fs_new@vostok@@UAEPAXI@Z",
+        "?execute@breath_state@survarium@@UAEXXZ": "_?execute@breath_state@survarium@@UAEXXZ"
       }
     },
     {

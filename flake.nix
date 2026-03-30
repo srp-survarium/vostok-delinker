@@ -20,13 +20,20 @@
     {
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
-          rust-bin.nightly.latest.default
+          (rust-bin.nightly.latest.default.override {
+            extensions = [
+              "rust-analyzer"
+              "rust-src"
+            ];
+          })
           rustfmt
           git
           pkg-config
           openssl
         ];
-        shellHook = "exec fish";
+        hellHook = ''
+          unset NIX_CFLAGS_COMPILE
+        '';
       };
     };
 }

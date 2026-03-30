@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
-use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
-use capstone::arch::ArchOperand;
-use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
 use capstone::InsnGroupType::*;
+use capstone::arch::ArchOperand;
+use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 
 use object::{Object, ObjectSection, SectionKind};
 
@@ -474,13 +474,53 @@ impl ObjectFiles<'_> {
     }
 }
 
+type Class = [u8];
+fn get_class(name: &[u8]) -> Option<&Class> {
+    if name.starts_with(b"vostok::") {
+        let mut end_idx = name.windows(2).rposition(|w| w == b"::")?;
+
+        let is_template = end_idx > 0 && name[end_idx - 1] == b'>';
+
+        if is_template {
+            let mut counter = 0;
+            for idx in (0..end_idx).rev() {
+                match &name[idx] {
+                    &b'>' => counter += 1,
+                    &b'<' => counter -= 1,
+                    _ => continue,
+                }
+                if counter == 0 {
+                    end_idx = idx;
+                    break;
+                }
+            }
+        };
+
+        // end_idx is either end of class or end of template - 1 (which is also end of class :D)
+        let start_idx = name[..end_idx]
+            .windows(2)
+            .rposition(|w| w == b"::")
+            .map(|i| i + 2)
+            .unwrap_or(0);
+        if start_idx == 0 {
+            return None;
+        }
+        let blah = std::str::from_utf8(&name[start_idx..end_idx]).unwrap();
+        println!("{blah}");
+        return Some(&name[start_idx..end_idx]);
+    } else {
+        None
+    }
+}
 // rfind + contains works for `&str`
 // windows + rposition works for `&[u8]`
+// (zedddie) pass mangled here to actually distinguish between namespaces and classes. (?)
 fn find_closest_symbol<'a, 'p, I>(name: RawString, symbols: I) -> RawString<'p>
 where
     I: Iterator<Item = &'a RawString<'p>> + Clone,
     'p: 'a,
 {
+    let _ = get_class(name.as_bytes());
     let pure_name = {
         let idx = name
             .as_bytes()
