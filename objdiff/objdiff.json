@@ -168,6 +168,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "??1?$impl@Uvertex_type@search_base@planning@ai@vostok@@@fixed_count@vertex_allocator@ai@vostok@@QAE@XZ": "_vostok::memory::base_allocator::malloc_impl"
       }
     },
     {
@@ -2382,6 +2385,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?deallocate_resource@binary_config_cook_impl@configs@core@vostok@@UAEXPAX@Z": "_?deallocate_resource@binary_config_cook_impl@configs@core@vostok@@UAEXPAX@Z"
       }
     },
     {
