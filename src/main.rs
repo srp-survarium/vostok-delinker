@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
-use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
-use capstone::arch::ArchOperand;
-use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
 use capstone::InsnGroupType::*;
+use capstone::arch::ArchOperand;
+use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 
 use object::{Object, ObjectSection, SectionKind};
 
@@ -499,6 +499,39 @@ impl ObjectFiles<'_> {
     }
 }
 
+fn skip_templates(candidate: &[u8]) -> Option<usize> {
+    let mut counter = 0_i32;
+    for idx in (0..candidate.len() - 1).rev() {
+        match &candidate[idx] {
+            &b'>' => counter += 1,
+            &b'<' => counter -= 1,
+            &b':' if counter == 0 && candidate[idx + 1] == b':' => return Some(idx),
+            _ => continue,
+        }
+    }
+    return None;
+}
+
+type Class = [u8];
+fn get_class(name: &[u8]) -> Option<&Class> {
+    if name.starts_with(b"vostok::") {
+        let mut end_idx = skip_templates(name)?;
+
+        let start_idx = skip_templates(&name[..end_idx]).map(|i| i + 2).unwrap_or(0);
+        if start_idx == 0 {
+            return None;
+        }
+        Some(&name[start_idx..end_idx])
+    } else {
+        None
+    }
+}
+
+fn mangled_contain_class(mangled: &[u8], class: &Class) -> bool {
+    mangled
+        .windows(class.len() + 2)
+        .any(|m| m[0] == b'@' && m[m.len() - 1] == b'@' && &m[1..m.len() - 1] == class)
+}
 // rfind + contains works for `&str`
 // windows + rposition works for `&[u8]`
 fn find_closest_symbol<'a, 'p, I>(name: RawString, symbols: I) -> RawString<'p>
@@ -506,26 +539,45 @@ where
     I: Iterator<Item = &'a RawString<'p>> + Clone,
     'p: 'a,
 {
-    let pure_name = {
-        let idx = name
-            .as_bytes()
-            .windows(2)
-            .rposition(|w| w == b"::")
-            .map(|i| i + 2)
-            .unwrap_or(0);
-        &name.as_bytes()[idx..]
+    let caller_class = get_class(name.as_bytes());
+    // let pure_name = {
+    //     let idx = skip_templates(
+    //         name.as_bytes(), // // .windows(2)
+    //                          // // .rposition(|w| w == b"::")
+    //                          // .map(|i| i + 2)
+    //                          // .unwrap_or(0)
+    //     )
+    //     .unwrap_or(0);
+    //     &name.as_bytes()[idx + 2..]
+    // };
+    let pure_name = match skip_templates(name.as_bytes()) {
+        Some(idx) => &name.as_bytes()[idx + 2..],
+        None => name.as_bytes(),
     };
-    let closest_symbol = symbols
+
+    let class_matches = |sym: &RawString| match caller_class {
+        Some(class) => mangled_contain_class(sym.as_bytes(), class),
+        None => false,
+    };
+    let name_matches = |sym: &RawString| {
+        sym.as_bytes()
+            .windows(pure_name.len())
+            .any(|s| s == pure_name)
+    };
+
+    if let Some(sym) = symbols
         .clone()
-        .filter(|symbol| {
-            symbol
-                .as_bytes()
-                .windows(pure_name.len())
-                .any(|w| w == pure_name)
-        })
-        .min_by_key(|symbol| symbol.len());
-    if let Some(closest_symbol) = closest_symbol {
-        return *closest_symbol;
+        .filter(|s| class_matches(s) && name_matches(s))
+        .min_by_key(|s| s.len())
+    {
+        return *sym;
+    }
+    if let Some(sym) = symbols
+        .clone()
+        .filter(|s| name_matches(s))
+        .min_by_key(|s| s.len())
+    {
+        return *sym;
     }
     *symbols
         .min_by_key(|symbol| symbol.len())
