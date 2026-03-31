@@ -246,6 +246,12 @@ impl Executable<'static> {
         };
 
         for fun in self.functions.values().flatten() {
+            // if fun.mangled_name.map(|n| n.as_bytes())
+            //     != Some(b"??0?$fixed_string@$0BAE@@vostok@@QAE@PBD@Z")
+            // {
+            //     continue;
+            // }
+
             const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok\\";
             let filename: &'static [u8] = match fun.filename {
                 Some(filename) => match filename.as_bytes().strip_prefix(VOSTOK_PREFIX) {
@@ -298,6 +304,8 @@ impl Executable<'static> {
 
         let ixs = ctx.disasm_all(fun.data, fun.address as u64)?;
         for ix in ixs.iter() {
+            // println!("{} {}", ix.mnemonic().unwrap(), ix.op_str().unwrap());
+
             let detail = ctx.insn_detail(ix)?;
 
             let groups = detail.groups().iter().map(|v| u32::from(v.0));
@@ -330,7 +338,7 @@ impl Executable<'static> {
             }
 
             match self.functions.get(&target_address) {
-                Some(target_funs) if ix.len() > 5 => {
+                Some(target_funs) if ix.len() > 4 => {
                     let (op, _addr) = ix
                         .bytes()
                         .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
@@ -341,7 +349,9 @@ impl Executable<'static> {
 
                     let reloc_name = find_closest_symbol(
                         fun.name,
-                        target_funs.iter().map(|target_funs| &target_funs.name),
+                        target_funs.iter().map(|target_fun| {
+                            target_fun.mangled_name.as_ref().unwrap_or(&target_fun.name)
+                        }),
                     );
                     let reloc_start = text.len() - std::mem::size_of::<u32>();
 
@@ -367,18 +377,33 @@ impl Executable<'static> {
             text_section_id,
         } = object_file;
 
-        let offset =
-            object.append_section_data(*text_section_id, &text, std::mem::size_of::<u32>() as u64);
+        let offset = object.append_section_data(*text_section_id, &text, 1);
+
+        // sushi@TODO: `object` crate doesn't(?) allow specifying auxiliary symbols.
+        // Because of that 1-3 bytes of garbage is generated which objdiff doesn't like.
+        // We replace those bytes with `nop`s and pad all of the functions ourselves,
+        // which fixes the problem, but this is a hack, which needs to be fixed at some point.
+        let padding: &[u8] = match 4 - text.len() % 4 {
+            1 => &[0x90],
+            2 => &[0x90, 0x90],
+            3 => &[0x90, 0x90, 0x90],
+            _ => &[],
+        };
+        if !padding.is_empty() {
+            _ = object.append_section_data(*text_section_id, padding, 1);
+        }
 
         for (reloc_start, reloc_name) in relocations {
+            // Consider all symbols external.
+            // This is fine for us, since we only care about matches.
             let reloc_symbol = object.add_symbol(object::write::Symbol {
                 name: reloc_name.as_bytes().to_vec(),
-                value: 0,       // @TODO: Where can I get offset, when it is external?
-                size: u64::MAX, // @TODO: Seems to be unused for COFF
-                kind: object::SymbolKind::Text, // @TODO: Text is for internal symbols, right?
+                value: 0,
+                size: u64::MAX,
+                kind: object::SymbolKind::Unknown,
                 scope: object::SymbolScope::Linkage,
                 weak: false,
-                section: object::write::SymbolSection::Section(*text_section_id),
+                section: object::write::SymbolSection::Undefined,
                 flags: object::SymbolFlags::None,
             });
 
@@ -400,7 +425,7 @@ impl Executable<'static> {
         object.add_symbol(object::write::Symbol {
             name: fun.mangled_name.unwrap_or(fun.name).as_bytes().to_vec(),
             value: offset,
-            size: u64::MAX,
+            size: u64::MAX, /* sushi@TODO: See TODO above. text.len() as u64, */
             kind: object::SymbolKind::Text,
             scope: object::SymbolScope::Linkage,
             weak: false,
