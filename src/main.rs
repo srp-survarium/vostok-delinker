@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
+use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::arch::ArchOperand;
+use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
 use capstone::InsnGroupType::*;
-use capstone::arch::ArchOperand;
-use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
-use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 
 use object::{Object, ObjectSection, SectionKind};
 
@@ -32,9 +32,21 @@ pub struct Executable<'a> {
     // based on what function calls or jumps to.
     //
     // `Vec` is always `NonEmpty`.
+    //
+    // Offsets into .text
     pub functions: HashMap<usize, Vec<Function<'a>>>,
+
+    // Offsets into .rdata
+    pub statics: HashMap<usize, RawString<'a>>,
     // constants?
-    // statics?
+
+    // TODO
+    // 1. Find all relocations in survarium.exe.
+    // 2. Subtract original offset the executable wants to be loaded at.
+    // 3. Build BTreeMap to find closest symbolic relocation
+    // 4. Write a relocation and leave offset in there (most often it will be 0)
+
+    // pub relocations:
 }
 
 #[derive(Clone, Debug)]
@@ -174,12 +186,18 @@ impl Executable<'static> {
         let mangled_table = {
             let mut symbols = symbol_table.iter();
             let mut mangled_table = HashMap::<usize, Vec<RawString>>::new();
+            const RDATA_SECTION: u16 = 3;
 
             while let Some(symbol) = symbols.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Public(data)) if data.function => {
                         let offset = data.offset.offset as usize;
                         mangled_table.entry(offset).or_default().push(data.name);
+                    }
+                    Ok(pdb2::SymbolData::Public(data)) if data.offset.section == RDATA_SECTION => {
+                        let offset = data.offset.offset as usize;
+                        let result = this.statics.insert(offset, data.name);
+                        assert_eq!(result, None);
                     }
                     _ => {}
                 }
@@ -307,8 +325,70 @@ impl Executable<'static> {
             // println!("{} {}", ix.mnemonic().unwrap(), ix.op_str().unwrap());
 
             let detail = ctx.insn_detail(ix)?;
+            let arch_detail = detail.arch_detail();
 
             let groups = detail.groups().iter().map(|v| u32::from(v.0));
+
+            // mov eax, [ebx + 25]
+            // 25
+
+            // If
+            // mov eax, s_static_addr
+            // mov [s_static_addr], 0
+            //
+            // Vector2, { x, y }
+            //            0  4
+            // mov eax, s_static_addr
+            // add eax, 4
+            // mov eax, [eax]
+            //
+            // let eax = &s_static_addr;
+            // eax.wrapped_ptr_bytes_add(4);
+            // eax = *eax;
+            //
+            // mov eax, [s_static_addr + 4]
+            //
+            // mov eax, [number]
+            // mov eax, [(number-4) + 4]
+            // number-4 == s_static_addr
+            //
+            //
+            // [Vector2, Vector2, Vector2]
+            //
+            // mov ecx, 2 ; param
+            //
+            // mov eax, s_static_addr
+            // mul ecx, ecx, sizeof(Vector2)
+            // add eax, 4                   ; offset(y)
+            // mov ebx, [eax]
+            //
+            // ''''
+            //
+            // mov ecx, 2
+            //
+            // mov ebx, [s_static_addr + sizeof(Vector2) * ecx + 4]
+            //
+            // ''''
+            //
+            // mov ecx, 2
+            //
+            // lea eax, [s_static_addr + sizeof(Vector2) * ecx + 4]
+            // mov ebx, [eax]
+            //
+            // ''''
+            //
+            // lea eax, [eax + 2]
+            // add eax, 2
+            //
+            //
+            // '''
+            //
+            // load effective address
+            // lea eax, [2 * eax + 2]
+            //
+            // mul eax, 2
+            // add eax, 2
+
             let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
 
             if !is_branch {
@@ -316,7 +396,6 @@ impl Executable<'static> {
                 continue;
             }
 
-            let arch_detail = detail.arch_detail();
             let ops = arch_detail.operands();
             assert_eq!(ops.len(), 1);
 
@@ -380,7 +459,7 @@ impl Executable<'static> {
         let offset = object.append_section_data(*text_section_id, &text, 1);
 
         // sushi@TODO: `object` crate doesn't(?) allow specifying auxiliary symbols.
-        // Because of that 1-3 bytes of garbage is generated which objdiff doesn't like.
+        // Because of that 1-3 bytes of garbage are generated which objdiff doesn't like.
         // We replace those bytes with `nop`s and pad all of the functions ourselves,
         // which fixes the problem, but this is a hack, which needs to be fixed at some point.
         let padding: &[u8] = match 4 - text.len() % 4 {
@@ -433,6 +512,70 @@ impl Executable<'static> {
             flags: object::SymbolFlags::None,
         });
 
+        Ok(())
+    }
+
+    fn mov_static_instruction(
+        &self,
+        rdata: &mut Vec<u8>,
+        relocations: &mut Vec<(usize, RawString)>,
+    ) -> anyhow::Result<()> {
+        todo!();
+        todo!();
+    }
+
+    fn branch_instruction(
+        &self,
+        arch_detail: capstone::arch::ArchDetail,
+        ix: capstone::Insn,
+
+        fun: &Function,
+
+        text: &mut Vec<u8>,
+        relocations: &mut Vec<(usize, RawString)>,
+    ) -> anyhow::Result<()> {
+        let ops = arch_detail.operands();
+        assert_eq!(ops.len(), 1);
+
+        let ArchOperand::X86Operand(X86Operand {
+            op_type: X86OperandType::Imm(target_address),
+            ..
+        }) = ops[0]
+        else {
+            unreachable!()
+        };
+        let target_address = usize::try_from(target_address)?;
+
+        let internal_branch = (fun.address..fun.address + fun.data.len()).contains(&target_address);
+        if internal_branch {
+            // sushi@TODO: Should offset be fixed?
+            text.extend_from_slice(ix.bytes());
+            return Ok(());
+        }
+
+        match self.functions.get(&target_address) {
+            Some(target_funs) if ix.len() > 4 => {
+                let (op, _addr) = ix
+                    .bytes()
+                    .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
+                text.extend_from_slice(op);
+                text.extend_from_slice(&0_u32.to_le_bytes());
+
+                let reloc_name = find_closest_symbol(
+                    fun.name,
+                    target_funs.iter().map(|target_fun| {
+                        target_fun.mangled_name.as_ref().unwrap_or(&target_fun.name)
+                    }),
+                );
+                let reloc_start = text.len() - std::mem::size_of::<u32>();
+
+                relocations.push((reloc_start, reloc_name));
+            }
+            // This usually covers data which is not meant to be instructions.
+            Some(_) | None => {
+                text.extend_from_slice(ix.bytes());
+            }
+        }
         Ok(())
     }
 }
