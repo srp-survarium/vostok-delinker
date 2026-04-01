@@ -309,29 +309,29 @@ impl Executable<'static> {
                  0x00026469: pop ebp
                  0x0002646a: ret 4
             */
-            let search_for =
-                b"vostok::fs_new::asynchronous_device_query::`scalar deleting destructor'";
-            if !fun
-                .name
-                .as_bytes()
-                .windows(search_for.len())
-                .any(|w| w == search_for)
-            {
-                continue;
-            }
-            println!("processing: {} -> {:?}", fun.name, fun.filename);
-            println!("found: {}", fun.name);
-
-            println!("\n{}", std::str::from_utf8(fun.name.as_bytes())?);
-            let ixs = ctx.disasm_all(fun.data, fun.address as u64)?;
-            for ix in ixs.iter() {
-                println!(
-                    "{:#010x?}: {} {}",
-                    ix.address(),
-                    ix.mnemonic().unwrap_or(""),
-                    ix.op_str().unwrap_or("")
-                );
-            }
+            // let search_for =
+            //     b"vostok::fs_new::asynchronous_device_query::`scalar deleting destructor'";
+            // if !fun
+            //     .name
+            //     .as_bytes()
+            //     .windows(search_for.len())
+            //     .any(|w| w == search_for)
+            // {
+            //     continue;
+            // }
+            // println!("processing: {} -> {:?}", fun.name, fun.filename);
+            // println!("found: {}", fun.name);
+            //
+            // println!("\n{}", std::str::from_utf8(fun.name.as_bytes())?);
+            // let ixs = ctx.disasm_all(fun.data, fun.address as u64)?;
+            // for ix in ixs.iter() {
+            //     println!(
+            //         "{:#010x?}: {} {}",
+            //         ix.address(),
+            //         ix.mnemonic().unwrap_or(""),
+            //         ix.op_str().unwrap_or("")
+            //     );
+            // }
 
             const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok\\";
             let filename: &'static [u8] = match fun.filename {
@@ -548,29 +548,29 @@ impl Executable<'static> {
             let rva = target_address - self.image_base;
             if target_address >= self.image_base {
                 let rva = target_address - self.image_base;
-                println!(
-                    "candidate VA: {:#x}, rva: {:#x}, rdata: {:#x}..{:#x}",
-                    target_address,
-                    rva,
-                    rdata_rva,
-                    rdata_rva + rdata_size
-                );
+                // println!(
+                //     "candidate VA: {:#x}, rva: {:#x}, rdata: {:#x}..{:#x}",
+                //     target_address,
+                //     rva,
+                //     rdata_rva,
+                //     rdata_rva + rdata_size
+                // );
             }
             if rva >= rdata_rva && rva < rdata_rva + rdata_size {
                 let section_offset = rva - rdata_rva;
-                println!("section_offset: {section_offset:#x}");
+                // println!("section_offset: {section_offset:#x}");
                 // it's in .rdata, look up in BTreeMap with section_offset
                 if let Some((&sym_offset, &sym_name)) = self.statics.range(..=section_offset).last()
                 {
                     let addend = section_offset - sym_offset;
                     let mut bytes = ix.bytes().to_vec();
                     let va_bytes = (target_address as u32).to_le_bytes();
-                    println!(
-                        "found symbol: {} at {:#x}, addend: {:#x}",
-                        sym_name,
-                        sym_offset,
-                        section_offset - sym_offset
-                    );
+                    // println!(
+                    //     "found symbol: {} at {:#x}, addend: {:#x}",
+                    //     sym_name,
+                    //     sym_offset,
+                    //     section_offset - sym_offset
+                    // );
                     let Some(pos) = bytes.windows(4).position(|w| w == va_bytes) else {
                         text.extend_from_slice(ix.bytes());
                         return Ok(());
@@ -582,10 +582,10 @@ impl Executable<'static> {
                     relocations.push((reloc_start, sym_name));
                     return Ok(());
                 }
-                println!(
-                    "no symbol found in BTreeMap for offset {:#x}",
-                    section_offset
-                );
+                // println!(
+                //     "no symbol found in BTreeMap for offset {:#x}",
+                //     section_offset
+                // );
             }
         }
 
