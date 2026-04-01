@@ -1,6 +1,9 @@
 #![feature(os_string_truncate)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use object::read::pe::PeFile32;
+use object::LittleEndian;
 
 use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
 use capstone::arch::ArchOperand;
@@ -37,18 +40,17 @@ pub struct Executable<'a> {
     pub functions: HashMap<usize, Vec<Function<'a>>>,
 
     // Offsets into .rdata
-    pub statics: HashMap<usize, RawString<'a>>,
+    pub statics: BTreeMap<usize, RawString<'a>>,
+    pub image_base: usize,
+    pub sec_info: SecInfo,
     // constants?
-
-    // TODO
-    // 1. Find all relocations in survarium.exe.
-    // 2. Subtract original offset the executable wants to be loaded at.
-    // 3. Build BTreeMap to find closest symbolic relocation
-    // 4. Write a relocation and leave offset in there (most often it will be 0)
-
-    // pub relocations:
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SecInfo {
+    rdata_rva: usize,
+    rdata_size: usize,
+}
 #[derive(Clone, Debug)]
 pub struct Function<'a> {
     pub name: RawString<'a>,
@@ -178,9 +180,14 @@ impl Executable<'static> {
         let text_section_address = text_sec.address() as usize;
         let text_data = text_sec.data()?;
 
-        //
-        //
-        //
+        // get image base offset :<
+        let pe = PeFile32::parse(EXECUTABLE)?;
+        let rdata_sec = pe.section_by_name(".rdata").unwrap();
+        this.image_base = pe.nt_headers().optional_header.image_base.get(LittleEndian) as usize;
+        this.sec_info = SecInfo {
+            rdata_rva: rdata_sec.address() as usize - this.image_base,
+            rdata_size: rdata_sec.size() as usize,
+        };
 
         let symbol_table: &'static pdb2::SymbolTable<'static> = leak(pdb.global_symbols()?);
         let mangled_table = {
@@ -188,6 +195,13 @@ impl Executable<'static> {
             let mut mangled_table = HashMap::<usize, Vec<RawString>>::new();
             const RDATA_SECTION: u16 = 3;
 
+            // TODO
+            // 1. Find all relocations in survarium.exe.
+            // 2. Subtract original offset the executable wants to be loaded at.
+            // 3. Build BTreeMap to find closest symbolic relocation
+            // 4. Write a relocation and leave offset in there (most often it will be 0)
+
+            // pub relocations:
             while let Some(symbol) = symbols.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Public(data)) if data.function => {
@@ -197,6 +211,12 @@ impl Executable<'static> {
                     Ok(pdb2::SymbolData::Public(data)) if data.offset.section == RDATA_SECTION => {
                         let offset = data.offset.offset as usize;
                         let result = this.statics.insert(offset, data.name);
+                        // some BTreeMap node {
+                        //      offset: usize
+                        //      data.name (mangled name)
+                        // }
+
+                        // println!("{offset}");
                         assert_eq!(result, None);
                     }
                     _ => {}
@@ -262,13 +282,49 @@ impl Executable<'static> {
         let mut object_files = ObjectFiles {
             objects: HashMap::new(),
         };
-
         for fun in self.functions.values().flatten() {
-            // if fun.mangled_name.map(|n| n.as_bytes())
-            //     != Some(b"??0?$fixed_string@$0BAE@@vostok@@QAE@PBD@Z")
-            // {
-            //     continue;
-            // }
+            /*
+                 0x00026440: push ebp
+                 0x00026441: mov ebp, esp
+                 0x00026443: push ecx
+                 0x00026444: mov dword ptr [ebp - 4], ecx
+                 0x00026447: mov eax, dword ptr [ebp - 4]
+                 0x0002644a: mov dword ptr [eax], 0x956030 <-- this stinks
+                 0x00026450: mov ecx, dword ptr [ebp + 8]
+                 0x00026453: and ecx, 1
+                 0x00026456: je 0x26464
+                 0x00026458: mov edx, dword ptr [ebp - 4]
+                 0x0002645b: push edx
+                 0x0002645c: call 0x189dfc
+                 0x00026461: add esp, 4
+                 0x00026464: mov eax, dword ptr [ebp - 4]
+                 0x00026467: mov esp, ebp
+                 0x00026469: pop ebp
+                 0x0002646a: ret 4
+            */
+            let search_for =
+                b"vostok::fs_new::asynchronous_device_query::`scalar deleting destructor'";
+            if !fun
+                .name
+                .as_bytes()
+                .windows(search_for.len())
+                .any(|w| w == search_for)
+            {
+                continue;
+            }
+            println!("processing: {} -> {:?}", fun.name, fun.filename);
+            println!("found: {}", fun.name);
+
+            println!("\n{}", std::str::from_utf8(fun.name.as_bytes())?);
+            let ixs = ctx.disasm_all(fun.data, fun.address as u64)?;
+            for ix in ixs.iter() {
+                println!(
+                    "{:#010x?}: {} {}",
+                    ix.address(),
+                    ix.mnemonic().unwrap_or(""),
+                    ix.op_str().unwrap_or("")
+                );
+            }
 
             const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok\\";
             let filename: &'static [u8] = match fun.filename {
@@ -329,70 +385,11 @@ impl Executable<'static> {
 
             let groups = detail.groups().iter().map(|v| u32::from(v.0));
 
-            // mov eax, [ebx + 25]
-            // 25
-
-            // If
-            // mov eax, s_static_addr
-            // mov [s_static_addr], 0
-            //
-            // Vector2, { x, y }
-            //            0  4
-            // mov eax, s_static_addr
-            // add eax, 4
-            // mov eax, [eax]
-            //
-            // let eax = &s_static_addr;
-            // eax.wrapped_ptr_bytes_add(4);
-            // eax = *eax;
-            //
-            // mov eax, [s_static_addr + 4]
-            //
-            // mov eax, [number]
-            // mov eax, [(number-4) + 4]
-            // number-4 == s_static_addr
-            //
-            //
-            // [Vector2, Vector2, Vector2]
-            //
-            // mov ecx, 2 ; param
-            //
-            // mov eax, s_static_addr
-            // mul ecx, ecx, sizeof(Vector2)
-            // add eax, 4                   ; offset(y)
-            // mov ebx, [eax]
-            //
-            // ''''
-            //
-            // mov ecx, 2
-            //
-            // mov ebx, [s_static_addr + sizeof(Vector2) * ecx + 4]
-            //
-            // ''''
-            //
-            // mov ecx, 2
-            //
-            // lea eax, [s_static_addr + sizeof(Vector2) * ecx + 4]
-            // mov ebx, [eax]
-            //
-            // ''''
-            //
-            // lea eax, [eax + 2]
-            // add eax, 2
-            //
-            //
-            // '''
-            //
-            // load effective address
-            // lea eax, [2 * eax + 2]
-            //
-            // mul eax, 2
-            // add eax, 2
-
             let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
 
             if !is_branch {
-                text.extend_from_slice(ix.bytes());
+                let _ =
+                    self.mov_static_instruction(arch_detail, ix, fun, &mut text, &mut relocations);
                 continue;
             }
 
@@ -406,17 +403,15 @@ impl Executable<'static> {
             else {
                 unreachable!()
             };
-            let target_address = usize::try_from(target_address)?;
-
             let internal_branch =
-                (fun.address..fun.address + fun.data.len()).contains(&target_address);
+                (fun.address..fun.address + fun.data.len()).contains(&(target_address as usize));
             if internal_branch {
                 // sushi@TODO: Should offset be fixed?
                 text.extend_from_slice(ix.bytes());
                 continue;
             }
 
-            match self.functions.get(&target_address) {
+            match self.functions.get(&(target_address as usize)) {
                 Some(target_funs) if ix.len() > 4 => {
                     let (op, _addr) = ix
                         .bytes()
@@ -517,11 +512,74 @@ impl Executable<'static> {
 
     fn mov_static_instruction(
         &self,
-        rdata: &mut Vec<u8>,
+        arch_detail: capstone::arch::ArchDetail,
+        ix: &capstone::Insn,
+
+        fun: &Function,
+
+        text: &mut Vec<u8>,
         relocations: &mut Vec<(usize, RawString)>,
     ) -> anyhow::Result<()> {
-        todo!();
-        todo!();
+        let ops = arch_detail.operands();
+        for op in &ops {
+            let ArchOperand::X86Operand(X86Operand {
+                op_type: X86OperandType::Imm(target_address),
+                ..
+            }) = op
+            else {
+                continue;
+            };
+            let target_address = usize::try_from(*target_address)?;
+
+            if target_address < self.image_base {
+                continue;
+            }
+
+            let rdata_rva = self.sec_info.rdata_rva;
+            let rdata_size = self.sec_info.rdata_size;
+            let rva = target_address - self.image_base;
+            if target_address >= self.image_base {
+                let rva = target_address - self.image_base;
+                println!(
+                    "candidate VA: {:#x}, rva: {:#x}, rdata: {:#x}..{:#x}",
+                    target_address,
+                    rva,
+                    rdata_rva,
+                    rdata_rva + rdata_size
+                );
+            }
+            if rva >= rdata_rva && rva < rdata_rva + rdata_size {
+                let section_offset = rva - rdata_rva;
+                println!("section_offset: {section_offset:#x}");
+                // it's in .rdata, look up in BTreeMap with section_offset
+                if let Some((&sym_offset, &sym_name)) = self.statics.range(..=section_offset).last()
+                {
+                    let addend = section_offset - sym_offset;
+                    let mut bytes = ix.bytes().to_vec();
+                    let va_bytes = (target_address as u32).to_le_bytes();
+                    println!(
+                        "found symbol: {} at {:#x}, addend: {:#x}",
+                        sym_name,
+                        sym_offset,
+                        section_offset - sym_offset
+                    );
+                    let Some(pos) = bytes.windows(4).position(|w| w == va_bytes) else {
+                        text.extend_from_slice(ix.bytes());
+                        return Ok(());
+                    };
+                    bytes[pos..pos + 4].copy_from_slice(&(addend as u32).to_le_bytes());
+
+                    let reloc_start = text.len() + pos;
+                    text.extend_from_slice(&bytes);
+                    relocations.push((reloc_start, sym_name));
+                    return Ok(());
+                }
+            println!("no symbol found in BTreeMap for offset {:#x}", section_offset);
+            }
+        }
+
+        text.extend_from_slice(ix.bytes());
+        Ok(())
     }
 
     fn branch_instruction(
