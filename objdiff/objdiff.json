@@ -2016,6 +2016,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "??$query@U?$vertical_predicate@$0A@@geometry@colliders@collision@vostok@@@ray_query_geometry@colliders@collision@vostok@@AAEXPBVAABBNoLeafNode@Opcode@@ABU?$vertical_predicate@$0A@@geometry@123@@Z": "_??$query@U?$vertical_predicate@$0A@@geometry@colliders@collision@vostok@@@ray_query_geometry@colliders@collision@vostok@@AAEXPBVAABBNoLeafNode@Opcode@@ABU?$vertical_predicate@$0A@@geometry@123@@Z"
       }
     },
     {
@@ -2295,6 +2298,10 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "??Bbinary_config_value@configs@vostok@@QBEGXZ": "_??Bbinary_config_value@configs@vostok@@QBEEXZ",
+        "?begin@binary_config_value@configs@vostok@@QBEPBV123@XZ": "_??Bbinary_config_value@configs@vostok@@QBEGXZ"
       }
     },
     {
@@ -3540,6 +3547,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?predicate@call_stack_size_calculator@debug@vostok@@QAE_NIIPBD0H0I@Z": "_?predicate@call_stack_size_calculator@debug@vostok@@QAE_NIIPBD0H0I@Z"
       }
     },
     {
@@ -3950,6 +3960,10 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?finalize@asynchronous_device_interface@fs_new@vostok@@QAEXXZ": "_vostok::threading::event::event",
+        "?set_synchronous_thread_id@asynchronous_device_interface@fs_new@vostok@@AAEXI@Z": "_??0asynchronous_device_interface@fs_new@vostok@@QAE@PAVdevice_file_system_interface@12@W4watcher_enabled_bool@12@@Z"
       }
     },
     {
@@ -3968,6 +3982,10 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?open@device_file_system_no_watcher_proxy@fs_new@vostok@@QBE_NPAPAPAXABVnative_path_string@23@ABUopen_file_params@23@@Z": "_vostok::fs_new::device_file_system_no_watcher_proxy::open",
+        "?open@device_file_system_no_watcher_proxy@fs_new@vostok@@QBE_NPAPAPAXABVnative_path_string@23@W4mode_enum@file_mode@23@W4access_enum@file_access@23@W4assert_on_fail_bool@@W4notify_watcher_bool@23@W4use_buffering_bool@23@@Z": "_?open@device_file_system_no_watcher_proxy@fs_new@vostok@@QBE_NPAPAPAXABVnative_path_string@23@W4mode_enum@file_mode@23@W4access_enum@file_access@23@W4assert_on_fail_bool@@W4notify_watcher_bool@23@W4use_buffering_bool@23@@Z"
       }
     },
     {
@@ -12782,6 +12800,9 @@
       "scratch": {
         "platform": "win32",
         "compiler": "msvc8.0"
+      },
+      "symbol_mappings": {
+        "?mount_sub_fat@archive_mounter@vfs@vostok@@AAEXXZ": "_vostok::vfs::mounter::destroy_this_if_needed"
       }
     },
     {

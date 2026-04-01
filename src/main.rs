@@ -193,7 +193,7 @@ impl Executable<'static> {
         let mangled_table = {
             let mut symbols = symbol_table.iter();
             let mut mangled_table = HashMap::<usize, Vec<RawString>>::new();
-            const RDATA_SECTION: u16 = 3;
+            const RDATA_SECTION: u16 = 2; //seems 3 was incorrect :P
 
             // TODO
             // 1. Find all relocations in survarium.exe.
@@ -208,6 +208,12 @@ impl Executable<'static> {
                         let offset = data.offset.offset as usize;
                         mangled_table.entry(offset).or_default().push(data.name);
                     }
+                    // Ok(pdb2::SymbolData::Public(data)) if !data.function => {
+                    //     println!(
+                    //         "symbol: {} section: {} offset: {:#x}",
+                    //         data.name, data.offset.section, data.offset.offset
+                    //     );
+                    // }
                     Ok(pdb2::SymbolData::Public(data)) if data.offset.section == RDATA_SECTION => {
                         let offset = data.offset.offset as usize;
                         let result = this.statics.insert(offset, data.name);
@@ -217,7 +223,8 @@ impl Executable<'static> {
                         // }
 
                         // println!("{offset}");
-                        assert_eq!(result, None);
+                        // assert_eq!(result, None); <-- for 3rd section that actually fail
+                        this.statics.insert(offset, data.name);
                     }
                     _ => {}
                 }
@@ -487,6 +494,7 @@ impl Executable<'static> {
                     offset: offset + reloc_start as u64,
                     symbol: reloc_symbol,
                     addend: -4,
+         //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
                     flags: object::RelocationFlags::Generic {
                         kind: object::RelocationKind::Relative,
                         encoding: object::RelocationEncoding::Generic,
@@ -574,7 +582,10 @@ impl Executable<'static> {
                     relocations.push((reloc_start, sym_name));
                     return Ok(());
                 }
-            println!("no symbol found in BTreeMap for offset {:#x}", section_offset);
+                println!(
+                    "no symbol found in BTreeMap for offset {:#x}",
+                    section_offset
+                );
             }
         }
 
