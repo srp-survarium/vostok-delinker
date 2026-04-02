@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+bytemuck = { version = "1.25.0", features = ["derive", "min_const_generics", "must_cast"] }
 capstone = "0.14.0"
 clap = { version = "4.5.41", features = ["derive", "env"] }
 msvc-demangler = "0.11.0"

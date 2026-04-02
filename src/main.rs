@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use object::read::pe::PeFile32;
+use object::read::pe::{PeFile32, PeSection};
 use object::LittleEndian;
 
 use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
@@ -29,27 +29,32 @@ pub struct ObjectFile {
     pub text_section_id: object::write::SectionId,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct Executable<'a> {
     // `HashMap` was chosen, because we need to make lookups
     // based on what function calls or jumps to.
     //
     // `Vec` is always `NonEmpty`.
-    //
-    // Offsets into .text
     pub functions: HashMap<usize, Vec<Function<'a>>>,
 
-    // Offsets into .rdata
+    // Offsets into .data
     pub statics: BTreeMap<usize, RawString<'a>>,
-    pub image_base: usize,
-    pub sec_info: SecInfo,
-    // constants?
+
+    // Offsets into .rdata
+    pub consts: BTreeMap<usize, RawString<'a>>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct SecInfo {
-    rdata_rva: usize,
-    rdata_size: usize,
+// Address - Offset from the beginning of executable
+// Offset  - Offset from a certain section
+// Rva     - Offset from ImageBase (correct?)
+
+#[derive(Clone, Debug, Default, Copy)]
+pub struct SecInfo<'a> {
+    pub rva: usize,
+    pub size: usize,
+
+    pub address: usize,
+    pub data: &'a [u8],
 }
 #[derive(Clone, Debug)]
 pub struct Function<'a> {
@@ -137,7 +142,7 @@ pub struct Function<'a> {
 //    assembly matches.
 
 fn main() -> anyhow::Result<()> {
-    let exe = object::File::parse(EXECUTABLE)?;
+    let exe = object::read::pe::PeFile32::parse(EXECUTABLE)?;
     let pdb = pdb2::PDB::open(std::io::Cursor::new(DEBUG_SYMBOLS))?;
 
     process_executable(exe, pdb)?;
@@ -146,7 +151,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn process_executable<S: pdb2::Source<'static> + 'static>(
-    exe: object::File<'static>,
+    exe: object::read::pe::PeFile32<'static>,
     pdb: pdb2::PDB<'static, S>,
 ) -> anyhow::Result<()> {
     let ctx = Capstone::new()
@@ -157,7 +162,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         .build()
         .expect("Cannot create Capstone context");
 
-    let exe: &'static object::File = leak(exe);
+    let exe: &'static object::read::pe::PeFile32 = leak(exe);
 
     let object_files = Executable::parse(exe, pdb)?.build_object_files(&ctx)?;
 
@@ -168,32 +173,58 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 
 impl Executable<'static> {
     fn parse<S: pdb2::Source<'static> + 'static>(
-        exe: &'static object::File,
+        exe: &'static object::read::pe::PeFile32<'static>,
         mut pdb: pdb2::PDB<'static, S>,
     ) -> anyhow::Result<Self> {
-        let mut this = Self::default();
+        let image_base = exe
+            .nt_headers()
+            .optional_header
+            .image_base
+            .get(LittleEndian);
+
+        let build_sec_info = |sec: PeSection<'static, 'static, _>| {
+            Ok::<_, anyhow::Error>(SecInfo {
+                rva: sec.address() as usize - image_base as usize,
+                size: sec.size() as usize,
+
+                address: sec.address() as usize,
+                data: sec.data()?,
+            })
+        };
 
         let Some(text_sec) = exe.section_by_name(".text") else {
-            return Ok(this);
+            anyhow::bail!("Missing .text section");
+        };
+        let Some(data_sec) = exe.section_by_name(".data") else {
+            anyhow::bail!("Missing .data section");
+        };
+        let Some(rdata_sec) = exe.section_by_name(".rdata") else {
+            anyhow::bail!("Missing .rdata section");
         };
 
-        let text_section_address = text_sec.address() as usize;
-        let text_data = text_sec.data()?;
-
-        // get image base offset :<
-        let pe = PeFile32::parse(EXECUTABLE)?;
-        let rdata_sec = pe.section_by_name(".rdata").unwrap();
-        this.image_base = pe.nt_headers().optional_header.image_base.get(LittleEndian) as usize;
-        this.sec_info = SecInfo {
-            rdata_rva: rdata_sec.address() as usize - this.image_base,
-            rdata_size: rdata_sec.size() as usize,
+        let Some(reloc_sec) = exe.section_by_name(".reloc") else {
+            anyhow::bail!("Missing .reloc section");
         };
+        print_reloc(exe);
+
+        let text_sec_info = build_sec_info(text_sec)?;
+        let data_sec_info = build_sec_info(data_sec)?;
+        let rdata_sec_info = build_sec_info(rdata_sec)?;
+
+        //
+        //
+        //
+
+        let mut statics = BTreeMap::<usize, RawString<'static>>::new();
+        let mut functions = HashMap::<usize, Vec<Function<'static>>>::new();
 
         let symbol_table: &'static pdb2::SymbolTable<'static> = leak(pdb.global_symbols()?);
         let mangled_table = {
             let mut symbols = symbol_table.iter();
             let mut mangled_table = HashMap::<usize, Vec<RawString>>::new();
-            const RDATA_SECTION: u16 = 2; //seems 3 was incorrect :P
+
+            const RDATA_SECTION: u16 = 2;
+            const DATA_SECTION: u16 = 3;
 
             // TODO
             // 1. Find all relocations in survarium.exe.
@@ -201,30 +232,22 @@ impl Executable<'static> {
             // 3. Build BTreeMap to find closest symbolic relocation
             // 4. Write a relocation and leave offset in there (most often it will be 0)
 
-            // pub relocations:
             while let Some(symbol) = symbols.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Public(data)) if data.function => {
                         let offset = data.offset.offset as usize;
                         mangled_table.entry(offset).or_default().push(data.name);
                     }
-                    // Ok(pdb2::SymbolData::Public(data)) if !data.function => {
-                    //     println!(
-                    //         "symbol: {} section: {} offset: {:#x}",
-                    //         data.name, data.offset.section, data.offset.offset
-                    //     );
-                    // }
-                    Ok(pdb2::SymbolData::Public(data)) if data.offset.section == RDATA_SECTION => {
+                    Ok(pdb2::SymbolData::Public(data)) if data.offset.section == DATA_SECTION => {
                         let offset = data.offset.offset as usize;
-                        let result = this.statics.insert(offset, data.name);
-                        // some BTreeMap node {
-                        //      offset: usize
-                        //      data.name (mangled name)
-                        // }
 
-                        // println!("{offset}");
-                        // assert_eq!(result, None); <-- for 3rd section that actually fail
-                        this.statics.insert(offset, data.name);
+                        let result = statics.insert(offset, data.name);
+                        if let Some(value) = result {
+                            anyhow::bail!("Conflict at offset: {value}");
+                        }
+                    }
+                    Ok(pdb2::SymbolData::Public(data)) if data.offset.section == RDATA_SECTION => {
+                        // constants will be extracted differently
                     }
                     _ => {}
                 }
@@ -233,7 +256,7 @@ impl Executable<'static> {
         };
 
         //
-        //
+        // Extract all functions from the executable
         //
 
         let dbi = leak(pdb.debug_information()?);
@@ -265,8 +288,7 @@ impl Executable<'static> {
                 };
 
                 let function = Function::extract(
-                    text_section_address,
-                    text_data,
+                    text_sec_info,
                     &program,
                     string_table,
                     &mangled_table,
@@ -275,14 +297,26 @@ impl Executable<'static> {
                     len,
                 )?;
 
-                this.functions
+                functions
                     .entry(function.address)
                     .or_default()
                     .push(function);
             }
         }
 
-        Ok(this)
+        //
+        // Extract all statics from the executable
+        //
+
+        for (k, v) in statics.iter() {
+            println!("0x{:x?}, {v}", k);
+        }
+
+        Ok(Self {
+            functions,
+            statics,
+            consts: BTreeMap::default(),
+        })
     }
 
     fn build_object_files(self, ctx: &Capstone) -> anyhow::Result<ObjectFiles<'static>> {
@@ -395,8 +429,8 @@ impl Executable<'static> {
             let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
 
             if !is_branch {
-                let _ =
-                    self.mov_static_instruction(arch_detail, ix, fun, &mut text, &mut relocations);
+                // let _ =
+                //     self.mov_static_instruction(arch_detail, ix, fun, &mut text, &mut relocations);
                 continue;
             }
 
@@ -494,7 +528,7 @@ impl Executable<'static> {
                     offset: offset + reloc_start as u64,
                     symbol: reloc_symbol,
                     addend: -4,
-         //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
+                    //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
                     flags: object::RelocationFlags::Generic {
                         kind: object::RelocationKind::Relative,
                         encoding: object::RelocationEncoding::Generic,
@@ -517,142 +551,11 @@ impl Executable<'static> {
 
         Ok(())
     }
-
-    fn mov_static_instruction(
-        &self,
-        arch_detail: capstone::arch::ArchDetail,
-        ix: &capstone::Insn,
-
-        fun: &Function,
-
-        text: &mut Vec<u8>,
-        relocations: &mut Vec<(usize, RawString)>,
-    ) -> anyhow::Result<()> {
-        let ops = arch_detail.operands();
-        for op in &ops {
-            let ArchOperand::X86Operand(X86Operand {
-                op_type: X86OperandType::Imm(target_address),
-                ..
-            }) = op
-            else {
-                continue;
-            };
-            let target_address = usize::try_from(*target_address)?;
-
-            if target_address < self.image_base {
-                continue;
-            }
-
-            let rdata_rva = self.sec_info.rdata_rva;
-            let rdata_size = self.sec_info.rdata_size;
-            let rva = target_address - self.image_base;
-            if target_address >= self.image_base {
-                let rva = target_address - self.image_base;
-                // println!(
-                //     "candidate VA: {:#x}, rva: {:#x}, rdata: {:#x}..{:#x}",
-                //     target_address,
-                //     rva,
-                //     rdata_rva,
-                //     rdata_rva + rdata_size
-                // );
-            }
-            if rva >= rdata_rva && rva < rdata_rva + rdata_size {
-                let section_offset = rva - rdata_rva;
-                // println!("section_offset: {section_offset:#x}");
-                // it's in .rdata, look up in BTreeMap with section_offset
-                if let Some((&sym_offset, &sym_name)) = self.statics.range(..=section_offset).last()
-                {
-                    let addend = section_offset - sym_offset;
-                    let mut bytes = ix.bytes().to_vec();
-                    let va_bytes = (target_address as u32).to_le_bytes();
-                    // println!(
-                    //     "found symbol: {} at {:#x}, addend: {:#x}",
-                    //     sym_name,
-                    //     sym_offset,
-                    //     section_offset - sym_offset
-                    // );
-                    let Some(pos) = bytes.windows(4).position(|w| w == va_bytes) else {
-                        text.extend_from_slice(ix.bytes());
-                        return Ok(());
-                    };
-                    bytes[pos..pos + 4].copy_from_slice(&(addend as u32).to_le_bytes());
-
-                    let reloc_start = text.len() + pos;
-                    text.extend_from_slice(&bytes);
-                    relocations.push((reloc_start, sym_name));
-                    return Ok(());
-                }
-                // println!(
-                //     "no symbol found in BTreeMap for offset {:#x}",
-                //     section_offset
-                // );
-            }
-        }
-
-        text.extend_from_slice(ix.bytes());
-        Ok(())
-    }
-
-    fn branch_instruction(
-        &self,
-        arch_detail: capstone::arch::ArchDetail,
-        ix: capstone::Insn,
-
-        fun: &Function,
-
-        text: &mut Vec<u8>,
-        relocations: &mut Vec<(usize, RawString)>,
-    ) -> anyhow::Result<()> {
-        let ops = arch_detail.operands();
-        assert_eq!(ops.len(), 1);
-
-        let ArchOperand::X86Operand(X86Operand {
-            op_type: X86OperandType::Imm(target_address),
-            ..
-        }) = ops[0]
-        else {
-            unreachable!()
-        };
-        let target_address = usize::try_from(target_address)?;
-
-        let internal_branch = (fun.address..fun.address + fun.data.len()).contains(&target_address);
-        if internal_branch {
-            // sushi@TODO: Should offset be fixed?
-            text.extend_from_slice(ix.bytes());
-            return Ok(());
-        }
-
-        match self.functions.get(&target_address) {
-            Some(target_funs) if ix.len() > 4 => {
-                let (op, _addr) = ix
-                    .bytes()
-                    .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
-                text.extend_from_slice(op);
-                text.extend_from_slice(&0_u32.to_le_bytes());
-
-                let reloc_name = find_closest_symbol(
-                    fun.name,
-                    target_funs.iter().map(|target_fun| {
-                        target_fun.mangled_name.as_ref().unwrap_or(&target_fun.name)
-                    }),
-                );
-                let reloc_start = text.len() - std::mem::size_of::<u32>();
-
-                relocations.push((reloc_start, reloc_name));
-            }
-            // This usually covers data which is not meant to be instructions.
-            Some(_) | None => {
-                text.extend_from_slice(ix.bytes());
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Function<'static> {
     fn extract(
-        text_section_address: usize,
-        text_data: &'static [u8],
+        text_section_info: SecInfo<'static>,
 
         program: &pdb2::LineProgram,
         string_table: &'static pdb2::StringTable<'static>,
@@ -687,8 +590,8 @@ impl Function<'static> {
             name,
             mangled_name,
             filename,
-            address: text_section_address + offset,
-            data: &text_data[offset..offset + len],
+            address: text_section_info.address + offset,
+            data: &text_section_info.data[offset..offset + len],
         })
     }
 }
@@ -1054,3 +957,110 @@ fn leak<T>(object: T) -> &'static T {
 //         println!("{data:#?}\n");
 //     }
 // }
+
+fn print_reloc(exe: &'static object::read::pe::PeFile32<'static>) {
+    let Some(reloc_sec) = exe.section_by_name(".reloc") else {
+        eprintln!("no .reloc section");
+        return;
+    };
+
+    let Some(text_sec) = exe.section_by_name(".text") else {
+        eprintln!("no .text section");
+        return;
+    };
+    let Some(data_sec) = exe.section_by_name(".data") else {
+        eprintln!("no .text section");
+        return;
+    };
+
+    let text_sec_rva = text_sec.address() - exe.relative_address_base();
+
+    let text_sec_data = text_sec.data().unwrap();
+
+    #[repr(C)]
+    #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
+    struct RelocHeader {
+        page_rva: u32,
+        block_size: u32,
+    }
+    const HEADER_SIZE: usize = std::mem::size_of::<RelocHeader>();
+
+    #[repr(C)]
+    #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
+    struct RelocEntry {
+        entry: u16,
+    }
+
+    let mut pos = 0;
+    let reloc_data = reloc_sec.data().unwrap();
+
+    while pos + HEADER_SIZE <= reloc_data.len() {
+        let RelocHeader {
+            page_rva,
+            block_size,
+        } = *bytemuck::from_bytes(&reloc_data[pos..pos + 8]);
+
+        if block_size == 0 || block_size < 8 {
+            break;
+        }
+
+        let entries: &[RelocEntry] =
+            bytemuck::cast_slice(&reloc_data[pos + 8..pos + block_size as usize]);
+
+        let entry_count = entries.len();
+        println!("Block: page RVA {:#x}, {} entries", page_rva, entry_count);
+
+        for RelocEntry { entry } in entries {
+            let reloc_type = entry >> 12;
+            let reloc_offset = entry & 0x0FFF;
+
+            let type_str = match reloc_type {
+                0 => "ABSOLUTE",
+                1 => "HIGH",
+                2 => "LOW",
+                3 => "HIGHLOW",
+                4 => "HIGHADJ",
+                10 => "DIR64",
+                _ => "UNKNOWN",
+            };
+
+            let reloc_rva = u64::from(page_rva + u32::from(reloc_offset));
+
+            let in_text = (text_sec_rva..text_sec_rva + text_sec.size()).contains(&reloc_rva);
+
+            if in_text {
+                let offset = (reloc_rva - text_sec_rva) as usize;
+                let data: u32 = bytemuck::pod_read_unaligned(&text_sec_data[offset..offset + 4]);
+                let value = data as u64;
+
+                println!(
+                    "  RVA {:#x}  type: {} ({}) - {:#x} -- {:#x}",
+                    reloc_rva,
+                    reloc_type,
+                    type_str,
+                    text_sec.address() as usize + offset,
+                    value - data_sec.address(),
+                );
+                // @TODO
+                // find, replace with 0, add_relocation
+            }
+        }
+
+        pos += block_size as usize;
+    }
+}
+
+// 1. Go through each relocation
+// 2. Find ones into the .text segment (by chekcing rva)
+// 3. ???
+
+// Yes. And to convert between them:
+
+// - **RVA → offset in section**: `rva - section_rva`
+// - **RVA → file offset**: `rva - section_rva + section_file_offset`
+// - **address → RVA**: `address - image_base`
+//
+//
+// static: offset from .data
+// offset from .data for symbol
+// rva: rva sym - rva .data
