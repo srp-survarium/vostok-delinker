@@ -13,9 +13,14 @@
 
 use std::collections::{btree_map, BTreeMap, HashMap};
 
+use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
+use capstone::arch::ArchOperand;
+use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
+use capstone::Capstone;
+use capstone::InsnGroupType::*;
+
 use object::read::pe::PeSection;
 use object::LittleEndian;
-
 use object::{Object, ObjectSection, SectionKind};
 
 use pdb2::{FallibleIterator, RawString};
@@ -78,34 +83,9 @@ pub struct SecInfo<'a> {
 //    crate, which allows parsing mangled functions to exact class and namespace names.
 //
 //
-// ## 4. sushi@TODO: Object file symbol generation
-//
-// 1. `object` crate always prepends '_' to all symbols. Which is incorrect for C++ mangling scheme.
-// 2. We need to fork the crate and remove the prepend. Otherwise `objdiff` cannot show nicer
-//    signatures in the object files.
-//
-//
-// ## 5. sushi@TODO: Relocation symbols for functions in other object files.
-//
-// 1. Since there is no local data associated with a symbol, what should offset be when adding an
-//    allocation? Currently I set it to 0, which seems to be incorrect. The same problem with
-//    the symbol `Kind`.
-// 2. We also do not try to associate symbols, which are stored locally, when considering
-//    allocations.
-//
-//
-// ## 6. sushi@TODO: Accessing const memory and statics.
-//
-// 1. Currently this is not implemented at all.
-// 2. To do that, we would need to find relocations in different instructions (like `mov`, `lea`,
-//    etc.)
-//
-//
-// ## 7. sushi@TODO: Accessing allocations in different instructions.
-//
-// 1. Currently only branching instructions (jmp and call) are considered for allocations).
-// 2. They can also be passed around as pointers with instructions like `mov` and `lea`.
-// 3. Same problem as above, but for function calls.
+// ## 4. sushi@TODO: Start discussion in object crate
+// ## 6. sushi@TODO: Relocations in .data and .rdata
+// ## 7. sushi@TODO: Initialized statics in .rdata
 //
 //
 // ## 8. sushi@TODO: Better parsing.
@@ -481,8 +461,15 @@ impl ObjectFiles<'static> {
             objects: HashMap::new(),
         };
         {
-            let mut modules = dbi.modules()?;
+            let ctx = Capstone::new()
+                .x86()
+                .mode(ArchMode::Mode32)
+                .syntax(ArchSyntax::Intel)
+                .detail(true)
+                .build()
+                .expect("Cannot create Capstone context");
 
+            let mut modules = dbi.modules()?;
             while let Some(module) = modules.next()? {
                 let Some(module_info) = pdb.module_info(&module)? else {
                     continue;
@@ -528,14 +515,96 @@ impl ObjectFiles<'static> {
                         None => continue,
                     };
 
-                    // sushi@TODO: RELOCs for jumps
-
-                    // if name.as_bytes() != b"survarium::network_client::process_sync_response"
-                    // // vostok::sound::sound_debug_stats::draw_overall_stats"
-                    // // vostok::ai::damage_sensor_parameters::damage_sensor_parameters"
+                    // if ![
+                    //     // b"vostok::ai::planning::search_backward::search_backward".as_slice(),
+                    //     // b"vostok::ai::planning::search_forward::search_forward".as_slice(),
+                    //     // b"survarium::network_client::process_sync_response"
+                    //     // vostok::sound::sound_debug_stats::draw_overall_stats"
+                    //     // vostok::ai::damage_sensor_parameters::damage_sensor_parameters"
+                    // ]
+                    // .contains(&name.as_bytes())
                     // {
                     //     continue;
                     // }
+
+                    //
+                    //
+                    //
+
+                    let fun_offset_in_text = offset.offset as usize;
+                    let fun_size = size as usize;
+
+                    let fun_range_in_text = fun_offset_in_text..fun_offset_in_text + fun_size;
+                    let fun_va = text.address + fun_offset_in_text;
+
+                    let mut fun_bytes = text_sec_data[fun_range_in_text.clone()].to_vec();
+                    let mut offset_in_fun = 0;
+
+                    let ixs =
+                        ctx.disasm_all(&text_sec_data[fun_range_in_text.clone()], fun_va as u64)?;
+                    for ix in ixs.iter() {
+                        let detail = ctx.insn_detail(ix)?;
+                        let arch_detail = detail.arch_detail();
+
+                        let groups = detail.groups().iter().map(|v| u32::from(v.0));
+
+                        let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
+
+                        if !is_branch {
+                            offset_in_fun += ix.len();
+                            continue;
+                        }
+
+                        let ops = arch_detail.operands();
+                        assert_eq!(ops.len(), 1);
+
+                        let ArchOperand::X86Operand(X86Operand {
+                            op_type: X86OperandType::Imm(target_va),
+                            ..
+                        }) = ops[0]
+                        else {
+                            unreachable!()
+                        };
+                        let internal_branch =
+                            (fun_va..fun_va + fun_size).contains(&(target_va as usize));
+                        if internal_branch {
+                            offset_in_fun += ix.len();
+                            continue;
+                        }
+
+                        // sushi@TODO: Closest if jumps in the middle of the function
+                        match functions.get(&(target_va as usize - text.address)) {
+                            Some(overloads) if ix.len() > 4 => {
+                                offset_in_fun += ix.len() - 4;
+                                fun_bytes[offset_in_fun..offset_in_fun + 4]
+                                    .copy_from_slice(&0_u32.to_le_bytes());
+
+                                let result = text_relocs.insert(
+                                    fun_offset_in_text + offset_in_fun,
+                                    RelocKind::Function { overloads },
+                                );
+                                offset_in_fun += 4;
+                                // @TODO
+                                if let Some(result) = result {
+                                    let RelocKind::Function {
+                                        overloads: old_overloads,
+                                    } = result
+                                    else {
+                                        unreachable!();
+                                    };
+                                    assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+                                }
+                            }
+                            // This usually covers data which is not meant to be instructions.
+                            Some(_) | None => {
+                                offset_in_fun += ix.len();
+                            }
+                        }
+                    }
+
+                    //
+                    //
+                    //
 
                     let object_file = object_files.objects.entry(filename).or_insert_with(|| {
                         let mut object = object::write::Object::new(
@@ -559,11 +628,6 @@ impl ObjectFiles<'static> {
                         }
                     });
 
-                    let fun_offset_in_text = offset.offset as usize;
-                    let size = size as usize;
-
-                    let fun_range_in_text = fun_offset_in_text..fun_offset_in_text + size;
-
                     let ObjectFile {
                         object,
                         data_section_id: _,
@@ -571,12 +635,8 @@ impl ObjectFiles<'static> {
                         text_section_id,
                     } = object_file;
 
-                    let fun_offset_in_coff = append_with_padding(
-                        object,
-                        *text_section_id,
-                        &text_sec_data[fun_range_in_text.clone()],
-                        0x90,
-                    );
+                    let fun_offset_in_coff =
+                        append_with_padding(object, *text_section_id, &fun_bytes, 0x90);
 
                     for (reloc_offset_in_text, reloc_kind) in text_relocs.range(fun_range_in_text) {
                         let reloc_offset_in_text = *reloc_offset_in_text as u64;
@@ -738,6 +798,7 @@ impl ObjectFiles<'static> {
                     }
 
                     object.add_symbol(object::write::Symbol {
+                        // sushi@TODO: closest symbol to name
                         name: functions
                             .get(&fun_offset_in_text)
                             .map(|fun| fun[0])
@@ -745,7 +806,7 @@ impl ObjectFiles<'static> {
                             .as_bytes()
                             .to_vec(),
                         value: fun_offset_in_coff,
-                        size: u64::MAX, /* sushi@TODO: See TODO above. text.len() as u64, */
+                        size: u64::MAX,
                         kind: object::SymbolKind::Text,
                         scope: object::SymbolScope::Linkage,
                         weak: false,

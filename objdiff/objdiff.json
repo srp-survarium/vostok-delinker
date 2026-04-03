@@ -39,6 +39,15 @@
       }
     },
     {
+      "name": "ai/search/graph_wrapper_planner_base_inline.h",
+      "target_path": "./target/ai/search/graph_wrapper_planner_base_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "ai/search/graph_wrapper_planner_forward_inline.h",
       "target_path": "./target/ai/search/graph_wrapper_planner_forward_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -104,6 +113,15 @@
     {
       "name": "ai/search/priority_queue_binary_heap_inline.h",
       "target_path": "./target/ai/search/priority_queue_binary_heap_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "ai/search/propositional_planner_base_inline.h",
+      "target_path": "./target/ai/search/propositional_planner_base_inline.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -183,6 +201,15 @@
       }
     },
     {
+      "name": "ai/search/world_state_property_inline.h",
+      "target_path": "./target/ai/search/world_state_property_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "ai/sensed_visual_object.h",
       "target_path": "./target/ai/sensed_visual_object.h.obj",
       "base_path": "./base/dummy.obj",
@@ -194,6 +221,15 @@
     {
       "name": "ai/sources/action_instance.cpp",
       "target_path": "./target/ai/sources/action_instance.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "ai/sources/action_parameter.cpp",
+      "target_path": "./target/ai/sources/action_parameter.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -230,6 +266,15 @@
     {
       "name": "ai/sources/animation_filter.cpp",
       "target_path": "./target/ai/sources/animation_filter.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "ai/sources/animation_item.cpp",
+      "target_path": "./target/ai/sources/animation_item.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -606,6 +651,15 @@
       }
     },
     {
+      "name": "ai/sources/operator_base.cpp",
+      "target_path": "./target/ai/sources/operator_base.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "ai/sources/operator_holder.cpp",
       "target_path": "./target/ai/sources/operator_holder.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -662,6 +716,15 @@
     {
       "name": "ai/sources/pddl_planner.cpp",
       "target_path": "./target/ai/sources/pddl_planner.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "ai/sources/pddl_predicate_inline.h",
+      "target_path": "./target/ai/sources/pddl_predicate_inline.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -858,6 +921,15 @@
       }
     },
     {
+      "name": "ai/sources/sound_item.cpp",
+      "target_path": "./target/ai/sources/sound_item.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "ai/sources/sound_target_selector.cpp",
       "target_path": "./target/ai/sources/sound_target_selector.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -975,6 +1047,15 @@
       }
     },
     {
+      "name": "animation/animation_player_inline.h",
+      "target_path": "./target/animation/animation_player_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "animation/bone_animation_inline.h",
       "target_path": "./target/animation/bone_animation_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -1029,6 +1110,15 @@
       }
     },
     {
+      "name": "animation/mixing_animation_interval_inline.h",
+      "target_path": "./target/animation/mixing_animation_interval_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "animation/mixing_animation_lexeme_inline.h",
       "target_path": "./target/animation/mixing_animation_lexeme_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -1049,6 +1139,15 @@
     {
       "name": "animation/mixing_animation_lexeme_parameters_inline.h",
       "target_path": "./target/animation/mixing_animation_lexeme_parameters_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "animation/mixing_base_lexeme_inline.h",
+      "target_path": "./target/animation/mixing_base_lexeme_inline.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -1085,6 +1184,15 @@
     {
       "name": "animation/mixing_multiplication_lexeme_inline.h",
       "target_path": "./target/animation/mixing_multiplication_lexeme_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "animation/mixing_n_ary_tree.h",
+      "target_path": "./target/animation/mixing_n_ary_tree.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -1274,6 +1382,15 @@
     {
       "name": "animation/sources/linear_interpolator.cpp",
       "target_path": "./target/animation/sources/linear_interpolator.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "animation/sources/mixing_animation_lexeme.cpp",
+      "target_path": "./target/animation/sources/mixing_animation_lexeme.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -1706,6 +1823,15 @@
     {
       "name": "c_array_functions.h",
       "target_path": "./target/c_array_functions.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "collision/bone_collision_data.h",
+      "target_path": "./target/collision/bone_collision_data.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -2163,6 +2289,15 @@
       }
     },
     {
+      "name": "configs_binary_config_value.h",
+      "target_path": "./target/configs_binary_config_value.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "configs_binary_config_value_inline.h",
       "target_path": "./target/configs_binary_config_value_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -2505,6 +2640,15 @@
       }
     },
     {
+      "name": "core/sources/math_convex.cpp",
+      "target_path": "./target/core/sources/math_convex.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "core/sources/math_cuboid.cpp",
       "target_path": "./target/core/sources/math_cuboid.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -2777,6 +2921,15 @@
     {
       "name": "core/sources/resources_fs_task.cpp",
       "target_path": "./target/core/sources/resources_fs_task.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "core/sources/resources_fs_task_composite.cpp",
+      "target_path": "./target/core/sources/resources_fs_task_composite.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -3396,6 +3549,15 @@
       }
     },
     {
+      "name": "debug/pointer_cast.h",
+      "target_path": "./target/debug/pointer_cast.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "debug/sources/bugtrap_win.cpp",
       "target_path": "./target/debug/sources/bugtrap_win.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -3443,6 +3605,15 @@
     {
       "name": "debug/sources/debug_win_xbox360.cpp",
       "target_path": "./target/debug/sources/debug_win_xbox360.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "debug/sources/initialize_win.cpp",
+      "target_path": "./target/debug/sources/initialize_win.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -3524,6 +3695,15 @@
     {
       "name": "engine/sources/editor_console.cpp",
       "target_path": "./target/engine/sources/editor_console.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "engine/sources/editor_console.h",
+      "target_path": "./target/engine/sources/editor_console.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -3738,6 +3918,15 @@
       }
     },
     {
+      "name": "fs/path_part_iterator.h",
+      "target_path": "./target/fs/path_part_iterator.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "fs/path_part_iterator_inline.h",
       "target_path": "./target/fs/path_part_iterator_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -3945,6 +4134,15 @@
       }
     },
     {
+      "name": "game/sources/animation_space_graph.h",
+      "target_path": "./target/game/sources/animation_space_graph.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "game/sources/animation_space_graph_cook.cpp",
       "target_path": "./target/game/sources/animation_space_graph_cook.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -4100,6 +4298,24 @@
     {
       "name": "game/sources/chat_handler.cpp",
       "target_path": "./target/game/sources/chat_handler.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "game/sources/client_player_history_item.cpp",
+      "target_path": "./target/game/sources/client_player_history_item.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "game/sources/client_player_state.cpp",
+      "target_path": "./target/game/sources/client_player_state.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -4442,6 +4658,15 @@
     {
       "name": "game/sources/login_menu.cpp",
       "target_path": "./target/game/sources/login_menu.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "game/sources/login_menu.h",
+      "target_path": "./target/game/sources/login_menu.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -5205,6 +5430,15 @@
       }
     },
     {
+      "name": "game_core/generic_anomaly_core.h",
+      "target_path": "./target/game_core/generic_anomaly_core.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "game_core/hit_initiator.h",
       "target_path": "./target/game_core/hit_initiator.h.obj",
       "base_path": "./base/dummy.obj",
@@ -5531,6 +5765,15 @@
     {
       "name": "game_core/sources/character_recoil_params.cpp",
       "target_path": "./target/game_core/sources/character_recoil_params.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "game_core/sources/client_player_update.cpp",
+      "target_path": "./target/game_core/sources/client_player_update.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -6006,6 +6249,15 @@
       }
     },
     {
+      "name": "game_core/sources/player_logic_crouch_state.h",
+      "target_path": "./target/game_core/sources/player_logic_crouch_state.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "game_core/sources/player_logic_jump_state.cpp",
       "target_path": "./target/game_core/sources/player_logic_jump_state.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -6098,6 +6350,15 @@
     {
       "name": "game_core/sources/scheduler.cpp",
       "target_path": "./target/game_core/sources/scheduler.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "game_core/sources/server_player_update.cpp",
+      "target_path": "./target/game_core/sources/server_player_update.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -6564,6 +6825,15 @@
       }
     },
     {
+      "name": "game_core/weapon_core_shotgun_reload_state.h",
+      "target_path": "./target/game_core/weapon_core_shotgun_reload_state.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "game_core/weapon_core_state_cook_template_inline.h",
       "target_path": "./target/game_core/weapon_core_state_cook_template_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -6575,6 +6845,15 @@
     {
       "name": "game_core/weapon_user_animations_container_inline.h",
       "target_path": "./target/game_core/weapon_user_animations_container_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "game_core/weapon_user_animations_selector.h",
+      "target_path": "./target/game_core/weapon_user_animations_selector.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -6834,6 +7113,15 @@
       }
     },
     {
+      "name": "managed_node_owner.h",
+      "target_path": "./target/managed_node_owner.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "math_aabb_inline.h",
       "target_path": "./target/math_aabb_inline.h.obj",
       "base_path": "./base/dummy.obj",
@@ -6998,6 +7286,15 @@
     {
       "name": "memory_associative_chunk_reader_inline.h",
       "target_path": "./target/memory_associative_chunk_reader_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "memory_base_allocator.h",
+      "target_path": "./target/memory_base_allocator.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -7466,6 +7763,15 @@
     {
       "name": "network_core/udp_match_packet.h",
       "target_path": "./target/network_core/udp_match_packet.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "network_core/udp_match_packets_allocator.h",
+      "target_path": "./target/network_core/udp_match_packets_allocator.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -8481,6 +8787,24 @@
       }
     },
     {
+      "name": "render/core/shader_constant_inline.h",
+      "target_path": "./target/render/core/shader_constant_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "render/core/shader_constant_table.h",
+      "target_path": "./target/render/core/shader_constant_table.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "render/core/sources/event_query.cpp",
       "target_path": "./target/render/core/sources/event_query.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -8564,6 +8888,15 @@
     {
       "name": "render/engine/sources/box_geometry.cpp",
       "target_path": "./target/render/engine/sources/box_geometry.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "render/engine/sources/camera_inline.h",
+      "target_path": "./target/render/engine/sources/camera_inline.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -9867,6 +10200,15 @@
       }
     },
     {
+      "name": "render/engine/sources/render_model_grass.h",
+      "target_path": "./target/render/engine/sources/render_model_grass.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "render/engine/sources/render_model_skeleton.cpp",
       "target_path": "./target/render/engine/sources/render_model_skeleton.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -10184,6 +10526,15 @@
     {
       "name": "render/engine/sources/speedtree_tree.cpp",
       "target_path": "./target/render/engine/sources/speedtree_tree.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "render/engine/sources/speedtree_tree.h",
+      "target_path": "./target/render/engine/sources/speedtree_tree.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -10713,6 +11064,15 @@
       }
     },
     {
+      "name": "render/facade/sources/engine_renderer.cpp",
+      "target_path": "./target/render/facade/sources/engine_renderer.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "render/facade/sources/functor_command.cpp",
       "target_path": "./target/render/facade/sources/functor_command.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -11109,8 +11469,26 @@
       }
     },
     {
+      "name": "sound/functor_command.h",
+      "target_path": "./target/sound/functor_command.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "sound/single_sound.h",
       "target_path": "./target/sound/single_sound.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "sound/sound_spl.h",
+      "target_path": "./target/sound/sound_spl.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -11147,6 +11525,15 @@
     {
       "name": "sound/sources/debug_statistic.cpp",
       "target_path": "./target/sound/sources/debug_statistic.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "sound/sources/encoded_sound_interface.cpp",
+      "target_path": "./target/sound/sources/encoded_sound_interface.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -11586,6 +11973,15 @@
       }
     },
     {
+      "name": "sound/sources/sound_world.h",
+      "target_path": "./target/sound/sources/sound_world.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "sound/sources/sound_world_orders.cpp",
       "target_path": "./target/sound/sources/sound_world_orders.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -11660,6 +12056,15 @@
     {
       "name": "stdlib_extensions_inline.h",
       "target_path": "./target/stdlib_extensions_inline.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "strings_concatenations.h",
+      "target_path": "./target/strings_concatenations.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -12261,6 +12666,15 @@
       }
     },
     {
+      "name": "vfs/sources/fat_header.cpp",
+      "target_path": "./target/vfs/sources/fat_header.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "vfs/sources/find_async.cpp",
       "target_path": "./target/vfs/sources/find_async.cpp.obj",
       "base_path": "./base/dummy.obj",
@@ -12290,6 +12704,15 @@
     {
       "name": "vfs/sources/find_async_tree.cpp",
       "target_path": "./target/vfs/sources/find_async_tree.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "vfs/sources/find_environment.h",
+      "target_path": "./target/vfs/sources/find_environment.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -12495,6 +12918,15 @@
       }
     },
     {
+      "name": "vfs/sources/mount_referers.h",
+      "target_path": "./target/vfs/sources/mount_referers.h.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "vfs/sources/mount_root_node_base.h",
       "target_path": "./target/vfs/sources/mount_root_node_base.h.obj",
       "base_path": "./base/dummy.obj",
@@ -12542,6 +12974,15 @@
     {
       "name": "vfs/sources/mounter.cpp",
       "target_path": "./target/vfs/sources/mounter.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "vfs/sources/mounter.h",
+      "target_path": "./target/vfs/sources/mounter.h.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
@@ -12648,8 +13089,26 @@
       }
     },
     {
+      "name": "vfs/sources/test_find.cpp",
+      "target_path": "./target/vfs/sources/test_find.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
       "name": "vfs/sources/test_log.cpp",
       "target_path": "./target/vfs/sources/test_log.cpp.obj",
+      "base_path": "./base/dummy.obj",
+      "scratch": {
+        "platform": "win32",
+        "compiler": "msvc8.0"
+      }
+    },
+    {
+      "name": "vfs/sources/test_utils.cpp",
+      "target_path": "./target/vfs/sources/test_utils.cpp.obj",
       "base_path": "./base/dummy.obj",
       "scratch": {
         "platform": "win32",
