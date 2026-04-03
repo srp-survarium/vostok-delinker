@@ -1,15 +1,20 @@
 #![feature(os_string_truncate)]
 
-use std::collections::{BTreeMap, HashMap};
+// notes:
+// 170k relocs total
+//
+//
+// 100k relocs in text
+//
+// 16k function relocs in text
+// 4k exact function relocs in text
+//
+// 41k const relocs in text
 
-use object::read::pe::{PeFile32, PeSection};
+use std::collections::{btree_map, BTreeMap, HashMap};
+
+use object::read::pe::PeSection;
 use object::LittleEndian;
-
-use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
-use capstone::arch::ArchOperand;
-use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
-use capstone::Capstone;
-use capstone::InsnGroupType::*;
 
 use object::{Object, ObjectSection, SectionKind};
 
@@ -29,21 +34,6 @@ pub struct ObjectFile {
     pub text_section_id: object::write::SectionId,
 }
 
-#[derive(Clone, Debug)]
-pub struct Executable<'a> {
-    // `HashMap` was chosen, because we need to make lookups
-    // based on what function calls or jumps to.
-    //
-    // `Vec` is always `NonEmpty`.
-    pub functions: HashMap<usize, Vec<Function<'a>>>,
-
-    // Offsets into .data
-    pub statics: BTreeMap<usize, RawString<'a>>,
-
-    // Offsets into .rdata
-    pub consts: BTreeMap<usize, RawString<'a>>,
-}
-
 // Address - Offset from the beginning of executable
 // Offset  - Offset from a certain section
 // Rva     - Offset from ImageBase (correct?)
@@ -52,15 +42,7 @@ pub struct Executable<'a> {
 pub struct SecInfo<'a> {
     pub rva: usize,
     pub size: usize,
-
-    pub address: usize,
-    pub data: &'a [u8],
-}
-#[derive(Clone, Debug)]
-pub struct Function<'a> {
-    pub name: RawString<'a>,
-    pub mangled_name: Option<RawString<'a>>,
-    pub filename: Option<RawString<'a>>,
+    pub id: u16,
 
     pub address: usize,
     pub data: &'a [u8],
@@ -154,38 +136,33 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     exe: object::read::pe::PeFile32<'static>,
     pdb: pdb2::PDB<'static, S>,
 ) -> anyhow::Result<()> {
-    let ctx = Capstone::new()
-        .x86()
-        .mode(ArchMode::Mode32)
-        .syntax(ArchSyntax::Intel)
-        .detail(true)
-        .build()
-        .expect("Cannot create Capstone context");
-
     let exe: &'static object::read::pe::PeFile32 = leak(exe);
 
-    let object_files = Executable::parse(exe, pdb)?.build_object_files(&ctx)?;
-
+    let object_files = ObjectFiles::parse(exe, pdb)?;
     object_files.write(std::path::Path::new("objdiff/target"))?;
 
     Ok(())
 }
 
-impl Executable<'static> {
+impl ObjectFiles<'static> {
     fn parse<S: pdb2::Source<'static> + 'static>(
         exe: &'static object::read::pe::PeFile32<'static>,
         mut pdb: pdb2::PDB<'static, S>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<ObjectFiles<'static>> {
         let image_base = exe
             .nt_headers()
             .optional_header
             .image_base
             .get(LittleEndian);
 
+        let dbi = leak(pdb.debug_information()?);
+        let string_table: &'static pdb2::StringTable<'static> = leak(pdb.string_table()?);
+
         let build_sec_info = |sec: PeSection<'static, 'static, _>| {
             Ok::<_, anyhow::Error>(SecInfo {
                 rva: sec.address() as usize - image_base as usize,
                 size: sec.size() as usize,
+                id: sec.index().0 as u16,
 
                 address: sec.address() as usize,
                 data: sec.data()?,
@@ -195,408 +172,593 @@ impl Executable<'static> {
         let Some(text_sec) = exe.section_by_name(".text") else {
             anyhow::bail!("Missing .text section");
         };
-        let Some(data_sec) = exe.section_by_name(".data") else {
-            anyhow::bail!("Missing .data section");
-        };
         let Some(rdata_sec) = exe.section_by_name(".rdata") else {
             anyhow::bail!("Missing .rdata section");
         };
-
-        let Some(reloc_sec) = exe.section_by_name(".reloc") else {
-            anyhow::bail!("Missing .reloc section");
+        let Some(data_sec) = exe.section_by_name(".data") else {
+            anyhow::bail!("Missing .data section");
         };
-        print_reloc(exe);
 
-        let text_sec_info = build_sec_info(text_sec)?;
-        let data_sec_info = build_sec_info(data_sec)?;
-        let rdata_sec_info = build_sec_info(rdata_sec)?;
+        let text = build_sec_info(text_sec)?;
+        let rdata = build_sec_info(rdata_sec)?;
+        let data = build_sec_info(data_sec)?;
 
         //
-        //
+        // rva, offset, address
         //
 
-        let mut statics = BTreeMap::<usize, RawString<'static>>::new();
-        let mut functions = HashMap::<usize, Vec<Function<'static>>>::new();
+        let mut functions = BTreeMap::<usize, Vec<RawString>>::new();
+        let mut statics = BTreeMap::<usize, RawString>::new();
+        let mut strings = BTreeMap::<usize, (RawString, Vec<u8>)>::new();
 
-        let symbol_table: &'static pdb2::SymbolTable<'static> = leak(pdb.global_symbols()?);
-        let mangled_table = {
+        {
+            let symbol_table: &'static pdb2::SymbolTable = leak(pdb.global_symbols()?);
+
+            // Additional non-mangled constants from `Data` symbols.
+            // Only used for symbols not found in `Public` symbols.
+            // (@NOTE: might be useless, we will see)
+            let mut data_statics = vec![];
+
             let mut symbols = symbol_table.iter();
-            let mut mangled_table = HashMap::<usize, Vec<RawString>>::new();
-
-            const RDATA_SECTION: u16 = 2;
-            const DATA_SECTION: u16 = 3;
-
-            // TODO
-            // 1. Find all relocations in survarium.exe.
-            // 2. Subtract original offset the executable wants to be loaded at.
-            // 3. Build BTreeMap to find closest symbolic relocation
-            // 4. Write a relocation and leave offset in there (most often it will be 0)
-
             while let Some(symbol) = symbols.next()? {
                 match symbol.parse() {
-                    Ok(pdb2::SymbolData::Public(data)) if data.function => {
-                        let offset = data.offset.offset as usize;
-                        mangled_table.entry(offset).or_default().push(data.name);
-                    }
-                    Ok(pdb2::SymbolData::Public(data)) if data.offset.section == DATA_SECTION => {
-                        let offset = data.offset.offset as usize;
+                    Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol {
+                        function,
+                        offset,
+                        name,
+                        ..
+                    })) if function => {
+                        assert_eq!(offset.section, text.id);
 
-                        let result = statics.insert(offset, data.name);
-                        if let Some(value) = result {
-                            anyhow::bail!("Conflict at offset: {value}");
+                        let offset = offset.offset as usize;
+
+                        functions.entry(offset).or_default().push(name);
+                    }
+
+                    Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }))
+                        if offset.section == rdata.id && name.as_bytes().starts_with(b"??_C@_") =>
+                    {
+                        let offset = offset.offset as usize;
+
+                        let msvc_demangler::Type::ConstantString(string) =
+                            msvc_demangler::parse(&name.to_string())?.symbol_type
+                        else {
+                            continue;
+                        };
+
+                        let result = strings.insert(offset, (name, string));
+                        assert_eq!(result, None);
+                    }
+
+                    Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }))
+                        if offset.section == data.id =>
+                    {
+                        let offset = offset.offset as usize;
+
+                        let old_value = statics.insert(offset, name);
+                        if let Some(value) = old_value {
+                            anyhow::bail!(
+                                "Conflict at offset {offset:x?} between '{value}' and '{name}'"
+                            );
                         }
                     }
-                    Ok(pdb2::SymbolData::Public(data)) if data.offset.section == RDATA_SECTION => {
-                        // constants will be extracted differently
+
+                    // Ignored for now.
+                    // There are not that many symbols and the ones with types are either U64 or F80.
+                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, .. }))
+                        if offset.section == rdata.id => {}
+
+                    // in public they are mangled
+                    // in data all symbols are not mangled, yes
+                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. }))
+                        if offset.section == data.id =>
+                    {
+                        let offset = offset.offset as usize;
+
+                        data_statics.push((offset, name));
                     }
                     _ => {}
                 }
             }
-            mangled_table
+
+            for (offset, name) in data_statics {
+                let entry = statics.entry(offset);
+                match entry {
+                    btree_map::Entry::Vacant(entry) => {
+                        entry.insert(name);
+                    }
+                    _ => (),
+                }
+            }
         };
 
-        //
-        // Extract all functions from the executable
-        //
+        {
+            let mut modules = dbi.modules()?;
 
-        let dbi = leak(pdb.debug_information()?);
-        let string_table: &'static pdb2::StringTable<'static> = leak(pdb.string_table()?);
-
-        let mut modules = dbi.modules()?;
-
-        while let Some(module) = modules.next()? {
-            let Some(module_info) = pdb.module_info(&module)? else {
-                continue;
-            };
-            let module_info = leak(module_info);
-
-            let program = module_info.line_program()?;
-            let mut iter = module_info.symbols()?;
-
-            while let Some(symbol) = iter.next()? {
-                let (name, offset, len) = match symbol.parse() {
-                    Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
-                        name,
-                        offset,
-                        len,
-                        ..
-                    })) => (name, offset, len),
-                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
-                        offset, len, name, ..
-                    })) => (name, offset, len.into()),
-                    _ => continue,
+            while let Some(module) = modules.next()? {
+                let Some(module_info) = pdb.module_info(&module)? else {
+                    continue;
                 };
+                let module_info = leak(module_info);
 
-                let function = Function::extract(
-                    text_sec_info,
-                    &program,
-                    string_table,
-                    &mangled_table,
-                    name,
-                    offset,
-                    len,
-                )?;
+                let mut iter = module_info.symbols()?;
 
-                functions
-                    .entry(function.address)
-                    .or_default()
-                    .push(function);
+                while let Some(symbol) = iter.next()? {
+                    let (name, offset) = match symbol.parse() {
+                        Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
+                            name,
+                            offset,
+                            ..
+                        })) => (name, offset),
+                        Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol { offset, name, .. })) => {
+                            (name, offset)
+                        }
+                        _ => continue,
+                    };
+
+                    match functions.entry(offset.offset as usize) {
+                        btree_map::Entry::Vacant(entry) => {
+                            entry.insert(vec![name]);
+                        }
+                        _ => (),
+                    }
+                }
             }
         }
 
         //
-        // Extract all statics from the executable
+        // Fix all relocations in the text section of the executable.
+        // @NOTE: They can be in other parts
         //
 
-        for (k, v) in statics.iter() {
-            println!("0x{:x?}, {v}", k);
+        enum RelocKind<'a> {
+            // .text
+            Function {
+                overloads: &'a [RawString<'static>],
+            },
+
+            // .rdata
+            ConstantString {
+                symbol: RawString<'static>,
+                data: &'a [u8],
+            },
+            ConstantValue {
+                data: [u8; 4], // first 4 bytes
+            },
+
+            // .data
+            // @TODO: Distinguish uninit vs. init statics
+            Static {
+                symbol: RawString<'static>,
+            },
         }
 
-        Ok(Self {
-            functions,
-            statics,
-            consts: BTreeMap::default(),
-        })
-    }
+        let mut text_sec_data = text.data.to_vec();
+        let mut text_relocs = BTreeMap::<usize, RelocKind>::new();
 
-    fn build_object_files(self, ctx: &Capstone) -> anyhow::Result<ObjectFiles<'static>> {
+        let Some(reloc_sec) = exe.section_by_name(".reloc") else {
+            anyhow::bail!("Missing .reloc section");
+        };
+
+        {
+            #[repr(C)]
+            #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
+            struct RelocHeader {
+                page_rva: u32,
+                block_size: u32,
+            }
+            const HEADER_SIZE: usize = std::mem::size_of::<RelocHeader>();
+
+            #[repr(C)]
+            #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
+            struct RelocEntry {
+                entry: u16,
+            }
+
+            let mut pos = 0;
+            let reloc_data = reloc_sec.data()?;
+            while pos + HEADER_SIZE <= reloc_data.len() {
+                let RelocHeader {
+                    page_rva,
+                    block_size,
+                } = bytemuck::pod_read_unaligned(&reloc_data[pos..pos + HEADER_SIZE]);
+
+                if block_size == 0 || block_size < 8 {
+                    break;
+                }
+
+                let entries: &[RelocEntry] =
+                    bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..pos + block_size as usize]);
+                pos += block_size as usize;
+
+                for RelocEntry { entry } in entries {
+                    let reloc_type = entry >> 12;
+                    let reloc_offset = entry & 0x0FFF;
+
+                    const RELOC_TYP_HIGHLOW: u16 = 3;
+
+                    if reloc_type != RELOC_TYP_HIGHLOW {
+                        continue;
+                    }
+
+                    let reloc_rva = (page_rva + u32::from(reloc_offset)) as usize;
+                    let in_text = (text.rva..text.rva + text.size).contains(&reloc_rva);
+
+                    // this is that "cornercase"
+                    if !in_text {
+                        continue;
+                    }
+
+                    let offset_in_text = (reloc_rva - text.rva) as usize;
+                    let target_va: u32 = bytemuck::pod_read_unaligned(
+                        &text_sec_data[offset_in_text..offset_in_text + 4],
+                    );
+                    let target_va = target_va as usize;
+
+                    match () {
+                        () if (text.address..text.address + text.size).contains(&target_va) => {
+                            let target_offset_in_text = target_va - text.address;
+
+                            let (function_offset_in_text, function_names) = functions
+                                .range(..=target_offset_in_text)
+                                .next_back()
+                                .expect("all function relocs to be named");
+
+                            text_sec_data[offset_in_text..offset_in_text + 4].copy_from_slice(
+                                &u32::to_le_bytes(
+                                    (target_offset_in_text - *function_offset_in_text) as u32,
+                                ),
+                            );
+                            text_relocs.insert(
+                                offset_in_text,
+                                RelocKind::Function {
+                                    overloads: function_names,
+                                },
+                            );
+                        }
+                        () if (rdata.address..rdata.address + rdata.size).contains(&target_va) => {
+                            let target_offset_in_rdata = target_va - rdata.address;
+
+                            match strings.range(..=target_offset_in_rdata).next_back() {
+                                Some((string_offset_in_rdata, (string_mangled_name, string)))
+                                    if target_offset_in_rdata - string_offset_in_rdata
+                                        < string.len() =>
+                                {
+                                    text_sec_data[offset_in_text..offset_in_text + 4]
+                                        .copy_from_slice(&u32::to_le_bytes(
+                                            (target_offset_in_rdata - *string_offset_in_rdata)
+                                                as u32,
+                                        ));
+
+                                    text_relocs.insert(
+                                        offset_in_text,
+                                        RelocKind::ConstantString {
+                                            symbol: *string_mangled_name,
+                                            data: string,
+                                        },
+                                    );
+                                }
+                                _ => {
+                                    text_relocs.insert(
+                                        offset_in_text,
+                                        RelocKind::ConstantValue {
+                                            data: bytemuck::pod_read_unaligned(
+                                                &rdata.data[target_offset_in_rdata
+                                                    ..target_offset_in_rdata + 4],
+                                            ),
+                                        },
+                                    );
+                                }
+                            };
+                        }
+                        () if (data.address..data.address + data.size).contains(&target_va) => {
+                            let target_offset_in_data = target_va - data.address;
+
+                            let (static_offset_in_data, static_name) = statics
+                                .range(..=target_offset_in_data)
+                                .next_back()
+                                .expect("all statics relocs to be named");
+
+                            text_sec_data[offset_in_text..offset_in_text + 4].copy_from_slice(
+                                &u32::to_le_bytes(
+                                    (target_offset_in_data - *static_offset_in_data) as u32,
+                                ),
+                            );
+                            text_relocs.insert(
+                                offset_in_text,
+                                RelocKind::Static {
+                                    symbol: *static_name,
+                                },
+                            );
+                        }
+                        () => (),
+                    }
+                }
+            }
+        }
+
         let mut object_files = ObjectFiles {
             objects: HashMap::new(),
         };
-        for fun in self.functions.values().flatten() {
-            /*
-                 0x00026440: push ebp
-                 0x00026441: mov ebp, esp
-                 0x00026443: push ecx
-                 0x00026444: mov dword ptr [ebp - 4], ecx
-                 0x00026447: mov eax, dword ptr [ebp - 4]
-                 0x0002644a: mov dword ptr [eax], 0x956030 <-- this stinks
-                 0x00026450: mov ecx, dword ptr [ebp + 8]
-                 0x00026453: and ecx, 1
-                 0x00026456: je 0x26464
-                 0x00026458: mov edx, dword ptr [ebp - 4]
-                 0x0002645b: push edx
-                 0x0002645c: call 0x189dfc
-                 0x00026461: add esp, 4
-                 0x00026464: mov eax, dword ptr [ebp - 4]
-                 0x00026467: mov esp, ebp
-                 0x00026469: pop ebp
-                 0x0002646a: ret 4
-            */
-            // let search_for =
-            //     b"vostok::fs_new::asynchronous_device_query::`scalar deleting destructor'";
-            // if !fun
-            //     .name
-            //     .as_bytes()
-            //     .windows(search_for.len())
-            //     .any(|w| w == search_for)
-            // {
-            //     continue;
-            // }
-            // println!("processing: {} -> {:?}", fun.name, fun.filename);
-            // println!("found: {}", fun.name);
-            //
-            // println!("\n{}", std::str::from_utf8(fun.name.as_bytes())?);
-            // let ixs = ctx.disasm_all(fun.data, fun.address as u64)?;
-            // for ix in ixs.iter() {
-            //     println!(
-            //         "{:#010x?}: {} {}",
-            //         ix.address(),
-            //         ix.mnemonic().unwrap_or(""),
-            //         ix.op_str().unwrap_or("")
-            //     );
-            // }
+        {
+            let mut modules = dbi.modules()?;
 
-            const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok\\";
-            let filename: &'static [u8] = match fun.filename {
-                Some(filename) => match filename.as_bytes().strip_prefix(VOSTOK_PREFIX) {
-                    Some(filename) => filename,
-                    None => b"msvc_internal\\functions",
-                },
-                // See [2]
-                None => continue,
-            };
+            while let Some(module) = modules.next()? {
+                let Some(module_info) = pdb.module_info(&module)? else {
+                    continue;
+                };
+                let module_info = leak(module_info);
 
-            let object_file = object_files.objects.entry(filename).or_insert_with(|| {
-                let mut object = object::write::Object::new(
-                    object::BinaryFormat::Coff,
-                    object::Architecture::I386,
-                    object::Endianness::Little,
-                );
+                let program = module_info.line_program()?;
+                let mut iter = module_info.symbols()?;
 
-                let data_section_id =
-                    object.add_section(vec![], b".data".into(), SectionKind::Data);
-                let rdata_section_id =
-                    object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
-                let text_section_id =
-                    object.add_section(vec![], b".text".into(), SectionKind::Text);
+                while let Some(symbol) = iter.next()? {
+                    let (name, offset, size) = match symbol.parse() {
+                        Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
+                            name,
+                            offset,
+                            len,
+                            ..
+                        })) => (name, offset, len),
+                        Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
+                            offset,
+                            len,
+                            name,
+                            ..
+                        })) => (name, offset, len.into()),
+                        _ => continue,
+                    };
 
-                ObjectFile {
-                    object,
-                    data_section_id,
-                    rdata_section_id,
-                    text_section_id,
+                    let mut filename = None;
+
+                    let mut lines = program.lines_for_symbol(offset);
+                    // Extracting only a single line should be enough to find a source file.
+                    if let Some(line_info) = lines.next()? {
+                        let file_info = program.get_file_info(line_info.file_index)?;
+                        filename = Some(string_table.get(file_info.name)?);
+                    }
+
+                    const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\vostok\\";
+                    let filename: &'static [u8] = match filename {
+                        Some(filename) => match filename.as_bytes().strip_prefix(VOSTOK_PREFIX) {
+                            Some(filename) => filename,
+                            None => b"msvc_internal\\functions",
+                        },
+                        // See [2]
+                        None => continue,
+                    };
+
+                    // sushi@TODO: RELOCs for jumps
+
+                    // if name.as_bytes() != b"survarium::network_client::process_sync_response"
+                    // // vostok::sound::sound_debug_stats::draw_overall_stats"
+                    // // vostok::ai::damage_sensor_parameters::damage_sensor_parameters"
+                    // {
+                    //     continue;
+                    // }
+
+                    let object_file = object_files.objects.entry(filename).or_insert_with(|| {
+                        let mut object = object::write::Object::new(
+                            object::BinaryFormat::Coff,
+                            object::Architecture::I386,
+                            object::Endianness::Little,
+                        );
+
+                        let data_section_id =
+                            object.add_section(vec![], b".data".into(), SectionKind::Data);
+                        let rdata_section_id =
+                            object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
+                        let text_section_id =
+                            object.add_section(vec![], b".text".into(), SectionKind::Text);
+
+                        ObjectFile {
+                            object,
+                            data_section_id,
+                            rdata_section_id,
+                            text_section_id,
+                        }
+                    });
+
+                    let fun_offset_in_text = offset.offset as usize;
+                    let size = size as usize;
+
+                    let fun_range_in_text = fun_offset_in_text..fun_offset_in_text + size;
+
+                    let ObjectFile {
+                        object,
+                        data_section_id: _,
+                        rdata_section_id,
+                        text_section_id,
+                    } = object_file;
+
+                    let fun_offset_in_coff = append_with_padding(
+                        object,
+                        *text_section_id,
+                        &text_sec_data[fun_range_in_text.clone()],
+                        0x90,
+                    );
+
+                    for (reloc_offset_in_text, reloc_kind) in text_relocs.range(fun_range_in_text) {
+                        let reloc_offset_in_text = *reloc_offset_in_text as u64;
+                        match reloc_kind {
+                            RelocKind::Static { symbol: reloc_name } => {
+                                let reloc_symbol = object.add_symbol(object::write::Symbol {
+                                    name: reloc_name.as_bytes().to_vec(),
+                                    value: 0,
+                                    size: u64::MAX,
+                                    kind: object::SymbolKind::Unknown,
+                                    scope: object::SymbolScope::Linkage,
+                                    weak: false,
+                                    section: object::write::SymbolSection::Undefined,
+                                    flags: object::SymbolFlags::None,
+                                });
+
+                                let reloc_offset_in_fun =
+                                    reloc_offset_in_text - fun_offset_in_text as u64;
+                                object.add_relocation(
+                                    *text_section_id,
+                                    object::write::Relocation {
+                                        offset: fun_offset_in_coff + reloc_offset_in_fun,
+                                        symbol: reloc_symbol,
+                                        addend: -4,
+                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
+                                        flags: object::RelocationFlags::Generic {
+                                            kind: object::RelocationKind::Relative,
+                                            encoding: object::RelocationEncoding::Generic,
+                                            size: 32,
+                                        },
+                                    },
+                                )?;
+                            }
+                            RelocKind::Function { overloads } => {
+                                let reloc_name = overloads[0]; // sushi@TODO: Choose the closest match
+
+                                let reloc_symbol = object.add_symbol(object::write::Symbol {
+                                    name: reloc_name.as_bytes().to_vec(),
+                                    value: 0,
+                                    size: u64::MAX,
+                                    kind: object::SymbolKind::Unknown,
+                                    scope: object::SymbolScope::Linkage,
+                                    weak: false,
+                                    section: object::write::SymbolSection::Undefined,
+                                    flags: object::SymbolFlags::None,
+                                });
+
+                                let reloc_offset_in_fun =
+                                    reloc_offset_in_text - fun_offset_in_text as u64;
+                                object.add_relocation(
+                                    *text_section_id,
+                                    object::write::Relocation {
+                                        offset: fun_offset_in_coff + reloc_offset_in_fun,
+                                        symbol: reloc_symbol,
+                                        addend: -4,
+                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
+                                        flags: object::RelocationFlags::Generic {
+                                            kind: object::RelocationKind::Relative,
+                                            encoding: object::RelocationEncoding::Generic,
+                                            size: 32,
+                                        },
+                                    },
+                                )?;
+                            }
+                            RelocKind::ConstantValue { data } => {
+                                // sushi@TODO: data might be reloc as well, so needs to be handled properly
+                                let reloc_name =
+                                    format!("value_0x{:x?}", u32::from_le_bytes(*data));
+
+                                let const_offset_in_coff =
+                                    append_with_padding(object, *rdata_section_id, data, 0x00);
+
+                                let reloc_symbol = object.add_symbol(object::write::Symbol {
+                                    name: reloc_name.as_bytes().to_vec(),
+                                    value: const_offset_in_coff,
+                                    size: u64::MAX,
+                                    kind: object::SymbolKind::Data,
+                                    scope: object::SymbolScope::Linkage,
+                                    weak: false,
+                                    section: object::write::SymbolSection::Section(
+                                        *rdata_section_id,
+                                    ),
+                                    flags: object::SymbolFlags::None,
+                                });
+
+                                let reloc_offset_in_fun =
+                                    reloc_offset_in_text - fun_offset_in_text as u64;
+                                object.add_relocation(
+                                    *text_section_id,
+                                    object::write::Relocation {
+                                        offset: fun_offset_in_coff + reloc_offset_in_fun,
+                                        symbol: reloc_symbol,
+                                        addend: -4,
+                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
+                                        flags: object::RelocationFlags::Generic {
+                                            kind: object::RelocationKind::Relative,
+                                            encoding: object::RelocationEncoding::Generic,
+                                            size: 32,
+                                        },
+                                    },
+                                )?;
+                            }
+                            RelocKind::ConstantString { symbol, data } => {
+                                let reloc_name = match () {
+                                    () if symbol.as_bytes().starts_with(b"??_C@_0") => data
+                                        .iter()
+                                        .copied()
+                                        .map(|c| match c.is_ascii_alphanumeric() {
+                                            true => c,
+                                            false => b'_',
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    () if symbol.as_bytes().starts_with(b"??_C@_1") => data
+                                        .windows(2)
+                                        .map(|c| {
+                                            match c[0] == b'0' && c[1].is_ascii_alphanumeric() {
+                                                true => c[1],
+                                                false => b'_',
+                                            }
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    () => unreachable!(),
+                                };
+
+                                let const_offset_in_coff =
+                                    append_with_padding(object, *rdata_section_id, data, 0x00);
+
+                                let reloc_symbol = object.add_symbol(object::write::Symbol {
+                                    name: reloc_name,
+                                    value: const_offset_in_coff,
+                                    size: u64::MAX,
+                                    kind: object::SymbolKind::Data,
+                                    scope: object::SymbolScope::Linkage,
+                                    weak: false,
+                                    section: object::write::SymbolSection::Section(
+                                        *rdata_section_id,
+                                    ),
+                                    flags: object::SymbolFlags::None,
+                                });
+
+                                let reloc_offset_in_fun =
+                                    reloc_offset_in_text - fun_offset_in_text as u64;
+                                object.add_relocation(
+                                    *text_section_id,
+                                    object::write::Relocation {
+                                        offset: fun_offset_in_coff + reloc_offset_in_fun,
+                                        symbol: reloc_symbol,
+                                        addend: -4,
+                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
+                                        flags: object::RelocationFlags::Generic {
+                                            kind: object::RelocationKind::Relative,
+                                            encoding: object::RelocationEncoding::Generic,
+                                            size: 32,
+                                        },
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+
+                    object.add_symbol(object::write::Symbol {
+                        name: functions
+                            .get(&fun_offset_in_text)
+                            .map(|fun| fun[0])
+                            .unwrap_or(name)
+                            .as_bytes()
+                            .to_vec(),
+                        value: fun_offset_in_coff,
+                        size: u64::MAX, /* sushi@TODO: See TODO above. text.len() as u64, */
+                        kind: object::SymbolKind::Text,
+                        scope: object::SymbolScope::Linkage,
+                        weak: false,
+                        section: object::write::SymbolSection::Section(*text_section_id),
+                        flags: object::SymbolFlags::None,
+                    });
                 }
-            });
-
-            self.append_to_object_file(object_file, ctx, fun)?;
+            }
         }
 
         Ok(object_files)
     }
 
-    fn append_to_object_file(
-        &self,
-        object_file: &mut ObjectFile,
-        ctx: &Capstone,
-        fun: &Function,
-    ) -> anyhow::Result<()> {
-        // let mut data: Vec<u8> = Vec::new();
-        // let mut rdata: Vec<u8> = Vec::new();
-        let mut text: Vec<u8> = Vec::new();
-
-        let mut relocations: Vec<(usize, RawString)> = Vec::new();
-
-        let ixs = ctx.disasm_all(fun.data, fun.address as u64)?;
-        for ix in ixs.iter() {
-            // println!("{} {}", ix.mnemonic().unwrap(), ix.op_str().unwrap());
-
-            let detail = ctx.insn_detail(ix)?;
-            let arch_detail = detail.arch_detail();
-
-            let groups = detail.groups().iter().map(|v| u32::from(v.0));
-
-            let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
-
-            if !is_branch {
-                // let _ =
-                //     self.mov_static_instruction(arch_detail, ix, fun, &mut text, &mut relocations);
-                continue;
-            }
-
-            let ops = arch_detail.operands();
-            assert_eq!(ops.len(), 1);
-
-            let ArchOperand::X86Operand(X86Operand {
-                op_type: X86OperandType::Imm(target_address),
-                ..
-            }) = ops[0]
-            else {
-                unreachable!()
-            };
-            let internal_branch =
-                (fun.address..fun.address + fun.data.len()).contains(&(target_address as usize));
-            if internal_branch {
-                // sushi@TODO: Should offset be fixed?
-                text.extend_from_slice(ix.bytes());
-                continue;
-            }
-
-            match self.functions.get(&(target_address as usize)) {
-                Some(target_funs) if ix.len() > 4 => {
-                    let (op, _addr) = ix
-                        .bytes()
-                        .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
-                    text.extend_from_slice(op);
-                    text.extend_from_slice(&0_u32.to_le_bytes());
-
-                    // text.extend_from_slice(ix.bytes());
-
-                    let reloc_name = find_closest_symbol(
-                        fun.name,
-                        target_funs.iter().map(|target_fun| {
-                            target_fun.mangled_name.as_ref().unwrap_or(&target_fun.name)
-                        }),
-                    );
-                    let reloc_start = text.len() - std::mem::size_of::<u32>();
-
-                    relocations.push((reloc_start, reloc_name));
-                }
-                // This usually covers data which is not meant to be instructions.
-                Some(_) | None => {
-                    text.extend_from_slice(ix.bytes());
-
-                    // let (op, _addr) = ix
-                    //     .bytes()
-                    //     .split_at(ix.bytes().len() - std::mem::size_of::<u32>());
-                    // text.extend_from_slice(op);
-                    // text.extend_from_slice(&0_u32.to_le_bytes());
-                }
-            }
-        }
-
-        let ObjectFile {
-            object,
-            data_section_id: _,
-            rdata_section_id: _,
-            text_section_id,
-        } = object_file;
-
-        let offset = object.append_section_data(*text_section_id, &text, 1);
-
-        // sushi@TODO: `object` crate doesn't(?) allow specifying auxiliary symbols.
-        // Because of that 1-3 bytes of garbage are generated which objdiff doesn't like.
-        // We replace those bytes with `nop`s and pad all of the functions ourselves,
-        // which fixes the problem, but this is a hack, which needs to be fixed at some point.
-        let padding: &[u8] = match 4 - text.len() % 4 {
-            1 => &[0x90],
-            2 => &[0x90, 0x90],
-            3 => &[0x90, 0x90, 0x90],
-            _ => &[],
-        };
-        if !padding.is_empty() {
-            _ = object.append_section_data(*text_section_id, padding, 1);
-        }
-
-        for (reloc_start, reloc_name) in relocations {
-            // Consider all symbols external.
-            // This is fine for us, since we only care about matches.
-            let reloc_symbol = object.add_symbol(object::write::Symbol {
-                name: reloc_name.as_bytes().to_vec(),
-                value: 0,
-                size: u64::MAX,
-                kind: object::SymbolKind::Unknown,
-                scope: object::SymbolScope::Linkage,
-                weak: false,
-                section: object::write::SymbolSection::Undefined,
-                flags: object::SymbolFlags::None,
-            });
-
-            object.add_relocation(
-                *text_section_id,
-                object::write::Relocation {
-                    offset: offset + reloc_start as u64,
-                    symbol: reloc_symbol,
-                    addend: -4,
-                    //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
-                    flags: object::RelocationFlags::Generic {
-                        kind: object::RelocationKind::Relative,
-                        encoding: object::RelocationEncoding::Generic,
-                        size: 32,
-                    },
-                },
-            )?;
-        }
-
-        object.add_symbol(object::write::Symbol {
-            name: fun.mangled_name.unwrap_or(fun.name).as_bytes().to_vec(),
-            value: offset,
-            size: u64::MAX, /* sushi@TODO: See TODO above. text.len() as u64, */
-            kind: object::SymbolKind::Text,
-            scope: object::SymbolScope::Linkage,
-            weak: false,
-            section: object::write::SymbolSection::Section(*text_section_id),
-            flags: object::SymbolFlags::None,
-        });
-
-        Ok(())
-    }
-}
-
-impl Function<'static> {
-    fn extract(
-        text_section_info: SecInfo<'static>,
-
-        program: &pdb2::LineProgram,
-        string_table: &'static pdb2::StringTable<'static>,
-        mangled_table: &std::collections::HashMap<usize, Vec<RawString<'static>>>,
-
-        name: pdb2::RawString<'static>,
-        offset: pdb2::PdbInternalSectionOffset,
-        len: u32,
-    ) -> anyhow::Result<Self> {
-        let mut filename = None;
-
-        let mut lines = program.lines_for_symbol(offset);
-        // Extracting only a single line should be enough to find a source file.
-        if let Some(line_info) = lines.next()? {
-            let file_info = program.get_file_info(line_info.file_index)?;
-            filename = Some(string_table.get(file_info.name)?);
-        }
-
-        let offset = offset.offset as usize;
-        let len = len as usize;
-        if len == 0 {
-            anyhow::bail!("Functions cannot be unsized")
-        }
-
-        let mangled_name: Option<RawString> = match mangled_table.get(&offset) {
-            Some(symbols) if symbols.len() == 1 => Some(symbols[0]),
-            Some(symbols) => Some(find_closest_symbol(name, symbols.iter())),
-            None => None,
-        };
-
-        Ok(Function {
-            name,
-            mangled_name,
-            filename,
-            address: text_section_info.address + offset,
-            data: &text_section_info.data[offset..offset + len],
-        })
-    }
-}
-
-impl ObjectFiles<'_> {
     fn write(self, base: &std::path::Path) -> anyhow::Result<()> {
         let base_len = base.as_os_str().as_encoded_bytes().len();
         let mut path = base.to_path_buf();
@@ -614,453 +776,33 @@ impl ObjectFiles<'_> {
     }
 }
 
-fn skip_templates(candidate: &[u8]) -> Option<usize> {
-    let mut counter = 0_i32;
-    for idx in (0..candidate.len() - 1).rev() {
-        match &candidate[idx] {
-            &b'>' => counter += 1,
-            &b'<' => counter -= 1,
-            &b':' if counter == 0 && candidate[idx + 1] == b':' => return Some(idx),
-            _ => continue,
-        }
-    }
-    return None;
-}
-
-type Class = [u8];
-fn get_class(name: &[u8]) -> Option<&Class> {
-    if name.starts_with(b"vostok::") {
-        let mut end_idx = skip_templates(name)?;
-
-        let start_idx = skip_templates(&name[..end_idx]).map(|i| i + 2).unwrap_or(0);
-        if start_idx == 0 {
-            return None;
-        }
-        Some(&name[start_idx..end_idx])
-    } else {
-        None
-    }
-}
-
-fn mangled_contain_class(mangled: &[u8], class: &Class) -> bool {
-    mangled
-        .windows(class.len() + 2)
-        .any(|m| m[0] == b'@' && m[m.len() - 1] == b'@' && &m[1..m.len() - 1] == class)
-}
-// rfind + contains works for `&str`
-// windows + rposition works for `&[u8]`
-fn find_closest_symbol<'a, 'p, I>(name: RawString, symbols: I) -> RawString<'p>
-where
-    I: Iterator<Item = &'a RawString<'p>> + Clone,
-    'p: 'a,
-{
-    let caller_class = get_class(name.as_bytes());
-    // let pure_name = {
-    //     let idx = skip_templates(
-    //         name.as_bytes(), // // .windows(2)
-    //                          // // .rposition(|w| w == b"::")
-    //                          // .map(|i| i + 2)
-    //                          // .unwrap_or(0)
-    //     )
-    //     .unwrap_or(0);
-    //     &name.as_bytes()[idx + 2..]
-    // };
-    let pure_name = match skip_templates(name.as_bytes()) {
-        Some(idx) => &name.as_bytes()[idx + 2..],
-        None => name.as_bytes(),
-    };
-
-    let class_matches = |sym: &RawString| match caller_class {
-        Some(class) => mangled_contain_class(sym.as_bytes(), class),
-        None => false,
-    };
-    let name_matches = |sym: &RawString| {
-        sym.as_bytes()
-            .windows(pure_name.len())
-            .any(|s| s == pure_name)
-    };
-
-    if let Some(sym) = symbols
-        .clone()
-        .filter(|s| class_matches(s) && name_matches(s))
-        .min_by_key(|s| s.len())
-    {
-        return *sym;
-    }
-    if let Some(sym) = symbols
-        .clone()
-        .filter(|s| name_matches(s))
-        .min_by_key(|s| s.len())
-    {
-        return *sym;
-    }
-    *symbols
-        .min_by_key(|symbol| symbol.len())
-        .expect("Symbols must contain at least a single element")
-}
-
 // Most of those leaks have to exist to "leak" Streams which for some reason are owning in pdb crate.
 fn leak<T>(object: T) -> &'static T {
     Box::leak(Box::new(object))
 }
 
-// [2]
-//
-// survarium::game_scene::~game_scene
-// survarium::link_resolver::link_resolver
-// survarium::rifle_scope::~rifle_scope
-// survarium::simple_animation_controller_parameters::operator=
-// vostok::ai::fsm_state::fsm_state
-// vostok::ai::npc_statistics::npc_statistics
-// vostok::ai::npc_statistics::~npc_statistics
-// vostok::ai::planning::base_lexeme::`vcall'{12}'
-// vostok::ai::planning::base_lexeme::`vcall'{4}'
-// vostok::ai::planning::base_lexeme::`vcall'{8}'
-// vostok::ai::statistics_item<46,16>::~statistics_item<46,16>
-// vostok::animation::fermi_interpolator::~fermi_interpolator
-// vostok::animation::instant_interpolator::~instant_interpolator
-// vostok::animation::mixing::animation_interval::~animation_interval
-// vostok::fs_new::physical_path_info_data::physical_path_info_data
-// vostok::memory::stack_allocator::~stack_allocator
-// vostok::particle::lod_entry::lod_entry
-// vostok::render::environment_probe_properties::operator=
-// vostok::render::functor_command::~functor_command
-// vostok::render::sky_ambient_occlusion_properties::operator=
-// vostok::render::sky_dome_geometry::~sky_dome_geometry
-// vostok::render::sliced_cube_geometry::~sliced_cube_geometry
-// vostok::render::sphere_geometry::~sphere_geometry
-// vostok::render::stage_lights::lights_instance::lights_instance
-// vostok::render::stage_view_mode::~stage_view_mode
-// vostok::vfs::async_callbacks_data::~async_callbacks_data
-// vostok::vfs::find_environment::find_environment
-// vostok::vfs::query_mount_arguments::query_mount_arguments
-// vostok::vfs::virtual_file_system::~virtual_file_system
+// Always pads to 4
+fn append_with_padding(
+    object: &mut object::write::Object,
+    section_id: object::write::SectionId,
+    data: &[u8],
+    pad: u8,
+) -> u64 {
+    let offset = object.append_section_data(section_id, data, 1);
 
-// [3]
-//
-// "vostok::render::static_render_model_instance::static_render_model_instance",
-// "btCollisionWorld::RayResultCallback::getShapeId",
-//,
-// "vostok::network_core::buffer_to_send",
-// "vostok::animation::bone_names::create_internals_in_place",
-// "vostok::collision::box_geometry_instance",
-// "vostok::",
-// "survarium::",
-
-// [4]
-//
-// # Static function in namespace
-//
-// vostok::render::get_world_to_decal_matrix
-// <NO MANGLED NAME>
-// c:\survarium\sources\vostok\render\engine\sources\decal_instance.cpp
-//
-//
-// # Static function without namespace
-//
-// free_region_impl
-// <NO MANGLED NAME>
-// c:\survarium\sources\vostok\core\sources\memory_win.cpp
-//
-//
-// # Compiler generate function in namespace
-//
-// vostok::animation::`dynamic atexit destructor for 's_bi_spline_skeleton_animation_impl_cook''
-// <NO MANGLED NAME>
-// c:\survarium\sources\vostok\animation\sources\bi_spline_skeleton_animation_impl_cook.cpp
-
-// [5]
-//
-// {
-//     let fun_name = fun.name.to_string();
-//
-//     let fun_mangled_name = fun.mangled_name.map(|name| name.to_string());
-//     let fun_mangled_name = fun_mangled_name.as_deref().unwrap_or("<NO MANGLED NAME>");
-//
-//     let fun_filename = fun.filename.map(|name| name.to_string());
-//     let fun_filename = fun_filename.as_deref().unwrap_or("<NO FILNAME>");
-//
-//     println!(
-//         "\n{fun_name}\n{fun_mangled_name}\n{fun_filename}\n{:#010x} {:#010x} ",
-//         fun.address,
-//         fun.address + fun.data.len()
-//     );
-// }
-
-// [6]
-//
-// fn build_dummy_object_file() {
-//     let mut object = object::write::Object::new(
-//         object::BinaryFormat::Coff,
-//         object::Architecture::I386,
-//         object::Endianness::Little,
-//     );
-
-//     let data_section_id = object.add_section(vec![], b".data".into(), SectionKind::Data);
-//     let rdata_section_id = object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
-//     let text_section_id = object.add_section(vec![], b".text".into(), SectionKind::Text);
-
-//     let static_offset = object.append_section_data(
-//         data_section_id,
-//         &0x14_u32.to_le_bytes(),
-//         std::mem::align_of::<u32>() as u64,
-//     );
-
-//     object.add_symbol(object::write::Symbol {
-//         name: b"s_static_int".to_vec(),
-//         value: static_offset, // offset of the symbol. Seems like needs to be tracked
-//         size: u64::MAX,       // seems to be unused for COFF
-//         kind: object::SymbolKind::Data,
-//         scope: object::SymbolScope::Compilation,
-//         weak: false,
-//         section: object::write::SymbolSection::Section(data_section_id),
-//         flags: object::SymbolFlags::None,
-//     });
-
-//     //
-//     //
-//     //
-
-//     let hello_offset = object.append_section_data(
-//         rdata_section_id,
-//         b"Hello, World!\n\0",
-//         std::mem::align_of::<u32>() as u64,
-//     );
-//     let bye_offset = object.append_section_data(
-//         rdata_section_id,
-//         b"Bye, World!\n\0",
-//         std::mem::align_of::<u32>() as u64,
-//     );
-
-//     object.add_symbol(object::write::Symbol {
-//         name: b"$SG3918".to_vec(),
-//         value: hello_offset, // offset of the symbol. Seems like needs to be tracked
-//         size: u64::MAX,      // seems to be unused for COFF
-//         kind: object::SymbolKind::Data,
-//         scope: object::SymbolScope::Compilation,
-//         weak: false,
-//         section: object::write::SymbolSection::Section(rdata_section_id),
-//         flags: object::SymbolFlags::None,
-//     });
-
-//     object.add_symbol(object::write::Symbol {
-//         name: b"$SG3919".to_vec(),
-//         value: bye_offset, // offset of the symbol. Seems like needs to be tracked
-//         size: u64::MAX,    // seems to be unused for COFF
-//         kind: object::SymbolKind::Data,
-//         scope: object::SymbolScope::Compilation,
-//         weak: false,
-//         section: object::write::SymbolSection::Section(rdata_section_id),
-//         flags: object::SymbolFlags::None,
-//     });
-
-//     //
-//     //
-//     //
-
-//     let fun1_offset = object.append_section_data(
-//         text_section_id,
-//         &[
-//             0x55, 0x8B, 0xEC, 0x5D, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
-//             0xCC, 0xCC,
-//         ],
-//         std::mem::align_of::<u32>() as u64,
-//     );
-
-//     let fun1_sym = object.add_symbol(object::write::Symbol {
-//         name: b"?inner@detail@test@@YAXXZ".to_vec(),
-//         value: fun1_offset, // offset of the symbol. Seems like needs to be tracked
-//         size: u64::MAX,     // seems to be unused for COFF
-//         kind: object::SymbolKind::Text,
-//         scope: object::SymbolScope::Linkage,
-//         weak: false,
-//         section: object::write::SymbolSection::Section(text_section_id),
-//         flags: object::SymbolFlags::None,
-//     });
-
-//     //
-
-//     #[rustfmt::skip]
-//     let fun2_offset = object.append_section_data(
-//         text_section_id,
-//         &[
-//             0x55, 0x8B, 0xEC,              // prolog -- push ebp ; mov ebp, esp
-//             0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
-//             0xE8, 0x00, 0x00, 0x00, 0x00,  // call   -- call ?inner
-//             0x5D, 0xC3, 0xCC,              // epilog -- pop ebp ; ret ; int3
-//         ],
-//         std::mem::align_of::<u32>() as u64,
-//     );
-
-//     let fun2_sym = object.add_symbol(object::write::Symbol {
-//         name: b"?print_hello2@@YAXXZ".to_vec(),
-//         value: fun2_offset, // offset of the symbol. Seems like needs to be tracked
-//         size: u64::MAX,     // seems to be unused for COFF
-//         kind: object::SymbolKind::Text,
-//         scope: object::SymbolScope::Linkage,
-//         weak: false,
-//         section: object::write::SymbolSection::Section(text_section_id),
-//         flags: object::SymbolFlags::None,
-//     });
-
-//     object
-//         .add_relocation(
-//             text_section_id,
-//             object::write::Relocation {
-//                 offset: fun2_offset + 4,
-//                 size: 32,
-//                 kind: object::RelocationKind::Relative,
-//                 encoding: object::RelocationEncoding::Generic,
-//                 symbol: fun1_sym,
-//                 addend: -4,
-//             },
-//         )
-//         .unwrap();
-
-//     object
-//         .add_relocation(
-//             text_section_id,
-//             object::write::Relocation {
-//                 offset: fun2_offset + 9,
-//                 size: 32,
-//                 kind: object::RelocationKind::Relative,
-//                 encoding: object::RelocationEncoding::Generic,
-//                 symbol: fun1_sym,
-//                 addend: -4,
-//             },
-//         )
-//         .unwrap();
-
-//     //
-//     //
-//     //
-
-//     let object_data = object.write().unwrap();
-//     std::fs::write("./objdiff/base/data.obj", object_data).unwrap();
-// }
-
-// 7
-//
-// fn play_with_demangler() {
-//     let mangled_names = [
-//         "??0box_geometry_instance@collision@vostok@@QAE@ABVfloat4x4@math@2@@Z",
-//         "??1box_geometry_instance@collision@vostok@@UAE@XZ",
-//         "??_Gbox_geometry_instance@collision@vostok@@UAEPAXI@Z",
-//         "?aabb_test@box_geometry_instance@collision@vostok@@UBE_NABVaabb@math@3@@Z",
-//     ];
-//     for mangled_name in mangled_names {
-//         let name =
-//             msvc_demangler::demangle(mangled_name, msvc_demangler::DemangleFlags::empty()).unwrap();
-//         println!("{name}");
-
-//         let data = msvc_demangler::parse(mangled_name).unwrap();
-//         println!("{data:#?}\n");
-//     }
-// }
-
-fn print_reloc(exe: &'static object::read::pe::PeFile32<'static>) {
-    let Some(reloc_sec) = exe.section_by_name(".reloc") else {
-        eprintln!("no .reloc section");
-        return;
+    // sushi@TODO: `object` crate doesn't(?) allow specifying auxiliary symbols.
+    // Because of that 1-3 bytes of garbage are generated which objdiff doesn't like.
+    // We replace those bytes with `nop`s and pad all of the functions ourselves,
+    // which fixes the problem, but this is a hack, which needs to be fixed at some point.
+    let padding: &[u8] = match 4 - data.len() % 4 {
+        1 => &[pad],
+        2 => &[pad, pad],
+        3 => &[pad, pad, pad],
+        _ => &[],
     };
-
-    let Some(text_sec) = exe.section_by_name(".text") else {
-        eprintln!("no .text section");
-        return;
-    };
-    let Some(data_sec) = exe.section_by_name(".data") else {
-        eprintln!("no .text section");
-        return;
-    };
-
-    let text_sec_rva = text_sec.address() - exe.relative_address_base();
-
-    let text_sec_data = text_sec.data().unwrap();
-
-    #[repr(C)]
-    #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
-    struct RelocHeader {
-        page_rva: u32,
-        block_size: u32,
-    }
-    const HEADER_SIZE: usize = std::mem::size_of::<RelocHeader>();
-
-    #[repr(C)]
-    #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
-    struct RelocEntry {
-        entry: u16,
+    if !padding.is_empty() {
+        _ = object.append_section_data(section_id, padding, 1);
     }
 
-    let mut pos = 0;
-    let reloc_data = reloc_sec.data().unwrap();
-
-    while pos + HEADER_SIZE <= reloc_data.len() {
-        let RelocHeader {
-            page_rva,
-            block_size,
-        } = *bytemuck::from_bytes(&reloc_data[pos..pos + 8]);
-
-        if block_size == 0 || block_size < 8 {
-            break;
-        }
-
-        let entries: &[RelocEntry] =
-            bytemuck::cast_slice(&reloc_data[pos + 8..pos + block_size as usize]);
-
-        let entry_count = entries.len();
-        println!("Block: page RVA {:#x}, {} entries", page_rva, entry_count);
-
-        for RelocEntry { entry } in entries {
-            let reloc_type = entry >> 12;
-            let reloc_offset = entry & 0x0FFF;
-
-            let type_str = match reloc_type {
-                0 => "ABSOLUTE",
-                1 => "HIGH",
-                2 => "LOW",
-                3 => "HIGHLOW",
-                4 => "HIGHADJ",
-                10 => "DIR64",
-                _ => "UNKNOWN",
-            };
-
-            let reloc_rva = u64::from(page_rva + u32::from(reloc_offset));
-
-            let in_text = (text_sec_rva..text_sec_rva + text_sec.size()).contains(&reloc_rva);
-
-            if in_text {
-                let offset = (reloc_rva - text_sec_rva) as usize;
-                let data: u32 = bytemuck::pod_read_unaligned(&text_sec_data[offset..offset + 4]);
-                let value = data as u64;
-
-                println!(
-                    "  RVA {:#x}  type: {} ({}) - {:#x} -- {:#x}",
-                    reloc_rva,
-                    reloc_type,
-                    type_str,
-                    text_sec.address() as usize + offset,
-                    value - data_sec.address(),
-                );
-                // @TODO
-                // find, replace with 0, add_relocation
-            }
-        }
-
-        pos += block_size as usize;
-    }
+    offset
 }
-
-// 1. Go through each relocation
-// 2. Find ones into the .text segment (by chekcing rva)
-// 3. ???
-
-// Yes. And to convert between them:
-
-// - **RVA → offset in section**: `rva - section_rva`
-// - **RVA → file offset**: `rva - section_rva + section_file_offset`
-// - **address → RVA**: `address - image_base`
-//
-//
-// static: offset from .data
-// offset from .data for symbol
-// rva: rva sym - rva .data
