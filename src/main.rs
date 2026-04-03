@@ -393,6 +393,9 @@ impl ObjectFiles<'static> {
                                     );
                                 }
                                 Some(_) | None => {
+                                    text_sec_data[offset_in_text..offset_in_text + 4]
+                                        .copy_from_slice(&u32::to_le_bytes(0));
+
                                     text_relocs.insert(
                                         offset_in_text,
                                         RelocKind::ConstantValue {
