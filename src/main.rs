@@ -8,14 +8,28 @@ use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
 use capstone::Capstone;
 use capstone::InsnGroupType::*;
 
+use clap::Parser;
 use object::read::pe::PeSection;
 use object::LittleEndian;
 use object::{Object, ObjectSection, SectionKind};
 
 use pdb2::{FallibleIterator, RawString};
 
-const EXECUTABLE: &[u8] = include_bytes!("../resources/survarium.exe");
-const DEBUG_SYMBOLS: &[u8] = include_bytes!("../resources/survarium.pdb");
+#[derive(clap::Parser)]
+pub struct Cli {
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub pdb_path: std::path::PathBuf,
+
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub exe_path: std::path::PathBuf,
+
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub output_path: std::path::PathBuf,
+
+    // "c:\\survarium\\sources\\" for target
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub engine_path: String,
+}
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -54,22 +68,39 @@ pub struct SecInfo<'a> {
 //    assembly matches.
 
 fn main() -> anyhow::Result<()> {
-    let exe = object::read::pe::PeFile32::parse(EXECUTABLE)?;
-    let pdb = pdb2::PDB::open(std::io::Cursor::new(DEBUG_SYMBOLS))?;
+    let Cli {
+        pdb_path,
+        exe_path,
+        output_path,
+        engine_path,
+    } = Cli::parse();
 
-    process_executable(exe, pdb)?;
+    let exe: &[u8] = std::fs::read(exe_path)?.leak();
+    let exe = object::read::pe::PeFile32::parse(exe)?;
+    let exe: &'static object::read::pe::PeFile32 = leak(exe);
+
+    let pdb = std::fs::read(pdb_path)?.leak();
+    let pdb = std::io::Cursor::new(pdb);
+    let pdb = pdb2::PDB::open(pdb)?;
+
+    let mut engine_path = engine_path.to_lowercase().replace('/', "\\");
+    if !engine_path.ends_with('\\') {
+        engine_path.push('\\');
+    }
+
+    process_executable(exe, pdb, engine_path.as_bytes(), output_path.as_path())?;
 
     Ok(())
 }
 
 fn process_executable<S: pdb2::Source<'static> + 'static>(
-    exe: object::read::pe::PeFile32<'static>,
+    exe: &'static object::read::pe::PeFile32<'static>,
     pdb: pdb2::PDB<'static, S>,
+    engine_path: &[u8],
+    output_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let exe: &'static object::read::pe::PeFile32 = leak(exe);
-
-    let object_files = ObjectFiles::parse(exe, pdb)?;
-    object_files.write(std::path::Path::new("objdiff/target"))?;
+    let object_files = ObjectFiles::parse(exe, pdb, engine_path)?;
+    object_files.write(output_path)?;
 
     Ok(())
 }
@@ -78,6 +109,7 @@ impl ObjectFiles<'static> {
     fn parse<S: pdb2::Source<'static> + 'static>(
         exe: &'static object::read::pe::PeFile32<'static>,
         mut pdb: pdb2::PDB<'static, S>,
+        engine_path: &[u8],
     ) -> anyhow::Result<ObjectFiles<'static>> {
         let image_base = exe
             .nt_headers()
@@ -369,7 +401,7 @@ impl ObjectFiles<'static> {
                                         },
                                     );
                                 }
-                                _ => {
+                                Some(_) | None => {
                                     text_relocs.insert(
                                         offset_in_text,
                                         RelocKind::ConstantValue {
@@ -385,10 +417,14 @@ impl ObjectFiles<'static> {
                         () if (data.va..data.va + data.size).contains(&target_va) => {
                             let target_offset_in_data = target_va - data.va;
 
-                            let (static_offset_in_data, static_name) = statics
-                                .range(..=target_offset_in_data)
-                                .next_back()
-                                .expect("all statics relocs to be named");
+                            let Some((static_offset_in_data, static_name)) =
+                                statics.range(..=target_offset_in_data).next_back()
+                            else {
+                                if target_offset_in_data == 0 {
+                                    continue;
+                                }
+                                panic!("all static relocs to be named");
+                            };
 
                             text_sec_data[offset_in_text..offset_in_text + 4].copy_from_slice(
                                 &u32::to_le_bytes(
@@ -456,9 +492,8 @@ impl ObjectFiles<'static> {
                         filename = Some(string_table.get(file_info.name)?);
                     }
 
-                    const VOSTOK_PREFIX: &[u8] = b"c:\\survarium\\sources\\";
                     let filename: &'static [u8] = match filename {
-                        Some(filename) => match filename.as_bytes().strip_prefix(VOSTOK_PREFIX) {
+                        Some(filename) => match filename.as_bytes().strip_prefix(engine_path) {
                             Some(filename) => filename,
                             None => continue,
                         },
@@ -916,7 +951,9 @@ where
             return *sym;
         }
     }
-    *mangled_symbols.min_by_key(|sym| sym.len()).expect("")
+    *mangled_symbols
+        .min_by_key(|sym| sym.len())
+        .expect("Mangled iterator to not be empty")
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
