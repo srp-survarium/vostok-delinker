@@ -261,7 +261,9 @@ impl ObjectFiles<'static> {
                         [0xc3] => Some(b"empty_stub".as_slice().into()),
                         [0x8b, 0x44, 0x24, 0x04, 0xc3] => Some(b"identity".as_slice().into()),
                         [0x8b, 0x0, 0xc3] => Some(b"vec_begin".as_slice().into()),
-                        [0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3,] => Some(b"vec_size".as_slice().into()),
+                        [0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3] => {
+                            Some(b"vec_size".as_slice().into())
+                        }
                         _ => None,
                     };
                     match functions.entry(fun_offset_in_text) {

@@ -16,3 +16,9 @@ object = {
   rev = "76af56e7c23fffa02bb9c561e6bbb7e137e7d974",
   features = ["pe", "write_core"],
 }
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
+new_without_default = "allow"
+useless_format = "allow"
