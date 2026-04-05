@@ -21,4 +21,3 @@ object = {
 collapsible_if = "allow"
 manual_is_multiple_of = "allow"
 new_without_default = "allow"
-useless_format = "allow"

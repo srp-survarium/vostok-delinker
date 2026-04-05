@@ -53,7 +53,6 @@ pub struct SecInfo<'a> {
 
 // # Notes
 //
-// ## 4. sushi@TODO: Start discussion in object crate
 // ## 6. sushi@TODO: Relocations in .data and .rdata
 // ## 7. sushi@TODO: Initialized statics in .rdata
 
@@ -257,23 +256,25 @@ impl ObjectFiles<'static> {
                     let fun_body =
                         &text.data[fun_offset_in_text..fun_offset_in_text + size as usize];
 
-                    let fun_rename: Option<RawString> = match fun_body {
-                        [0xc3] => Some(b"empty_stub".as_slice().into()),
-                        [0x8b, 0x44, 0x24, 0x04, 0xc3] => Some(b"identity".as_slice().into()),
-                        [0x8b, 0x0, 0xc3] => Some(b"vec_begin".as_slice().into()),
-                        [0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3] => {
-                            Some(b"vec_size".as_slice().into())
-                        }
-                        _ => None,
-                    };
+                    #[rustfmt::skip]
+                    const COMMON_FUNCTION_RENAMES: &[(&[u8], &[u8])] = &[
+                        (b"empty_stub", &[0xC3]),
+                        (b"identity",   &[0x8B, 0x44, 0x24, 0x04, 0xC3]),
+                        (b"vec_begin",  &[0x8B, 0x0, 0xC3]),
+                        (b"vec_size",   &[0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3]),
+                    ];
+
+                    let fun_rename = COMMON_FUNCTION_RENAMES
+                        .iter()
+                        .find(|(_, code)| *code == fun_body)
+                        .map(|(name, _)| (*name).into());
+
                     match functions.entry(fun_offset_in_text) {
                         btree_map::Entry::Vacant(entry) => {
                             entry.insert(vec![fun_rename.unwrap_or(name)]);
                         }
                         btree_map::Entry::Occupied(mut entry) => match fun_rename {
-                            Some(fun_rename) => {
-                                *entry.get_mut() = vec![fun_rename];
-                            }
+                            Some(fun_rename) => *entry.get_mut() = vec![fun_rename],
                             None => (),
                         },
                     }
@@ -359,7 +360,7 @@ impl ObjectFiles<'static> {
                     let reloc_rva = (page_rva + u32::from(reloc_offset)) as usize;
                     let in_text = (text.rva..text.rva + text.size).contains(&reloc_rva);
 
-                    // this is that "cornercase"
+                    // @TODO: this is that "cornercase"
                     if !in_text {
                         continue;
                     }
@@ -413,6 +414,7 @@ impl ObjectFiles<'static> {
                                         },
                                     );
                                 }
+
                                 Some(_) | None => {
                                     text_sec_data[offset_in_text..offset_in_text + 4]
                                         .copy_from_slice(&u32::to_le_bytes(0));
