@@ -9,13 +9,8 @@ bytemuck = { version = "1.25.0", features = ["derive", "min_const_generics", "mu
 capstone = "0.14.0"
 clap = { version = "4.5.41", features = ["derive", "env"] }
 msvc-demangler = "0.11.0"
+object = { version = "0.39.0", features = ["pe", "write_core"] }
 pdb2 = "0.10.1"
-
-object = {
-  git = "https://github.com/srp-survarium/object",
-  rev = "76af56e7c23fffa02bb9c561e6bbb7e137e7d974",
-  features = ["pe", "write_core"],
-}
 
 [lints.clippy]
 collapsible_if = "allow"

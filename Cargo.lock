@@ -296,7 +296,8 @@ dependencies = [
 [[package]]
 name = "object"
 version = "0.39.0"
-source = "git+https://github.com/srp-survarium/object?rev=76af56e7c23fffa02bb9c561e6bbb7e137e7d974#76af56e7c23fffa02bb9c561e6bbb7e137e7d974"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63944c133d03f44e75866bbd160b95af0ec3f6a13d936d69d31c81078cbc5baf"
 dependencies = [
  "crc32fast",
  "flate2",

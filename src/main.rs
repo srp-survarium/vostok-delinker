@@ -657,6 +657,7 @@ impl ObjectFiles<'static> {
                             object::Architecture::I386,
                             object::Endianness::Little,
                         );
+                        object.set_mangling(object::write::Mangling::None);
 
                         let data_section_id =
                             object.add_section(vec![], b".data".into(), SectionKind::Data);
