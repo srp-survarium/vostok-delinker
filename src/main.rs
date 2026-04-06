@@ -40,6 +40,18 @@ pub struct ObjectFile {
     pub text_section_id: object::write::SectionId,
 }
 
+#[derive(Copy, Clone)]
+pub struct ObjectOffset {
+    offset: u64,
+    section_id: object::write::SectionId,
+}
+
+#[derive(Copy, Clone)]
+pub enum ObjectLocation {
+    Offset(ObjectOffset),
+    Extern,
+}
+
 #[derive(Clone, Debug, Default, Copy)]
 pub struct SecInfo<'a> {
     pub rva: usize,
@@ -49,6 +61,29 @@ pub struct SecInfo<'a> {
     pub id: u16,
 
     pub data: &'a [u8],
+}
+
+#[derive(Copy, Clone)]
+pub enum RelocKind<'a> {
+    // .text
+    Function {
+        overloads: &'a [RawString<'static>],
+    },
+
+    // .rdata
+    ConstantString {
+        symbol: RawString<'static>,
+        data: &'a [u8],
+    },
+    ConstantValue {
+        target_rva: usize,
+    },
+
+    // .data
+    // @TODO: Distinguish uninit vs. init statics
+    Static {
+        symbol: RawString<'static>,
+    },
 }
 
 // # Notes
@@ -111,11 +146,11 @@ impl ObjectFiles<'static> {
 
         let build_sec_info = |sec: object::read::pe::PeSection<'static, 'static, _>| {
             Ok::<_, anyhow::Error>(SecInfo {
-                rva: sec.address() as usize - image_base as usize,
-                va: sec.address() as usize,
+                rva: sec.address().to_usize() - image_base.to_usize(),
+                va: sec.address().to_usize(),
 
-                size: sec.size() as usize,
-                id: sec.index().0 as u16,
+                size: sec.size().to_usize(),
+                id: u16::try_from(sec.index().0)?,
 
                 data: sec.data()?,
             })
@@ -163,7 +198,7 @@ impl ObjectFiles<'static> {
                     })) if function => {
                         assert_eq!(offset.section, text.id);
 
-                        let offset = offset.offset as usize;
+                        let offset = offset.offset.to_usize();
 
                         functions.entry(offset).or_default().push(name);
                     }
@@ -171,7 +206,7 @@ impl ObjectFiles<'static> {
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }))
                         if offset.section == rdata.id && name.as_bytes().starts_with(b"??_C@_") =>
                     {
-                        let offset = offset.offset as usize;
+                        let offset = offset.offset.to_usize();
 
                         let msvc_demangler::Type::ConstantString(string) =
                             msvc_demangler::parse(&name.to_string())?.symbol_type
@@ -186,7 +221,7 @@ impl ObjectFiles<'static> {
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }))
                         if offset.section == data.id =>
                     {
-                        let offset = offset.offset as usize;
+                        let offset = offset.offset.to_usize();
 
                         let old_value = statics.insert(offset, name);
                         if let Some(value) = old_value {
@@ -206,7 +241,7 @@ impl ObjectFiles<'static> {
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. }))
                         if offset.section == data.id =>
                     {
-                        let offset = offset.offset as usize;
+                        let offset = offset.offset.to_usize();
 
                         data_statics.push((offset, name));
                     }
@@ -249,13 +284,13 @@ impl ObjectFiles<'static> {
                             offset,
                             name,
                             ..
-                        })) => (len as u32, name, offset),
+                        })) => (u32::from(len), name, offset),
                         _ => continue,
                     };
 
-                    let fun_offset_in_text = offset.offset as usize;
+                    let fun_offset_in_text = offset.offset.to_usize();
                     let fun_body =
-                        &text.data[fun_offset_in_text..fun_offset_in_text + size as usize];
+                        &text.data[fun_offset_in_text..fun_offset_in_text + size.to_usize()];
 
                     #[rustfmt::skip]
                     const COMMON_FUNCTION_RENAMES: &[(&[u8], &[u8])] = &[
@@ -288,30 +323,8 @@ impl ObjectFiles<'static> {
         // @NOTE: They can be in other parts
         //
 
-        enum RelocKind<'a> {
-            // .text
-            Function {
-                overloads: &'a [RawString<'static>],
-            },
-
-            // .rdata
-            ConstantString {
-                symbol: RawString<'static>,
-                data: &'a [u8],
-            },
-            ConstantValue {
-                target_va: usize,
-            },
-
-            // .data
-            // @TODO: Distinguish uninit vs. init statics
-            Static {
-                symbol: RawString<'static>,
-            },
-        }
-
-        let mut exe_data = exe.data().to_vec();
-        let mut relocs_va = BTreeMap::<usize, RelocKind>::new();
+        let mut exe_data = map_pe_image(&exe);
+        let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
 
         let Some(reloc_sec) = exe.section_by_name(".reloc") else {
             anyhow::bail!("Missing .reloc section");
@@ -338,15 +351,18 @@ impl ObjectFiles<'static> {
                 let RelocHeader {
                     page_rva,
                     block_size,
-                } = bytemuck::pod_read_unaligned(&reloc_data[pos..pos + HEADER_SIZE]);
+                } = bytemuck::pod_read_unaligned::<RelocHeader>(
+                    &reloc_data[pos..pos + HEADER_SIZE],
+                );
 
                 if block_size == 0 || block_size < 8 {
                     break;
                 }
 
-                let entries: &[RelocEntry] =
-                    bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..pos + block_size as usize]);
-                pos += block_size as usize;
+                let entries: &[RelocEntry] = bytemuck::cast_slice(
+                    &reloc_data[pos + HEADER_SIZE..pos + block_size.to_usize()],
+                );
+                pos += block_size.to_usize();
 
                 for RelocEntry { entry } in entries {
                     let reloc_type = entry >> 12;
@@ -366,47 +382,49 @@ impl ObjectFiles<'static> {
                     //
                     // * `target_va` replaced with offset of the closest named symbol
                     //
-                    let reloc_rva = (page_rva + u32::from(reloc_offset)) as usize;
-                    let reloc_va = reloc_rva + image_base as usize;
+                    let reloc_rva = (page_rva + u32::from(reloc_offset)).to_usize();
 
-                    let target_va: u32 =
-                        bytemuck::pod_read_unaligned(&exe_data[reloc_va..reloc_va + 4]);
-                    let target_va = target_va as usize;
+                    let target_va =
+                        bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
+                    let target_rva = (target_va - image_base).to_usize();
 
-                    let target_va_mut = &mut exe_data[reloc_va..reloc_va + 4];
+                    let target_va_mut = &mut exe_data[reloc_rva..reloc_rva + 4];
 
                     match () {
-                        () if (text.va..text.va + text.size).contains(&target_va) => {
-                            let target_offset_in_text = target_va - text.va;
+                        () if (text.rva..text.rva + text.size).contains(&target_rva) => {
+                            let target_offset_in_text = target_rva - text.rva;
 
                             let (function_offset_in_text, function_overloads) = functions
                                 .range(..=target_offset_in_text)
                                 .next_back()
                                 .expect("all function relocs to be named");
 
-                            target_va_mut.copy_from_slice(&u32::to_le_bytes(
-                                (target_offset_in_text - *function_offset_in_text) as u32,
-                            ));
-                            relocs_va.insert(
-                                reloc_va,
+                            let target_offset_in_reloc =
+                                u32::try_from(target_offset_in_text - *function_offset_in_text)?;
+                            target_va_mut.copy_from_slice(&target_offset_in_reloc.to_le_bytes());
+                            relocs_rva.insert(
+                                reloc_rva,
                                 RelocKind::Function {
                                     overloads: function_overloads,
                                 },
                             );
                         }
-                        () if (rdata.va..rdata.va + rdata.size).contains(&target_va) => {
-                            let target_offset_in_rdata = target_va - rdata.va;
+                        () if (rdata.rva..rdata.rva + rdata.size).contains(&target_rva) => {
+                            let target_offset_in_rdata = target_rva - rdata.rva;
 
                             match strings.range(..=target_offset_in_rdata).next_back() {
                                 Some((string_offset_in_rdata, (string_mangled_name, string)))
                                     if target_offset_in_rdata - string_offset_in_rdata
                                         < string.len() =>
                                 {
-                                    target_va_mut.copy_from_slice(&u32::to_le_bytes(
-                                        (target_offset_in_rdata - *string_offset_in_rdata) as u32,
-                                    ));
-                                    relocs_va.insert(
-                                        reloc_va,
+                                    let target_offset_in_reloc = u32::try_from(
+                                        target_offset_in_rdata - *string_offset_in_rdata,
+                                    )?;
+
+                                    target_va_mut
+                                        .copy_from_slice(&target_offset_in_reloc.to_le_bytes());
+                                    relocs_rva.insert(
+                                        reloc_rva,
                                         RelocKind::ConstantString {
                                             symbol: *string_mangled_name,
                                             data: string,
@@ -416,14 +434,14 @@ impl ObjectFiles<'static> {
 
                                 Some(_) | None => {
                                     // @TODO
-                                    target_va_mut.copy_from_slice(&u32::to_le_bytes(0));
-                                    relocs_va
-                                        .insert(reloc_va, RelocKind::ConstantValue { target_va });
+                                    target_va_mut.copy_from_slice(&0_u32.to_le_bytes());
+                                    relocs_rva
+                                        .insert(reloc_rva, RelocKind::ConstantValue { target_rva });
                                 }
                             };
                         }
-                        () if (data.va..data.va + data.size).contains(&target_va) => {
-                            let target_offset_in_data = target_va - data.va;
+                        () if (data.rva..data.rva + data.size).contains(&target_rva) => {
+                            let target_offset_in_data = target_rva - data.rva;
 
                             let Some((static_offset_in_data, static_name)) =
                                 statics.range(..=target_offset_in_data).next_back()
@@ -434,11 +452,12 @@ impl ObjectFiles<'static> {
                                 panic!("all static relocs to be named");
                             };
 
-                            target_va_mut.copy_from_slice(&u32::to_le_bytes(
-                                (target_offset_in_data - *static_offset_in_data) as u32,
-                            ));
-                            relocs_va.insert(
-                                reloc_va,
+                            let target_offset_in_reloc =
+                                u32::try_from(target_offset_in_data - *static_offset_in_data)?;
+
+                            target_va_mut.copy_from_slice(&target_offset_in_reloc.to_le_bytes());
+                            relocs_rva.insert(
+                                reloc_rva,
                                 RelocKind::Static {
                                     symbol: *static_name,
                                 },
@@ -539,16 +558,17 @@ impl ObjectFiles<'static> {
                     //
                     //
 
-                    let fun_offset_in_text = fun_offset.offset as usize;
-                    let fun_size = fun_size as usize;
+                    let fun_offset_in_text = fun_offset.offset.to_usize();
+                    let fun_size = fun_size.to_usize();
 
+                    let fun_rva = text.rva + fun_offset_in_text;
                     let fun_va = text.va + fun_offset_in_text;
-                    let fun_range_va = fun_va..fun_va + fun_size;
+                    let fun_range_rva = fun_rva..fun_rva + fun_size;
 
-                    let mut fun_bytes = exe_data[fun_range_va.clone()].to_vec();
+                    let mut fun_bytes = exe_data[fun_range_rva.clone()].to_vec();
                     let mut offset_in_fun = 0;
 
-                    let ixs = ctx.disasm_all(&exe_data[fun_range_va.clone()], fun_va as u64)?;
+                    let ixs = ctx.disasm_all(&exe_data[fun_range_rva.clone()], fun_va.to_u64())?;
                     for ix in ixs.iter() {
                         let detail = ctx.insn_detail(ix)?;
                         let arch_detail = detail.arch_detail();
@@ -572,21 +592,22 @@ impl ObjectFiles<'static> {
                         else {
                             unreachable!()
                         };
+                        let target_va = u64::try_from(target_va)?;
                         let internal_branch =
-                            (fun_va..fun_va + fun_size).contains(&(target_va as usize));
+                            (fun_va..fun_va + fun_size).contains(&(target_va.to_usize()));
                         if internal_branch {
                             offset_in_fun += ix.len();
                             continue;
                         }
 
-                        match functions.get(&(target_va as usize - text.va)) {
+                        match functions.get(&(target_va.to_usize() - text.va)) {
                             Some(overloads) if ix.len() > 4 => {
                                 offset_in_fun += ix.len() - 4;
                                 fun_bytes[offset_in_fun..offset_in_fun + 4]
                                     .copy_from_slice(&0_u32.to_le_bytes());
 
-                                let result = relocs_va.insert(
-                                    text.va + fun_offset_in_text + offset_in_fun,
+                                let result = relocs_rva.insert(
+                                    text.rva + fun_offset_in_text + offset_in_fun,
                                     RelocKind::Function { overloads },
                                 );
                                 offset_in_fun += 4;
@@ -647,192 +668,27 @@ impl ObjectFiles<'static> {
                         }
                     });
 
-                    let ObjectFile {
-                        object,
-                        data_section_id: _,
-                        rdata_section_id,
-                        text_section_id,
-                    } = object_file;
-
-                    let fun_offset_in_coff =
-                        append_with_padding(object, *text_section_id, &fun_bytes, 0x90);
-
-                    for (reloc_va, reloc_kind) in relocs_va.range(fun_range_va) {
-                        let reloc_va = *reloc_va as u64;
-                        let reloc_offset_in_fun = reloc_va - fun_va as u64;
-                        let reloc_offset_in_coff = fun_offset_in_coff + reloc_offset_in_fun;
-
-                        match reloc_kind {
-                            RelocKind::Function { overloads } => {
-                                let reloc_name = find_closest_relative_call(&fun_name, overloads);
-
-                                let reloc_symbol = object.add_symbol(object::write::Symbol {
-                                    name: reloc_name.as_bytes().to_vec(),
-                                    value: 0,
-                                    size: u64::MAX,
-                                    kind: object::SymbolKind::Unknown,
-                                    scope: object::SymbolScope::Linkage,
-                                    weak: false,
-                                    section: object::write::SymbolSection::Undefined,
-                                    flags: object::SymbolFlags::None,
-                                });
-
-                                object.add_relocation(
-                                    *text_section_id,
-                                    object::write::Relocation {
-                                        offset: reloc_offset_in_coff,
-                                        symbol: reloc_symbol,
-                                        addend: -4,
-                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
-                                        flags: object::RelocationFlags::Generic {
-                                            kind: object::RelocationKind::Relative,
-                                            encoding: object::RelocationEncoding::Generic,
-                                            size: 32,
-                                        },
-                                    },
-                                )?;
-                            }
-                            RelocKind::ConstantString { symbol, data } => {
-                                let reloc_name = match () {
-                                    () if symbol.as_bytes().starts_with(b"??_C@_0") => data
-                                        .iter()
-                                        .copied()
-                                        .map(|c| match c.is_ascii_alphanumeric() {
-                                            true => c,
-                                            false => b'_',
-                                        })
-                                        .collect::<Vec<_>>(),
-                                    () if symbol.as_bytes().starts_with(b"??_C@_1") => data
-                                        .windows(2)
-                                        .map(|c| {
-                                            match c[0] == b'0' && c[1].is_ascii_alphanumeric() {
-                                                true => c[1],
-                                                false => b'_',
-                                            }
-                                        })
-                                        .collect::<Vec<_>>(),
-                                    () => unreachable!(),
-                                };
-
-                                let const_offset_in_coff =
-                                    append_with_padding(object, *rdata_section_id, data, 0x00);
-
-                                let reloc_symbol = object.add_symbol(object::write::Symbol {
-                                    name: reloc_name,
-                                    value: const_offset_in_coff,
-                                    size: u64::MAX,
-                                    kind: object::SymbolKind::Data,
-                                    scope: object::SymbolScope::Linkage,
-                                    weak: false,
-                                    section: object::write::SymbolSection::Section(
-                                        *rdata_section_id,
-                                    ),
-                                    flags: object::SymbolFlags::None,
-                                });
-
-                                object.add_relocation(
-                                    *text_section_id,
-                                    object::write::Relocation {
-                                        offset: reloc_offset_in_coff,
-                                        symbol: reloc_symbol,
-                                        addend: -4,
-                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
-                                        flags: object::RelocationFlags::Generic {
-                                            kind: object::RelocationKind::Relative,
-                                            encoding: object::RelocationEncoding::Generic,
-                                            size: 32,
-                                        },
-                                    },
-                                )?;
-                            }
-                            RelocKind::ConstantValue { target_va } => {
-                                // sushi@TODO: data might be reloc as well, so needs to be handled properly
-                                let target_va = *target_va;
-                                let target_data: u32 = bytemuck::pod_read_unaligned(
-                                    &exe_data[target_va..target_va + 4],
-                                );
-                                let reloc_name = format!("?value_0x{:x?}@@3IA", target_data);
-
-                                let const_offset_in_coff = append_with_padding(
-                                    object,
-                                    *rdata_section_id,
-                                    &target_data.to_le_bytes(),
-                                    0x00,
-                                );
-
-                                let reloc_symbol = object.add_symbol(object::write::Symbol {
-                                    name: reloc_name.as_bytes().to_vec(),
-                                    value: const_offset_in_coff,
-                                    size: u64::MAX,
-                                    kind: object::SymbolKind::Data,
-                                    scope: object::SymbolScope::Linkage,
-                                    weak: false,
-                                    section: object::write::SymbolSection::Section(
-                                        *rdata_section_id,
-                                    ),
-                                    flags: object::SymbolFlags::None,
-                                });
-
-                                object.add_relocation(
-                                    *text_section_id,
-                                    object::write::Relocation {
-                                        offset: reloc_offset_in_coff,
-                                        symbol: reloc_symbol,
-                                        addend: -4,
-                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
-                                        flags: object::RelocationFlags::Generic {
-                                            kind: object::RelocationKind::Relative,
-                                            encoding: object::RelocationEncoding::Generic,
-                                            size: 32,
-                                        },
-                                    },
-                                )?;
-                            }
-                            RelocKind::Static { symbol: reloc_name } => {
-                                let reloc_symbol = object.add_symbol(object::write::Symbol {
-                                    name: reloc_name.as_bytes().to_vec(),
-                                    value: 0,
-                                    size: u64::MAX,
-                                    kind: object::SymbolKind::Unknown,
-                                    scope: object::SymbolScope::Linkage,
-                                    weak: false,
-                                    section: object::write::SymbolSection::Undefined,
-                                    flags: object::SymbolFlags::None,
-                                });
-
-                                object.add_relocation(
-                                    *text_section_id,
-                                    object::write::Relocation {
-                                        offset: reloc_offset_in_coff,
-                                        symbol: reloc_symbol,
-                                        addend: -4,
-                                        //  zedddie@FIXME: ^^ this seem to be true only for movs/jmps, not for pushes
-                                        flags: object::RelocationFlags::Generic {
-                                            kind: object::RelocationKind::Relative,
-                                            encoding: object::RelocationEncoding::Generic,
-                                            size: 32,
-                                        },
-                                    },
-                                )?;
-                            }
-                        }
-                    }
-
-                    let name = match functions.get(&fun_offset_in_text) {
+                    let fun_name = match functions.get(&fun_offset_in_text) {
                         Some(overloads) => find_closest_symbol_name(&fun_name, overloads),
                         None => fun_name,
                     };
-                    object.add_symbol(object::write::Symbol {
-                        name: name.as_bytes().to_vec(),
+                    let fun_offset_in_coff_text = object_file.add_function(fun_name, &fun_bytes);
 
-                        value: fun_offset_in_coff,
-                        size: u64::MAX,
-                        kind: object::SymbolKind::Text,
-                        scope: object::SymbolScope::Linkage,
-                        weak: false,
-                        section: object::write::SymbolSection::Section(*text_section_id),
-                        flags: object::SymbolFlags::None,
-                    });
+                    for (reloc_rva, reloc_kind) in relocs_rva.range(fun_range_rva) {
+                        let reloc_rva = *reloc_rva;
+                        let reloc_kind = *reloc_kind;
+
+                        let reloc_offset_in_fun = reloc_rva - fun_rva;
+                        let reloc_offset_in_coff_text =
+                            fun_offset_in_coff_text + reloc_offset_in_fun;
+
+                        object_file.add_relocation_at(
+                            reloc_kind,
+                            reloc_offset_in_coff_text,
+                            fun_name,
+                            &exe_data,
+                        )?;
+                    }
                 }
             }
         }
@@ -851,7 +707,7 @@ impl ObjectFiles<'static> {
                 .iter()
                 .map(|&c| match c {
                     b'\\' => '/',
-                    _ => c as char,
+                    _ => char::from(c),
                 })
                 .collect::<String>();
             path.as_mut_os_string().push("/");
@@ -862,6 +718,159 @@ impl ObjectFiles<'static> {
             std::fs::write(&path, object_file.object.write()?)?;
         }
         Ok(())
+    }
+}
+
+impl ObjectFile {
+    fn add_relocation_at(
+        &mut self,
+        reloc_kind: RelocKind,
+        reloc_offset: ObjectOffset,
+        //
+        fun_name: RawString,
+        exe_data: &[u8],
+    ) -> anyhow::Result<()> {
+        match reloc_kind {
+            RelocKind::Function { overloads } => {
+                let reloc_name = find_closest_relative_call(&fun_name, overloads);
+
+                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
+            }
+
+            RelocKind::ConstantString { symbol, data } => {
+                let reloc_name = get_constant_name(symbol, data);
+                let reloc_name = RawString::from(reloc_name.as_slice());
+
+                let const_offset_in_coff_rdata =
+                    self.append_section_data(self.rdata_section_id, data, 0x00);
+
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Offset(const_offset_in_coff_rdata),
+                    reloc_offset,
+                )?;
+            }
+
+            RelocKind::ConstantValue { target_rva } => {
+                // sushi@TODO: data might be reloc as well, so needs to be handled properly
+                let target_data =
+                    bytemuck::pod_read_unaligned::<u32>(&exe_data[target_rva..target_rva + 4]);
+                let reloc_name = format!("?value_0x{:x?}@@3IA", target_data);
+                let reloc_name = RawString::from(reloc_name.as_bytes());
+
+                let const_offset_in_coff_rdata = self.append_section_data(
+                    self.rdata_section_id,
+                    &target_data.to_le_bytes(),
+                    0x00,
+                );
+
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Offset(const_offset_in_coff_rdata),
+                    reloc_offset,
+                )?;
+            }
+
+            RelocKind::Static { symbol: reloc_name } => {
+                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ObjectFile {
+    fn append_section_data(
+        &mut self,
+        section_id: object::write::SectionId,
+        data: &[u8],
+        pad: u8,
+    ) -> ObjectOffset {
+        let offset = append_with_padding(&mut self.object, section_id, data, pad);
+        ObjectOffset { offset, section_id }
+    }
+
+    fn add_relocation(
+        &mut self,
+        name: RawString,
+        location: ObjectLocation,
+        offset: ObjectOffset,
+    ) -> anyhow::Result<()> {
+        let (value, kind, section) = match location {
+            ObjectLocation::Extern => (
+                0,
+                object::SymbolKind::Unknown,
+                object::write::SymbolSection::Undefined,
+            ),
+            ObjectLocation::Offset(ObjectOffset { offset, section_id }) => {
+                let kind = if section_id == self.text_section_id {
+                    object::SymbolKind::Text
+                } else {
+                    object::SymbolKind::Data
+                };
+                (
+                    offset,
+                    kind,
+                    object::write::SymbolSection::Section(section_id),
+                )
+            }
+        };
+
+        let symbol = self.object.add_symbol(object::write::Symbol {
+            name: name.as_bytes().to_vec(),
+            value,
+            size: u64::MAX,
+            kind,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section,
+            flags: object::SymbolFlags::None,
+        });
+
+        self.object.add_relocation(
+            offset.section_id,
+            object::write::Relocation {
+                offset: offset.offset,
+                symbol,
+                addend: -4,
+                flags: object::RelocationFlags::Generic {
+                    kind: object::RelocationKind::Relative,
+                    encoding: object::RelocationEncoding::Generic,
+                    size: 32,
+                },
+            },
+        )?;
+
+        Ok(())
+    }
+
+    fn add_function(&mut self, name: RawString, body: &[u8]) -> ObjectOffset {
+        let fun_offset_in_coff_text = self.append_section_data(self.text_section_id, &body, 0x90);
+
+        self.object.add_symbol(object::write::Symbol {
+            name: name.as_bytes().to_vec(),
+            value: fun_offset_in_coff_text.offset,
+            size: u64::MAX,
+            kind: object::SymbolKind::Text,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
+            flags: object::SymbolFlags::None,
+        });
+
+        fun_offset_in_coff_text
+    }
+}
+
+impl std::ops::Add<usize> for ObjectOffset {
+    type Output = Self;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        Self {
+            offset: self.offset + rhs.to_u64(),
+            section_id: self.section_id,
+        }
     }
 }
 
@@ -879,7 +888,7 @@ fn append_with_padding(
 ) -> u64 {
     let offset = object.append_section_data(section_id, data, 1);
 
-    // sushi@TODO: `object` crate doesn't(?) allow specifying auxiliary symbols.
+    // sushi@NOTE: `object` crate doesn't(?) allow specifying auxiliary symbols.
     // Because of that 1-3 bytes of garbage are generated which objdiff doesn't like.
     // We replace those bytes with `nop`s and pad all of the functions ourselves,
     // which fixes the problem, but this is a hack, which needs to be fixed at some point.
@@ -982,4 +991,77 @@ where
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|s| s == needle)
+}
+
+fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
+    let image_base = exe
+        .nt_headers()
+        .optional_header
+        .image_base
+        .get(LittleEndian)
+        .to_usize();
+    let image_size = exe
+        .nt_headers()
+        .optional_header
+        .size_of_image
+        .get(LittleEndian)
+        .to_usize();
+    let mut mapped = vec![0u8; image_size];
+
+    for section in exe.sections() {
+        let rva = section.address().to_usize() - image_base;
+        if let Ok(data) = section.data() {
+            mapped[rva..rva + data.len()].copy_from_slice(data);
+        }
+    }
+    mapped
+}
+
+fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
+    match () {
+        () if symbol.as_bytes().starts_with(b"??_C@_0") => data
+            .iter()
+            .copied()
+            .map(|c| match c.is_ascii_alphanumeric() {
+                true => c,
+                false => b'_',
+            })
+            .collect::<Vec<_>>(),
+        () if symbol.as_bytes().starts_with(b"??_C@_1") => data
+            .windows(2)
+            .map(|c| match c[0] == b'0' && c[1].is_ascii_alphanumeric() {
+                true => c[1],
+                false => b'_',
+            })
+            .collect::<Vec<_>>(),
+        () => unreachable!(),
+    }
+}
+
+trait ToUsize {
+    fn to_usize(self) -> usize;
+}
+
+trait ToU64 {
+    fn to_u64(self) -> u64;
+}
+
+const _: () = assert!(std::mem::size_of::<usize>() == std::mem::size_of::<u64>());
+
+impl ToUsize for u32 {
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl ToUsize for u64 {
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl ToU64 for usize {
+    fn to_u64(self) -> u64 {
+        self as u64
+    }
 }
