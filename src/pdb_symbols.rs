@@ -9,6 +9,8 @@ use crate::Env;
 pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
+
+    pub constants: BTreeMap<usize, RawString<'static>>,
     pub statics: BTreeMap<usize, RawString<'static>>,
 }
 
@@ -33,68 +35,89 @@ impl PdbSymbols {
         //
         // But we also want unique symbols.
         let mut static_data_symbols = vec![];
+        let mut constant_data_symbols = vec![];
 
         let mut symbols = env.symbol_table.iter();
         while let Some(symbol) = symbols.next()? {
-            match symbol.parse() {
-                Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol {
-                    function,
-                    offset,
-                    name,
-                    ..
-                })) if function => {
-                    assert_eq!(offset.section, env.text.id);
+            let symbol = symbol.parse()?;
 
-                    let symbol_rva = env.text.rva + offset.offset.to_usize();
+            let (name, offset) = match &symbol {
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }) => (name, offset),
+                pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. }) => (name, offset),
+                _ => continue,
+            };
+            let name = *name;
+
+            let symbol_rva = match () {
+                () if offset.section == env.text.id => env.text.rva + offset.offset.to_usize(),
+                () if offset.section == env.rdata.id => env.rdata.rva + offset.offset.to_usize(),
+                () if offset.section == env.data.id => env.data.rva + offset.offset.to_usize(),
+                _ => continue,
+            };
+
+            match symbol {
+                // @NOTE: There are more symbols in `.text`, which are not functions.
+                // Seem to be useless though:
+                // 0x1cba96: __imp_load__CoInitialize@4
+                // 0x19963d: __nosnan2
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { function, .. }) if function => {
+                    assert_eq!(offset.section, env.text.id);
 
                     self.functions.entry(symbol_rva).or_default().push(name);
                 }
 
-                Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }))
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
                     if offset.section == env.rdata.id && name.as_bytes().starts_with(b"??_C@_") =>
                 {
-                    let symbol_rva = env.rdata.rva + offset.offset.to_usize();
-
                     let msvc_demangler::Type::ConstantString(string) =
                         msvc_demangler::parse(&name.to_string())?.symbol_type
                     else {
-                        continue;
+                        unreachable!()
                     };
 
                     let old_symbol = self.strings.insert(symbol_rva, (name, string));
                     assert_eq!(old_symbol, None, "Constant symbols cannot repeat");
                 }
 
-                Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { offset, name, .. }))
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
+                    if offset.section == env.rdata.id =>
+                {
+                    // @TODO: There can be multiple symbols for the same constant name.
+                    // While it makes sense to keep all of them and find closest,
+                    // for now we simply keep one.
+                    let _old_symbol = self.constants.insert(symbol_rva, name);
+                }
+
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
                     if offset.section == env.data.id =>
                 {
-                    let symbol_rva = env.data.rva + offset.offset.to_usize();
-
                     let old_symbol = self.statics.insert(symbol_rva, name);
                     assert_eq!(old_symbol, None, "Static symbols cannot repeat");
                 }
 
-                // @TODO
-                // Ignored for now.
-                // There are not that many symbols and the ones with types are either U64 or F80.
-                Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, .. }))
-                    if offset.section == env.rdata.id => {}
-
-                // in public they are mangled
-                // in data all symbols are not mangled, yes
-                Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. }))
+                // Unmangled data symbols to cover missing spots.
+                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                    if offset.section == env.rdata.id =>
+                {
+                    constant_data_symbols.push((symbol_rva, name));
+                }
+                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
                     if offset.section == env.data.id =>
                 {
-                    let symbol_rva = env.data.rva + offset.offset.to_usize();
-
                     static_data_symbols.push((symbol_rva, name));
                 }
                 _ => {}
             }
         }
-
         for (symbol_rva, name) in static_data_symbols {
             match self.statics.entry(symbol_rva) {
+                btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
+                btree_map::Entry::Occupied(_) => (),
+            }
+        }
+
+        for (symbol_rva, name) in constant_data_symbols {
+            match self.constants.entry(symbol_rva) {
                 btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
                 btree_map::Entry::Occupied(_) => (),
             }
@@ -124,42 +147,39 @@ impl PdbSymbols {
 
             while let Some(symbol) = iter.next()? {
                 match symbol.parse() {
-                    //
-                    // functions
-                    //
                     Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
                         name,
                         offset,
                         len,
                         ..
                     })) => self.add_function_symbol(env, name, offset, len),
-
                     Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
                         name, offset, len, ..
                     })) => self.add_function_symbol(env, name, offset, u32::from(len)),
 
-                    //
-                    // statics
-                    //
-                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. }))
-                        if offset.section == env.data.id =>
-                    {
-                        let symbol_rva = env.data.rva + offset.offset.to_usize();
+                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
+                        let symbol_rva = match () {
+                            () if offset.section == env.rdata.id => {
+                                env.rdata.rva + offset.offset.to_usize()
+                            }
+                            () if offset.section == env.data.id => {
+                                env.data.rva + offset.offset.to_usize()
+                            }
+                            _ => continue,
+                        };
 
-                        // Prefer symbol names from modules.
-                        // As those are closer to the original symbols.
-                        // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
-                        let _old_symbol = self.statics.insert(symbol_rva, name);
-                    }
-
-                    //
-                    // constants
-                    //
-                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, .. }))
-                        if offset.section == env.rdata.id =>
-                    {
-                        // TODO
-                        // println!("module_data_symbol   {}", name);
+                        match () {
+                            () if offset.section == env.rdata.id => {
+                                let _old_symbol = self.constants.insert(symbol_rva, name);
+                            }
+                            () if offset.section == env.data.id => {
+                                // Prefer symbol names from modules.
+                                // As those are closer to the original symbols.
+                                // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
+                                let _old_symbol = self.statics.insert(symbol_rva, name);
+                            }
+                            _ => continue,
+                        };
                     }
 
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })) => {
