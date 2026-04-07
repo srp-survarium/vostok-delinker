@@ -162,10 +162,15 @@ pub fn resolve_absolute_relocations<'s>(
                     let Some((static_rva, static_name)) =
                         symbols.statics.range(..=target_rva).next_back()
                     else {
-                        assert_eq!(target_rva, 0, "All relocations must be named");
+                        let _reloc_va = reloc_rva + env.image_base.to_usize();
+                        // @TODO: There is a "single" unnamed static relocation in base, which is a
+                        // string "rb\0" used for `fopen` in `ov_fopen`.
                         continue;
                     };
 
+                    // @TODO: Many relocations (~10k ) have very huge diffs,
+                    // meaning they do not actually belong to a found symbol.
+                    // This needs to be investigated (if this will affect objdiff matching)
                     let diff = u32::try_from(target_rva - *static_rva)?;
                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 

@@ -144,14 +144,12 @@ impl PdbSymbols {
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. }))
                         if offset.section == env.data.id =>
                     {
-                        let offset = offset.offset.to_usize();
+                        let symbol_rva = env.data.rva + offset.offset.to_usize();
 
-                        match self.statics.entry(offset) {
-                            btree_map::Entry::Occupied(_) => (),
-                            btree_map::Entry::Vacant(entry) => {
-                                entry.insert(name);
-                            }
-                        }
+                        // Prefer symbol names from modules.
+                        // As those are closer to the original symbols.
+                        // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
+                        let _old_symbol = self.statics.insert(symbol_rva, name);
                     }
 
                     //
