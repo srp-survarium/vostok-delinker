@@ -21,8 +21,7 @@ pub struct ObjectFiles<'a> {
 
 pub struct ObjectFile {
     pub object: object::write::Object<'static>,
-    // @TODO: Values of initialized statics will be here.
-    pub _data_section_id: object::write::SectionId,
+    pub data_section_id: object::write::SectionId,
     pub rdata_section_id: object::write::SectionId,
     pub text_section_id: object::write::SectionId,
 }
@@ -194,7 +193,7 @@ impl ObjectFile {
 
         Self {
             object,
-            _data_section_id: data_section_id,
+            data_section_id,
             rdata_section_id,
             text_section_id,
         }
@@ -411,8 +410,29 @@ impl ObjectFile {
                 }
             }
 
-            RelocKind::Static { symbol: _ } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
+            RelocKind::Static {
+                symbol: _,
+                target_rva,
+            } => {
+                let new_data =
+                    bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
+                let static_offset_in_coff_data =
+                    self.append_section_data(self.data_section_id, &new_data, 0x00);
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Offset(static_offset_in_coff_data),
+                    reloc_offset,
+                )?;
+
+                if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
+                    self.add_relocation_at(
+                        *reloc_kind,
+                        static_offset_in_coff_data,
+                        fun_name,
+                        coff_data,
+                        relocs_rva,
+                    )?;
+                }
             }
         }
 
@@ -524,7 +544,10 @@ impl<'a> RelocKind<'a> {
                 symbol: reloc_name,
                 target_rva: _,
             } => Name::Borrowed(reloc_name),
-            Self::Static { symbol: reloc_name } => Name::Borrowed(reloc_name),
+            Self::Static {
+                symbol: reloc_name,
+                target_rva: _,
+            } => Name::Borrowed(reloc_name),
         }
     }
 }
@@ -671,7 +694,7 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
             .collect::<Vec<_>>(),
         () if symbol.as_bytes().starts_with(b"??_C@_1") => data
             .windows(2)
-            .map(|c| match c[0] == b'0' && c[1].is_ascii_alphanumeric() {
+            .map(|c| match c[0] == b'\0' && c[1].is_ascii_alphanumeric() {
                 true => c[1],
                 false => b'_',
             })

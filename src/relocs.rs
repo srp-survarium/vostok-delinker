@@ -27,9 +27,9 @@ pub enum RelocKind<'a> {
     },
 
     // .data
-    // @TODO: Distinguish uninit vs. init statics
     Static {
         symbol: RawString<'static>,
+        target_rva: usize,
     },
 }
 
@@ -141,11 +141,12 @@ pub fn resolve_absolute_relocations<'s>(
                             let Some((constant_rva, constant_name)) =
                                 symbols.constants.range(..=target_rva).next_back()
                             else {
-                                let _reloc_va = reloc_rva + env.image_base.to_usize();
-                                // @TODO: AAAAAAA
-                                continue;
+                                unreachable!("All constants must be named");
                             };
 
+                            // @TODO: Many relocations (~2k) have very huge diffs,
+                            // meaning they do not actually belong to a found symbol.
+                            // This needs to be investigated (if this will affect objdiff matching)
                             let diff = u32::try_from(target_rva - *constant_rva)?;
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
@@ -169,7 +170,7 @@ pub fn resolve_absolute_relocations<'s>(
                         continue;
                     };
 
-                    // @TODO: Many relocations (~10k ) have very huge diffs,
+                    // @TODO: Many relocations (~10k) have very huge diffs,
                     // meaning they do not actually belong to a found symbol.
                     // This needs to be investigated (if this will affect objdiff matching)
                     let diff = u32::try_from(target_rva - *static_rva)?;
@@ -179,6 +180,7 @@ pub fn resolve_absolute_relocations<'s>(
                         reloc_rva,
                         RelocKind::Static {
                             symbol: *static_name,
+                            target_rva,
                         },
                     );
                 }
