@@ -1,5 +1,7 @@
 @echo off
 
+pushd "%~dp0"
+
 if not defined ROOT_DIR       set "ROOT_DIR=%~dp0\.."
 for %%I in ("%ROOT_DIR%")  do set "ROOT_DIR=%%~fI"
 
@@ -17,3 +19,5 @@ cargo run --release -- ^
   --engine-path "c:\survarium\sources"
 
 py "%VOSTOK_DIR%\scripts\generate_objdiff_config.py"
+
+popd
