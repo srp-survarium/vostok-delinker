@@ -5,11 +5,7 @@ use crate::Env;
 
 use std::collections::{BTreeMap, HashMap};
 
-use capstone::arch::x86::{ArchMode, ArchSyntax, X86Operand, X86OperandType};
-use capstone::arch::ArchOperand;
-use capstone::prelude::{BuildsCapstone, BuildsCapstoneSyntax};
-use capstone::Capstone;
-use capstone::InsnGroupType::*;
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
 use pdb2::{FallibleIterator, RawString};
 
@@ -56,14 +52,6 @@ impl ObjectFiles<'_> {
             objects: HashMap::new(),
         };
 
-        let ctx = Capstone::new()
-            .x86()
-            .mode(ArchMode::Mode32)
-            .syntax(ArchSyntax::Intel)
-            .detail(true)
-            .build()
-            .expect("Cannot create Capstone context");
-
         let mut modules = env.dbi.modules()?;
         while let Some(module) = modules.next()? {
             let Some(module_info) = pdb.module_info(&module)? else {
@@ -102,7 +90,6 @@ impl ObjectFiles<'_> {
                 let fun_rva = env.text.rva + fun_offset.offset.to_usize();
                 let fun_bytes = resolve_relative_relocations(
                     env,
-                    &ctx,
                     fun_rva,
                     fun_size,
                     symbols,
@@ -270,7 +257,6 @@ fn get_function_location(
 // At the same time `relocs_rva` sorts automatically!
 fn resolve_relative_relocations<'s>(
     env: &Env,
-    ctx: &Capstone,
 
     fun_rva: usize,
     fun_size: usize,
@@ -284,35 +270,30 @@ fn resolve_relative_relocations<'s>(
 
     // @NOTE: Requires a new allocation, since capstone cannot borrow function code mutably.
     let mut fun_bytes = coff_data[fun_rva..fun_rva + fun_size].to_vec();
-    let mut offset_in_fun = 0;
 
-    let ixs = ctx.disasm_all(&coff_data[fun_rva..fun_rva + fun_size], fun_va.to_u64())?;
-    for ix in ixs.iter() {
-        offset_in_fun += ix.len();
+    let code = &coff_data[fun_rva..fun_rva + fun_size];
+    let mut decoder = Decoder::with_ip(32, code, fun_va as u64, DecoderOptions::NONE);
+    let mut ix = Instruction::default();
 
-        let detail = ctx.insn_detail(ix)?;
-        let arch_detail = detail.arch_detail();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut ix);
 
-        let groups = detail.groups().iter().map(|v| u32::from(v.0));
+        let offset_in_fun = (ix.ip() - fun_va as u64) as usize + ix.len();
 
-        let is_branch = groups.clone().any(|v| v == CS_GRP_BRANCH_RELATIVE);
-
-        if !is_branch {
-            continue;
+        match ix.flow_control() {
+            FlowControl::ConditionalBranch
+            | FlowControl::UnconditionalBranch
+            | FlowControl::Call => {}
+            _ => continue,
         }
 
-        let ops = arch_detail.operands();
-        assert_eq!(ops.len(), 1);
-
-        let ArchOperand::X86Operand(X86Operand {
-            op_type: X86OperandType::Imm(target_va),
-            ..
-        }) = ops[0]
-        else {
-            unreachable!()
+        let target_va = match ix.op0_kind() {
+            OpKind::NearBranch16 => ix.near_branch16() as u64,
+            OpKind::NearBranch32 => ix.near_branch32() as u64,
+            OpKind::NearBranch64 => unreachable!(),
+            _ => continue,
         };
 
-        let target_va = u64::try_from(target_va)?;
         let target_rva = target_va - u64::from(env.image_base);
 
         let internal_branch = (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
@@ -329,10 +310,6 @@ fn resolve_relative_relocations<'s>(
             // Read data as code. Which is jump tables stored inline.
             continue;
         };
-
-        // if fun_name == b"" {
-
-        // }
 
         let overloads = overloads.as_slice();
 
