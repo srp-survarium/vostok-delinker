@@ -21,15 +21,15 @@ pub enum RelocKind<'a> {
         symbol: RawString<'static>,
         data: &'a [u8],
     },
-    ConstantValue {
-        target_data: u32,
-        maybe_rva: Option<usize>,
+    Constant {
+        symbol: RawString<'static>,
+        target_rva: usize,
     },
 
     // .data
-    // @TODO: Distinguish uninit vs. init statics
     Static {
         symbol: RawString<'static>,
+        target_rva: usize,
     },
 }
 
@@ -138,21 +138,23 @@ pub fn resolve_absolute_relocations<'s>(
                         }
 
                         Some(_) | None => {
-                            let target_data = bytemuck::pod_read_unaligned::<u32>(
-                                &exe_data[target_rva..target_rva + 4],
-                            );
-                            let maybe_rva = target_data
-                                .checked_sub(env.image_base)
-                                .map(|rva| rva.to_usize());
+                            let Some((constant_rva, constant_name)) =
+                                symbols.constants.range(..=target_rva).next_back()
+                            else {
+                                unreachable!("All constants must be named");
+                            };
 
-                            // @TODO
-                            coff_data_reloc.copy_from_slice(&0_u32.to_le_bytes());
+                            // @TODO: Many relocations (~2k) have very huge diffs,
+                            // meaning they do not actually belong to a found symbol.
+                            // This needs to be investigated (if this will affect objdiff matching)
+                            let diff = u32::try_from(target_rva - *constant_rva)?;
+                            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                             relocs_rva.insert(
                                 reloc_rva,
-                                RelocKind::ConstantValue {
-                                    target_data,
-                                    maybe_rva,
+                                RelocKind::Constant {
+                                    symbol: *constant_name,
+                                    target_rva,
                                 },
                             );
                         }
@@ -168,7 +170,7 @@ pub fn resolve_absolute_relocations<'s>(
                         continue;
                     };
 
-                    // @TODO: Many relocations (~10k ) have very huge diffs,
+                    // @TODO: Many relocations (~10k) have very huge diffs,
                     // meaning they do not actually belong to a found symbol.
                     // This needs to be investigated (if this will affect objdiff matching)
                     let diff = u32::try_from(target_rva - *static_rva)?;
@@ -178,6 +180,7 @@ pub fn resolve_absolute_relocations<'s>(
                         reloc_rva,
                         RelocKind::Static {
                             symbol: *static_name,
+                            target_rva,
                         },
                     );
                 }

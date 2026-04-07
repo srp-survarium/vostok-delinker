@@ -44,9 +44,6 @@ pub struct SecInfo<'a> {
 // 1. Figure out how to not leak memory excessively with `pdb2` crate.
 // Why does tie lifetime of `RawString` to a module info?
 // This doesn't make sense, since it should tie it to `pdb` file itself.
-//
-// ## 2. sushi@TODO: Relocations in .data and .rdata
-// ## 3. sushi@TODO: Initialized statics in .rdata
 
 fn main() -> anyhow::Result<()> {
     let Cli {

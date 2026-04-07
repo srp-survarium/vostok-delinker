@@ -21,8 +21,7 @@ pub struct ObjectFiles<'a> {
 
 pub struct ObjectFile {
     pub object: object::write::Object<'static>,
-    // @TODO: Values of initialized statics will be here.
-    pub _data_section_id: object::write::SectionId,
+    pub data_section_id: object::write::SectionId,
     pub rdata_section_id: object::write::SectionId,
     pub text_section_id: object::write::SectionId,
 }
@@ -134,6 +133,7 @@ impl ObjectFiles<'_> {
                         reloc_kind,
                         reloc_offset_in_coff_text,
                         fun_name,
+                        coff_data,
                         &relocs_rva,
                     )?;
                 }
@@ -193,7 +193,7 @@ impl ObjectFile {
 
         Self {
             object,
-            _data_section_id: data_section_id,
+            data_section_id,
             rdata_section_id,
             text_section_id,
         }
@@ -363,9 +363,10 @@ impl ObjectFile {
         reloc_offset: ObjectOffset,
         //
         fun_name: RawString,
+        coff_data: &[u8],
         relocs_rva: &BTreeMap<usize, RelocKind>,
     ) -> anyhow::Result<()> {
-        let reloc_name = reloc_kind.get_name(fun_name, relocs_rva);
+        let reloc_name = reloc_kind.get_name(fun_name);
         let reloc_name = reloc_name.as_raw_string();
 
         match reloc_kind {
@@ -384,36 +385,54 @@ impl ObjectFile {
                 )?;
             }
 
-            RelocKind::ConstantValue {
-                target_data,
-                maybe_rva,
+            RelocKind::Constant {
+                symbol: _,
+                target_rva,
             } => {
-                let const_offset_in_coff_rdata = self.append_section_data(
-                    self.rdata_section_id,
-                    &target_data.to_le_bytes(),
-                    0x00,
-                );
+                let new_data =
+                    bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
+                let const_offset_in_coff_rdata =
+                    self.append_section_data(self.rdata_section_id, &new_data, 0x00);
                 self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                 )?;
 
-                match maybe_rva.and_then(|rva| relocs_rva.get(&rva)) {
-                    Some(chained_reloc_kind) => {
-                        self.add_relocation_at(
-                            *chained_reloc_kind,
-                            const_offset_in_coff_rdata,
-                            fun_name,
-                            relocs_rva,
-                        )?;
-                    }
-                    None => (),
+                if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
+                    self.add_relocation_at(
+                        *reloc_kind,
+                        const_offset_in_coff_rdata,
+                        fun_name,
+                        coff_data,
+                        relocs_rva,
+                    )?;
                 }
             }
 
-            RelocKind::Static { symbol: _ } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
+            RelocKind::Static {
+                symbol: _,
+                target_rva,
+            } => {
+                let new_data =
+                    bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
+                let static_offset_in_coff_data =
+                    self.append_section_data(self.data_section_id, &new_data, 0x00);
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Offset(static_offset_in_coff_data),
+                    reloc_offset,
+                )?;
+
+                if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
+                    self.add_relocation_at(
+                        *reloc_kind,
+                        static_offset_in_coff_data,
+                        fun_name,
+                        coff_data,
+                        relocs_rva,
+                    )?;
+                }
             }
         }
 
@@ -512,12 +531,7 @@ enum Name<'a> {
 }
 
 impl<'a> RelocKind<'a> {
-    fn get_name(
-        self,
-
-        fun_name: RawString<'a>,
-        relocs_rva: &BTreeMap<usize, RelocKind<'a>>,
-    ) -> Name<'a> {
+    fn get_name(self, fun_name: RawString<'a>) -> Name<'a> {
         match self {
             Self::Function { overloads } => {
                 Name::Borrowed(find_closest_relative_call(fun_name, overloads))
@@ -526,37 +540,19 @@ impl<'a> RelocKind<'a> {
                 let reloc_name = get_constant_name(symbol, data);
                 Name::Owned(reloc_name)
             }
-            Self::ConstantValue {
-                target_data,
-                maybe_rva,
-            } => match maybe_rva.and_then(|rva| relocs_rva.get(&rva)) {
-                None => {
-                    let reloc_name = format!("value_0x{:x?}", target_data);
-                    Name::Owned(reloc_name.into_bytes())
-                }
-
-                Some(chained_reloc_kind) => {
-                    let mut chained_reloc_name = chained_reloc_kind.get_name(fun_name, relocs_rva);
-                    chained_reloc_name.prepend(b"ptr_");
-                    chained_reloc_name
-                }
-            },
-            Self::Static { symbol: reloc_name } => Name::Borrowed(reloc_name),
+            Self::Constant {
+                symbol: reloc_name,
+                target_rva: _,
+            } => Name::Borrowed(reloc_name),
+            Self::Static {
+                symbol: reloc_name,
+                target_rva: _,
+            } => Name::Borrowed(reloc_name),
         }
     }
 }
 
 impl Name<'_> {
-    fn prepend(&mut self, prefix: &[u8]) {
-        match self {
-            Self::Owned(name) => _ = name.splice(0..0, prefix.iter().copied()),
-            Self::Borrowed(name) => {
-                *self = Self::Owned(name.as_bytes().to_vec());
-                self.prepend(prefix);
-            }
-        }
-    }
-
     fn as_raw_string(&self) -> RawString<'_> {
         match self {
             Self::Owned(name) => RawString::from(name.as_slice()),
@@ -698,7 +694,7 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
             .collect::<Vec<_>>(),
         () if symbol.as_bytes().starts_with(b"??_C@_1") => data
             .windows(2)
-            .map(|c| match c[0] == b'0' && c[1].is_ascii_alphanumeric() {
+            .map(|c| match c[0] == b'\0' && c[1].is_ascii_alphanumeric() {
                 true => c[1],
                 false => b'_',
             })
