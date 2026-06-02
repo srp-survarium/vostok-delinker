@@ -3,10 +3,12 @@
 mod object_files;
 mod pdb_symbols;
 mod relocs;
+mod symbol_matcher;
 mod utils;
 
 use crate::object_files::ObjectFiles;
 use crate::pdb_symbols::PdbSymbols;
+use crate::symbol_matcher::SymbolMatcher;
 use crate::utils::{leak, ToUsize};
 
 use clap::Parser;
@@ -26,6 +28,16 @@ pub struct Cli {
 
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub engine_path: String,
+
+    /// Target side: record the name chosen for every folded symbol group to this
+    /// file, so the base delink can reproduce the same choices.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub write_symbol_map: Option<std::path::PathBuf>,
+
+    /// Base side: reconcile folded symbol names against the target choices
+    /// recorded here. Missing file is tolerated (no reconciliation).
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub read_symbol_map: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -51,6 +63,8 @@ fn main() -> anyhow::Result<()> {
         exe_path,
         output_path,
         engine_path,
+        write_symbol_map,
+        read_symbol_map,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -66,7 +80,14 @@ fn main() -> anyhow::Result<()> {
         engine_path.push('\\');
     }
 
-    process_executable(exe, pdb, engine_path.as_bytes(), output_path.as_path())?;
+    process_executable(
+        exe,
+        pdb,
+        engine_path.as_bytes(),
+        output_path.as_path(),
+        write_symbol_map.as_deref(),
+        read_symbol_map.as_deref(),
+    )?;
 
     Ok(())
 }
@@ -76,12 +97,28 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     mut pdb: pdb2::PDB<'static, S>,
     engine_path: &[u8],
     output_path: &std::path::Path,
+    write_symbol_map: Option<&std::path::Path>,
+    read_symbol_map: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
 
     let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(&env, exe, &pdb_symbols)?;
+
+    // Base side reconciles its folded names against the target's recorded
+    // choices; the target side (and a plain run) just emits local defaults.
+    let matcher = match read_symbol_map {
+        Some(path) if path.is_file() => SymbolMatcher::load(path)?,
+        Some(path) => {
+            eprintln!(
+                "[symbol-matcher] no target symbol map at {} yet; emitting local defaults",
+                path.display()
+            );
+            SymbolMatcher::off()
+        }
+        None => SymbolMatcher::off(),
+    };
 
     let object_files = ObjectFiles::parse(
         &env,
@@ -90,8 +127,28 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &coff_data,
         relocs_rva,
         engine_path,
+        &matcher,
     )?;
     object_files.write(output_path)?;
+
+    // Target side: record the choices base will later try to reproduce.
+    if let Some(path) = write_symbol_map {
+        let groups = symbol_matcher::write_function_map(path, &pdb_symbols.functions)?;
+        eprintln!(
+            "[symbol-matcher] recorded {groups} folded function groups -> {}",
+            path.display()
+        );
+    }
+
+    // Base side: report how many folded references were pulled into agreement
+    // with the target (`became_same` is the verification number).
+    if let Some(stats) = matcher.stats() {
+        eprintln!(
+            "[symbol-matcher] reconciled {} folded references against target \
+             ({} became the same as target, {} fell back: target's choice absent in base)",
+            stats.reconciled, stats.became_same, stats.fallback_missing
+        );
+    }
 
     Ok(())
 }

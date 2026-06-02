@@ -13,10 +13,11 @@ set "OBJDIFF_DIR=%VOSTOK_DIR%\binaries\objdiff"
 if exist "%OBJDIFF_DIR%\target" rmdir /s /q "%OBJDIFF_DIR%\target"
 
 cargo run --release -- ^
-  --pdb-path    "%SURVARIUM_BIN%\survarium.pdb" ^
-  --exe-path    "%SURVARIUM_BIN%\survarium.exe" ^
-  --output-path "%OBJDIFF_DIR%\target" ^
-  --engine-path "c:\survarium\sources"
+  --pdb-path         "%SURVARIUM_BIN%\survarium.pdb" ^
+  --exe-path         "%SURVARIUM_BIN%\survarium.exe" ^
+  --output-path      "%OBJDIFF_DIR%\target" ^
+  --engine-path      "c:\survarium\sources" ^
+  --write-symbol-map "%OBJDIFF_DIR%\target-symbol-map.tsv"
 
 py "%VOSTOK_DIR%\scripts\generate_objdiff_config.py"
 

@@ -1,5 +1,6 @@
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::RelocKind;
+use crate::symbol_matcher::{canonical_name, SymbolMatcher};
 use crate::utils::{contains, leak, ToU64, ToUsize};
 use crate::Env;
 
@@ -44,6 +45,7 @@ impl ObjectFiles<'_> {
         mut relocs_rva: BTreeMap<usize, RelocKind<'s>>,
 
         engine_path: &[u8],
+        matcher: &SymbolMatcher,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -103,7 +105,7 @@ impl ObjectFiles<'_> {
                     .or_insert_with(|| ObjectFile::empty(engine_path));
 
                 let fun_name = match symbols.functions.get(&fun_rva) {
-                    Some(overloads) => find_closest_symbol_name(&fun_name, overloads),
+                    Some(overloads) => matcher.pick(overloads, canonical_name(overloads)),
                     _ => fun_name,
                 };
 
@@ -119,7 +121,7 @@ impl ObjectFiles<'_> {
                     object_file.add_relocation_at(
                         reloc_kind,
                         reloc_offset_in_coff_text,
-                        fun_name,
+                        matcher,
                         coff_data,
                         &relocs_rva,
                     )?;
@@ -339,11 +341,11 @@ impl ObjectFile {
         reloc_kind: RelocKind,
         reloc_offset: ObjectOffset,
         //
-        fun_name: RawString,
+        matcher: &SymbolMatcher,
         coff_data: &[u8],
         relocs_rva: &BTreeMap<usize, RelocKind>,
     ) -> anyhow::Result<()> {
-        let reloc_name = reloc_kind.get_name(fun_name);
+        let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
 
         match reloc_kind {
@@ -380,7 +382,7 @@ impl ObjectFile {
                     self.add_relocation_at(
                         *reloc_kind,
                         const_offset_in_coff_rdata,
-                        fun_name,
+                        matcher,
                         coff_data,
                         relocs_rva,
                     )?;
@@ -405,7 +407,7 @@ impl ObjectFile {
                     self.add_relocation_at(
                         *reloc_kind,
                         static_offset_in_coff_data,
-                        fun_name,
+                        matcher,
                         coff_data,
                         relocs_rva,
                     )?;
@@ -508,10 +510,10 @@ enum Name<'a> {
 }
 
 impl<'a> RelocKind<'a> {
-    fn get_name(self, fun_name: RawString<'a>) -> Name<'a> {
+    fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
             Self::Function { overloads } => {
-                Name::Borrowed(find_closest_relative_call(fun_name, overloads))
+                Name::Borrowed(matcher.pick(overloads, canonical_name(overloads)))
             }
             Self::ConstantString { symbol, data } => {
                 let reloc_name = get_constant_name(symbol, data);
@@ -578,86 +580,6 @@ fn append_with_padding(
 //
 //
 //
-
-fn last_segment_no_generics(name: &[u8]) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    let mut end = name.len();
-    for (i, &c) in name.iter().enumerate().rev() {
-        match c {
-            b'>' => depth += 1,
-            b'<' => {
-                if depth == 1 {
-                    end = i;
-                }
-                depth = depth.checked_sub(1)?;
-            }
-            b':' if depth == 0 && name.get(i + 1) == Some(&b':') => {
-                let start = i + b"::".len();
-                if start >= end {
-                    return None;
-                }
-                return Some((start, end));
-            }
-            _ if depth == 0 && i == 0 => return Some((0, end)),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn find_closest_relative_call<'p>(
-    fun_name: RawString,
-    overloads: &[RawString<'p>],
-) -> RawString<'p> {
-    match overloads.len() {
-        1 => overloads[0],
-        _ => find_closest_symbol(get_class(fun_name.as_bytes()), overloads.iter()),
-    }
-}
-
-fn find_closest_symbol_name<'p>(
-    fun_name: &RawString,
-    overloads: &[RawString<'p>],
-) -> RawString<'p> {
-    match overloads.len() {
-        1 => overloads[0],
-        _ => find_closest_symbol(get_method(fun_name.as_bytes()), overloads.iter()),
-    }
-}
-
-fn get_class(name: &[u8]) -> Option<&[u8]> {
-    let (fn_start, _) = last_segment_no_generics(name)?;
-
-    let class_end = fn_start.checked_sub(b"::".len())?;
-    let path = &name[..class_end];
-
-    let (class_start, class_end) = last_segment_no_generics(path)?;
-    Some(&path[class_start..class_end])
-}
-
-fn get_method(name: &[u8]) -> Option<&[u8]> {
-    let (fn_start, fn_end) = last_segment_no_generics(name)?;
-    Some(&name[fn_start..fn_end])
-}
-
-fn find_closest_symbol<'a, 'p, I>(name: Option<&[u8]>, mangled_symbols: I) -> RawString<'p>
-where
-    I: Iterator<Item = &'a RawString<'p>> + Clone,
-    'p: 'a,
-{
-    if let Some(name) = name {
-        if let Some(sym) = mangled_symbols
-            .clone()
-            .filter(|sym| sym.as_bytes().windows(name.len()).any(|sym| sym == name))
-            .min_by_key(|sym| sym.len())
-        {
-            return *sym;
-        }
-    }
-    *mangled_symbols
-        .min_by_key(|sym| sym.len())
-        .expect("Mangled iterator to not be empty")
-}
 
 fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
     match () {
