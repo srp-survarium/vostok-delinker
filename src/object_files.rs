@@ -212,10 +212,15 @@ fn get_function_location(
     }
 
     let location: &'static [u8] = match filename {
-        Some(filename) => match filename.as_bytes().strip_prefix(engine_path) {
-            Some(filename) => filename,
-            None => return Ok(None),
-        },
+        Some(filename) => { 
+            if filename.len() < engine_path.len(){
+                return Ok(None)
+            }
+            match str::from_utf8(filename.as_bytes())?[0..engine_path.len()].eq_ignore_ascii_case(str::from_utf8(engine_path)?) {
+                true => str::from_utf8(filename.as_bytes())?[engine_path.len()..].as_bytes(),
+                false => return Ok(None),
+            }
+        }
         None => match fun_name.as_bytes() {
             name if !contains(name, b"::") && !name.contains(&b' ') => b"_msvc_internal\\c_lang",
             name => {
