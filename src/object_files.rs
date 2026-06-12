@@ -1,8 +1,8 @@
+use crate::Env;
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::RelocKind;
-use crate::symbol_matcher::{canonical_name, SymbolMatcher};
-use crate::utils::{contains, leak, ToU64, ToUsize};
-use crate::Env;
+use crate::symbol_matcher::{SymbolMatcher, canonical_name};
+use crate::utils::{ToU64, ToUsize, contains, leak};
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -212,11 +212,13 @@ fn get_function_location(
     }
 
     let location: &'static [u8] = match filename {
-        Some(filename) => { 
-            if filename.len() < engine_path.len(){
-                return Ok(None)
+        Some(filename) => {
+            if filename.len() < engine_path.len() {
+                return Ok(None);
             }
-            match str::from_utf8(filename.as_bytes())?[0..engine_path.len()].eq_ignore_ascii_case(str::from_utf8(engine_path)?) {
+            match str::from_utf8(filename.as_bytes())?[0..engine_path.len()]
+                .eq_ignore_ascii_case(str::from_utf8(engine_path)?)
+            {
                 true => str::from_utf8(filename.as_bytes())?[engine_path.len()..].as_bytes(),
                 false => return Ok(None),
             }
@@ -287,53 +289,80 @@ fn resolve_relative_relocations<'s>(
 
         let offset_in_fun = (ix.ip() - fun_va as u64) as usize + ix.len();
 
-        match ix.flow_control() {
-            FlowControl::ConditionalBranch
-            | FlowControl::UnconditionalBranch
-            | FlowControl::Call => {}
-            _ => continue,
-        }
+        if ix.is_stack_instruction() && ix.op0_kind() == OpKind::Immediate32 {
+            let target_rva = ix.immediate32() as u64 - u64::from(env.image_base);
 
-        let target_va = match ix.op0_kind() {
-            OpKind::NearBranch16 => ix.near_branch16() as u64,
-            OpKind::NearBranch32 => ix.near_branch32() as u64,
-            OpKind::NearBranch64 => unreachable!(),
-            _ => continue,
-        };
-
-        let target_rva = target_va - u64::from(env.image_base);
-
-        let internal_branch = (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
-        if internal_branch {
-            continue;
-        }
-
-        if ix.len() <= 4 {
-            // Read data as code. Which is jump tables stored inline.
-            continue;
-        }
-
-        let Some(overloads) = symbols.functions.get(&target_rva.to_usize()) else {
-            // Read data as code. Which is jump tables stored inline.
-            continue;
-        };
-
-        let overloads = overloads.as_slice();
-
-        fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
-        let old_reloc = relocs_rva.insert(
-            fun_rva + offset_in_fun - 4,
-            RelocKind::Function { overloads },
-        );
-
-        if let Some(old_reloc) = old_reloc {
-            let RelocKind::Function {
-                overloads: old_overloads,
-            } = old_reloc
-            else {
-                unreachable!();
+            let Some(overloads) = symbols.functions.get(&target_rva.to_usize()) else {
+                // Read data as code. Which is jump tables stored inline.
+                continue;
             };
-            assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+
+            let overloads = overloads.as_slice();
+
+            fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
+            let old_reloc = relocs_rva.insert(
+                fun_rva + offset_in_fun - 4,
+                RelocKind::Function { overloads },
+            );
+
+            if let Some(old_reloc) = old_reloc {
+                let RelocKind::Function {
+                    overloads: old_overloads,
+                } = old_reloc
+                else {
+                    unreachable!();
+                };
+                assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+            }
+        } else {
+            match ix.flow_control() {
+                FlowControl::ConditionalBranch
+                | FlowControl::UnconditionalBranch
+                | FlowControl::Call => {}
+                _ => continue,
+            }
+
+            let target_va = match ix.op0_kind() {
+                OpKind::NearBranch16 => ix.near_branch16() as u64,
+                OpKind::NearBranch32 => ix.near_branch32() as u64,
+                OpKind::NearBranch64 => unreachable!(),
+                _ => continue,
+            };
+
+            let target_rva = target_va - u64::from(env.image_base);
+
+            let internal_branch = (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
+            if internal_branch {
+                continue;
+            }
+
+            if ix.len() <= 4 {
+                // Read data as code. Which is jump tables stored inline.
+                continue;
+            }
+
+            let Some(overloads) = symbols.functions.get(&target_rva.to_usize()) else {
+                // Read data as code. Which is jump tables stored inline.
+                continue;
+            };
+
+            let overloads = overloads.as_slice();
+
+            fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
+            let old_reloc = relocs_rva.insert(
+                fun_rva + offset_in_fun - 4,
+                RelocKind::Function { overloads },
+            );
+
+            if let Some(old_reloc) = old_reloc {
+                let RelocKind::Function {
+                    overloads: old_overloads,
+                } = old_reloc
+                else {
+                    unreachable!();
+                };
+                assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+            }
         }
     }
 
