@@ -45,6 +45,7 @@ impl ObjectFiles<'_> {
         mut relocs_rva: BTreeMap<usize, RelocKind<'s>>,
 
         engine_path: &[u8],
+        pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
     ) -> anyhow::Result<Self>
     where
@@ -102,7 +103,7 @@ impl ObjectFiles<'_> {
                 let object_file = this
                     .objects
                     .entry(filename)
-                    .or_insert_with(|| ObjectFile::empty(engine_path));
+                    .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
 
                 let fun_name = match symbols.functions.get(&fun_rva) {
                     Some(overloads) => matcher.pick(overloads, canonical_name(overloads)),
@@ -158,7 +159,7 @@ impl ObjectFiles<'_> {
 }
 
 impl ObjectFile {
-    fn empty(engine_path: &[u8]) -> Self {
+    fn empty(pad_rdata: bool) -> Self {
         let mut object = object::write::Object::new(
             object::BinaryFormat::Coff,
             object::Architecture::I386,
@@ -176,7 +177,7 @@ impl ObjectFile {
         //
         // This makes different relocations with different data and different names
         // to match, if they offsets match. These 4 bytes prevent that.
-        if engine_path == b"c:\\survarium\\sources\\" {
+        if pad_rdata {
             object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
         }
 
