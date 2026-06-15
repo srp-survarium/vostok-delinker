@@ -14,6 +14,10 @@ pub enum RelocKind<'a> {
     // .text
     Function {
         overloads: &'a [RawString<'static>],
+        // True for a PC-relative branch (call/jmp/jcc rel32 -> IMAGE_REL_I386_REL32),
+        // false for an absolute code reference taken from the .reloc table
+        // (e.g. `push offset fn`, a vftable slot -> IMAGE_REL_I386_DIR32).
+        relative: bool,
     },
 
     // .rdata
@@ -117,6 +121,8 @@ pub fn resolve_absolute_relocations<'s>(
                         reloc_rva,
                         RelocKind::Function {
                             overloads: function_overloads,
+                            // .reloc HIGHLOW entry -> absolute code reference.
+                            relative: false,
                         },
                     );
                 }
