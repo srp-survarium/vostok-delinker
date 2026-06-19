@@ -4,7 +4,7 @@ use crate::relocs::RelocKind;
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
 use crate::utils::{ToU64, ToUsize, contains, leak};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
@@ -45,6 +45,7 @@ impl ObjectFiles<'_> {
         mut relocs_rva: BTreeMap<usize, RelocKind<'s>>,
 
         engine_path: &[u8],
+        pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
     ) -> anyhow::Result<Self>
     where
@@ -102,7 +103,7 @@ impl ObjectFiles<'_> {
                 let object_file = this
                     .objects
                     .entry(filename)
-                    .or_insert_with(|| ObjectFile::empty(engine_path));
+                    .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
 
                 let fun_name = match symbols.functions.get(&fun_rva) {
                     Some(overloads) => matcher.pick(overloads, canonical_name(overloads)),
@@ -118,12 +119,15 @@ impl ObjectFiles<'_> {
                     let reloc_offset_in_fun = reloc_rva - fun_rva;
                     let reloc_offset_in_coff_text = fun_offset_in_coff_text + reloc_offset_in_fun;
 
+                    // Fresh per top-level reloc (each pointer chain is independent).
+                    let mut visited = HashSet::new();
                     object_file.add_relocation_at(
                         reloc_kind,
                         reloc_offset_in_coff_text,
                         matcher,
                         coff_data,
                         &relocs_rva,
+                        &mut visited,
                     )?;
                 }
             }
@@ -158,7 +162,7 @@ impl ObjectFiles<'_> {
 }
 
 impl ObjectFile {
-    fn empty(engine_path: &[u8]) -> Self {
+    fn empty(pad_rdata: bool) -> Self {
         let mut object = object::write::Object::new(
             object::BinaryFormat::Coff,
             object::Architecture::I386,
@@ -176,7 +180,7 @@ impl ObjectFile {
         //
         // This makes different relocations with different data and different names
         // to match, if they offsets match. These 4 bytes prevent that.
-        if engine_path == b"c:\\survarium\\sources\\" {
+        if pad_rdata {
             object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
         }
 
@@ -378,6 +382,8 @@ impl ObjectFile {
         matcher: &SymbolMatcher,
         coff_data: &[u8],
         relocs_rva: &BTreeMap<usize, RelocKind>,
+        // Target RVAs already expanded on this pointer chain (cycle guard).
+        visited: &mut HashSet<usize>,
     ) -> anyhow::Result<()> {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
@@ -412,14 +418,18 @@ impl ObjectFile {
                     reloc_offset,
                 )?;
 
+                // Cycle guard for self-referential RVAs.
                 if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
-                    self.add_relocation_at(
-                        *reloc_kind,
-                        const_offset_in_coff_rdata,
-                        matcher,
-                        coff_data,
-                        relocs_rva,
-                    )?;
+                    if visited.insert(target_rva) {
+                        self.add_relocation_at(
+                            *reloc_kind,
+                            const_offset_in_coff_rdata,
+                            matcher,
+                            coff_data,
+                            relocs_rva,
+                            visited,
+                        )?;
+                    }
                 }
             }
 
@@ -437,14 +447,18 @@ impl ObjectFile {
                     reloc_offset,
                 )?;
 
+                // Same cycle guard as the Constant arm above.
                 if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
-                    self.add_relocation_at(
-                        *reloc_kind,
-                        static_offset_in_coff_data,
-                        matcher,
-                        coff_data,
-                        relocs_rva,
-                    )?;
+                    if visited.insert(target_rva) {
+                        self.add_relocation_at(
+                            *reloc_kind,
+                            static_offset_in_coff_data,
+                            matcher,
+                            coff_data,
+                            relocs_rva,
+                            visited,
+                        )?;
+                    }
                 }
             }
         }

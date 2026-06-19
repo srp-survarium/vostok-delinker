@@ -17,6 +17,7 @@ cargo run --release -- ^
   --exe-path         "%SURVARIUM_BIN%\survarium.exe" ^
   --output-path      "%OBJDIFF_DIR%\target" ^
   --engine-path      "c:\survarium\sources" ^
+  --pad-empty-rdata ^
   --write-symbol-map "%OBJDIFF_DIR%\target-symbol-map.tsv"
 
 py "%VOSTOK_DIR%\scripts\generate_objdiff_config.py"
