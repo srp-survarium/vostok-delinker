@@ -9,7 +9,7 @@ mod utils;
 use crate::object_files::ObjectFiles;
 use crate::pdb_symbols::PdbSymbols;
 use crate::symbol_matcher::SymbolMatcher;
-use crate::utils::{leak, ToUsize};
+use crate::utils::{ToUsize, leak};
 
 use clap::Parser;
 use object::LittleEndian;

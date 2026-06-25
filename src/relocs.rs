@@ -1,6 +1,6 @@
+use crate::Env;
 use crate::pdb_symbols;
 use crate::utils::ToUsize;
-use crate::Env;
 
 use pdb2::RawString;
 

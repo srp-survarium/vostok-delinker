@@ -1,8 +1,8 @@
+use crate::Env;
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::RelocKind;
-use crate::symbol_matcher::{canonical_name, SymbolMatcher};
-use crate::utils::{contains, leak, ToU64, ToUsize};
-use crate::Env;
+use crate::symbol_matcher::{SymbolMatcher, canonical_name};
+use crate::utils::{ToU64, ToUsize, contains, leak};
 
 use std::collections::{BTreeMap, HashMap};
 

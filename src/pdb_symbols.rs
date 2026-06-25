@@ -1,9 +1,9 @@
 use pdb2::{FallibleIterator, RawString};
 
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{BTreeMap, btree_map};
 
-use crate::utils::{leak, ToUsize};
 use crate::Env;
+use crate::utils::{ToUsize, leak};
 
 #[derive(Default)]
 pub struct PdbSymbols {
@@ -219,6 +219,13 @@ impl PdbSymbols {
             .iter()
             .find(|(_, code)| *code == fun_body)
             .map(|(name, _)| (*name).into());
+
+        // Canonicalize `??__E`/`??__F` static-init thunks to the demangled name
+        // the target delink uses, so objdiff pairs the same thunk on both sides.
+        let name = match crate::utils::canonicalize_static_init_thunk(name.as_bytes()) {
+            Some(demangled) => RawString::from(crate::utils::leak(demangled).as_bytes()),
+            None => name,
+        };
 
         match self.functions.entry(symbol_rva) {
             btree_map::Entry::Vacant(entry) => {
