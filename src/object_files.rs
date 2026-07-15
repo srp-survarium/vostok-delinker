@@ -1,3 +1,4 @@
+use crate::data_manifest::{DataDefinition, DataManifest, DataStorage};
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::RelocKind;
 use crate::symbol_matcher::{canonical_name, SymbolMatcher};
@@ -11,6 +12,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 use pdb2::{FallibleIterator, RawString};
 
 use object::SectionKind;
+use object::write::SymbolId;
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -20,7 +22,10 @@ pub struct ObjectFile {
     pub object: object::write::Object<'static>,
     pub data_section_id: object::write::SectionId,
     pub rdata_section_id: object::write::SectionId,
+    pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: object::write::SectionId,
+    pub symbols: HashMap<Vec<u8>, SymbolId>,
+    pub data_offsets: HashMap<usize, ObjectOffset>,
 }
 
 #[derive(Copy, Clone)]
@@ -47,6 +52,7 @@ impl ObjectFiles<'_> {
         engine_path: &[u8],
         pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
+        data_manifest: &DataManifest,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -54,6 +60,34 @@ impl ObjectFiles<'_> {
         let mut this = Self {
             objects: HashMap::new(),
         };
+
+        for definition in data_manifest.definitions() {
+            let definition_end = definition.rva.checked_add(definition.size).unwrap();
+            let section = match definition.storage {
+                DataStorage::Rdata => env.rdata,
+                DataStorage::Data | DataStorage::Bss => env.data,
+            };
+            if definition.rva < section.rva || definition_end > section.rva + section.size {
+                anyhow::bail!("data manifest storage does not match the PE section");
+            }
+            let object_file = this
+                .objects
+                .entry(definition.object)
+                .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
+            object_file.add_data_definition(*definition, coff_data)?;
+        }
+        for definition in data_manifest.definitions() {
+            this.objects
+                .get_mut(definition.object)
+                .unwrap()
+                .add_data_relocations(
+                    *definition,
+                    matcher,
+                    coff_data,
+                    &relocs_rva,
+                    data_manifest,
+                )?;
+        }
 
         let mut modules = env.dbi.modules()?;
         while let Some(module) = modules.next()? {
@@ -128,6 +162,8 @@ impl ObjectFiles<'_> {
                         coff_data,
                         &relocs_rva,
                         &mut visited,
+                        data_manifest,
+                        true,
                     )?;
                 }
             }
@@ -188,7 +224,10 @@ impl ObjectFile {
             object,
             data_section_id,
             rdata_section_id,
+            bss_section_id: None,
             text_section_id,
+            symbols: HashMap::new(),
+            data_offsets: HashMap::new(),
         }
     }
 }
@@ -352,9 +391,20 @@ impl ObjectFile {
         relocs_rva: &BTreeMap<usize, RelocKind>,
         // Target RVAs already expanded on this pointer chain (cycle guard).
         visited: &mut HashSet<usize>,
+        data_manifest: &DataManifest,
+        materialize_target: bool,
     ) -> anyhow::Result<()> {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
+
+        if !materialize_target || data_manifest.contains_name(reloc_name.as_bytes()) {
+            let relative = match reloc_kind {
+                RelocKind::Function { relative, .. } => relative,
+                _ => false,
+            };
+            self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, relative)?;
+            return Ok(());
+        }
 
         match reloc_kind {
             RelocKind::Function { overloads: _, relative } => {
@@ -398,6 +448,8 @@ impl ObjectFile {
                             coff_data,
                             relocs_rva,
                             visited,
+                            data_manifest,
+                            true,
                         )?;
                     }
                 }
@@ -428,12 +480,104 @@ impl ObjectFile {
                             coff_data,
                             relocs_rva,
                             visited,
+                            data_manifest,
+                            true,
                         )?;
                     }
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn add_data_definition(
+        &mut self,
+        definition: DataDefinition,
+        coff_data: &[u8],
+    ) -> anyhow::Result<()> {
+        let definition_end = definition.rva.checked_add(definition.size)
+            .ok_or_else(|| anyhow::anyhow!("reviewed data definition extent overflows"))?;
+        if definition_end > coff_data.len() {
+            anyhow::bail!("reviewed data definition is outside mapped PE image");
+        }
+        let offset = match definition.storage {
+            DataStorage::Data => ObjectOffset {
+                offset: self.object.append_section_data(
+                    self.data_section_id,
+                    &coff_data[definition.rva..definition_end],
+                    definition.alignment,
+                ),
+                section_id: self.data_section_id,
+            },
+            DataStorage::Rdata => ObjectOffset {
+                offset: self.object.append_section_data(
+                    self.rdata_section_id,
+                    &coff_data[definition.rva..definition_end],
+                    definition.alignment,
+                ),
+                section_id: self.rdata_section_id,
+            },
+            DataStorage::Bss => {
+                let section_id = *self.bss_section_id.get_or_insert_with(|| {
+                    self.object.add_section(
+                        vec![], b".bss".into(), SectionKind::UninitializedData)
+                });
+                let offset = self.object.append_section_bss(
+                    section_id,
+                    definition.size.to_u64(),
+                    definition.alignment,
+                );
+                ObjectOffset {
+                    offset,
+                    section_id,
+                }
+            }
+        };
+        let symbol = self.object.add_symbol(object::write::Symbol {
+            name: definition.name.as_bytes().to_vec(),
+            value: offset.offset,
+            size: definition.size.to_u64(),
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(offset.section_id),
+            flags: object::SymbolFlags::None,
+        });
+        if self.symbols.insert(definition.name.as_bytes().to_vec(), symbol).is_some() {
+            anyhow::bail!("duplicate reviewed data definition in owner object");
+        }
+        self.data_offsets.insert(definition.rva, offset);
+        Ok(())
+    }
+
+    fn add_data_relocations(
+        &mut self,
+        definition: DataDefinition,
+        matcher: &SymbolMatcher,
+        coff_data: &[u8],
+        relocs_rva: &BTreeMap<usize, RelocKind>,
+        data_manifest: &DataManifest,
+    ) -> anyhow::Result<()> {
+        let definition_end = definition.rva.checked_add(definition.size).unwrap();
+        let offset = *self.data_offsets.get(&definition.rva).unwrap();
+        let sites = relocs_rva.range(definition.rva..definition_end);
+        if definition.storage == DataStorage::Bss && sites.clone().next().is_some() {
+            anyhow::bail!("reviewed BSS definition contains a PE base relocation");
+        }
+        for (reloc_rva, reloc_kind) in sites {
+            let mut visited = HashSet::new();
+            self.add_relocation_at(
+                *reloc_kind,
+                offset + (*reloc_rva - definition.rva),
+                matcher,
+                coff_data,
+                relocs_rva,
+                &mut visited,
+                data_manifest,
+                false,
+            )?;
+        }
         Ok(())
     }
 }
@@ -477,16 +621,20 @@ impl ObjectFile {
             }
         };
 
-        let symbol = self.object.add_symbol(object::write::Symbol {
-            name: name.as_bytes().to_vec(),
-            value,
-            size: u64::MAX,
-            kind,
-            scope: object::SymbolScope::Linkage,
-            weak: false,
-            section,
-            flags: object::SymbolFlags::None,
-        });
+        let symbol = if let Some(symbol) = self.symbols.get(name.as_bytes()) {
+            *symbol
+        } else {
+            self.object.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value,
+                size: u64::MAX,
+                kind,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section,
+                flags: object::SymbolFlags::None,
+            })
+        };
 
         // A relative branch's operand is the displacement from the END of the
         // 4-byte field, so it carries addend -4; an absolute operand (DIR32)

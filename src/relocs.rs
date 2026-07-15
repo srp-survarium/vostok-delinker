@@ -1,3 +1,4 @@
+use crate::data_manifest::DataManifest;
 use crate::pdb_symbols;
 use crate::utils::ToUsize;
 use crate::Env;
@@ -116,6 +117,7 @@ pub fn resolve_absolute_relocations<'s>(
     env: &Env,
     exe: &'static object::read::pe::PeFile32<'static>,
     symbols: &'s pdb_symbols::PdbSymbols,
+    data_manifest: &DataManifest,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
     let Some(reloc_sec) = exe.section_by_name(".reloc") else {
         anyhow::bail!("Missing .reloc section");
@@ -188,6 +190,17 @@ pub fn resolve_absolute_relocations<'s>(
                     );
                 }
                 () if (env.rdata.rva..env.rdata.rva + env.rdata.size).contains(&target_rva) => {
+                    if let Some((owner, addend)) =
+                        data_manifest.owner_and_addend_for_rva(target_rva)
+                    {
+                        let diff = u32::try_from(addend)?;
+                        coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+                        relocs_rva.insert(reloc_rva, RelocKind::Constant {
+                            symbol: owner.name,
+                            target_rva,
+                        });
+                        continue;
+                    }
                     match symbols.strings.range(..=target_rva).next_back() {
                         Some((string_rva, (string_mangled_name, string)))
                             if target_rva - string_rva < string.len() =>
@@ -236,6 +249,17 @@ pub fn resolve_absolute_relocations<'s>(
                     };
                 }
                 () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
+                    if let Some((owner, addend)) =
+                        data_manifest.owner_and_addend_for_rva(target_rva)
+                    {
+                        let diff = u32::try_from(addend)?;
+                        coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+                        relocs_rva.insert(reloc_rva, RelocKind::Static {
+                            symbol: owner.name,
+                            target_rva,
+                        });
+                        continue;
+                    }
                     let Some((static_rva, static_name)) =
                         closest_data_symbol(&symbols.statics, target_rva)
                     else {
