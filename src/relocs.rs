@@ -1,4 +1,5 @@
 use crate::data_manifest::DataManifest;
+use crate::contribution_manifest::{ContributionManifest, ContributionStorage};
 use crate::pdb_symbols;
 use crate::utils::ToUsize;
 use crate::Env;
@@ -82,6 +83,8 @@ fn resolve_data_alias(
     alias_rva: usize,
     target_rva: usize,
     alias: RawString<'static>,
+    storage: ContributionStorage,
+    contributions: &ContributionManifest,
 ) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
     let Some((addend, owner)) = decode_data_alias(alias)? else {
         return Ok(None);
@@ -92,6 +95,9 @@ fn resolve_data_alias(
     let Some((owner_rva, _)) = symbols.iter().find(|(_, name)| **name == owner) else {
         anyhow::bail!("canonical data alias owner is absent: {owner}");
     };
+    if !contributions.same_owner(storage, *owner_rva, target_rva) {
+        anyhow::bail!("canonical data alias crosses compiland contributions");
+    }
     if (*owner_rva as u32).wrapping_add(addend) != target_rva as u32 {
         anyhow::bail!("canonical data alias owner/addend does not resolve to target");
     }
@@ -101,9 +107,12 @@ fn resolve_data_alias(
 fn closest_data_symbol<'a>(
     symbols: &'a BTreeMap<usize, RawString<'static>>,
     target_rva: usize,
+    storage: ContributionStorage,
+    contributions: &ContributionManifest,
 ) -> Option<(&'a usize, &'a RawString<'static>)> {
     symbols.range(..=target_rva).rev().find(|(rva, name)| {
-        **rva == target_rva || !name.as_bytes().starts_with(DATA_ALIAS_PREFIX)
+        (**rva == target_rva || !name.as_bytes().starts_with(DATA_ALIAS_PREFIX))
+            && contributions.same_owner(storage, **rva, target_rva)
     })
 }
 
@@ -118,6 +127,7 @@ pub fn resolve_absolute_relocations<'s>(
     exe: &'static object::read::pe::PeFile32<'static>,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    contributions: &ContributionManifest,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
     let Some(reloc_sec) = exe.section_by_name(".reloc") else {
         anyhow::bail!("Missing .reloc section");
@@ -201,7 +211,13 @@ pub fn resolve_absolute_relocations<'s>(
                         });
                         continue;
                     }
-                    match symbols.strings.range(..=target_rva).next_back() {
+                    match symbols.strings.range(..=target_rva).rev().find(|(string_rva, _)| {
+                        contributions.same_owner(
+                            ContributionStorage::Rdata,
+                            **string_rva,
+                            target_rva,
+                        )
+                    }) {
                         Some((string_rva, (string_mangled_name, string)))
                             if target_rva - string_rva < string.len() =>
                         {
@@ -219,9 +235,16 @@ pub fn resolve_absolute_relocations<'s>(
 
                         Some(_) | None => {
                             let Some((constant_rva, constant_name)) =
-                                closest_data_symbol(&symbols.constants, target_rva)
+                                closest_data_symbol(
+                                    &symbols.constants,
+                                    target_rva,
+                                    ContributionStorage::Rdata,
+                                    contributions,
+                                )
                             else {
-                                unreachable!("All constants must be named");
+                                anyhow::bail!(
+                                    "no .rdata symbol in contribution owning RVA {target_rva:#x}"
+                                );
                             };
 
                             let (diff, reloc_name) = match resolve_data_alias(
@@ -229,6 +252,8 @@ pub fn resolve_absolute_relocations<'s>(
                                 *constant_rva,
                                 target_rva,
                                 *constant_name,
+                                ContributionStorage::Rdata,
+                                contributions,
                             )? {
                                 Some((addend, owner)) => (addend, owner),
                                 None => (
@@ -260,8 +285,22 @@ pub fn resolve_absolute_relocations<'s>(
                         });
                         continue;
                     }
+                    let storage = contributions
+                        .storage_for_rva(target_rva)
+                        .filter(|storage| {
+                            matches!(
+                                storage,
+                                ContributionStorage::Data | ContributionStorage::Bss
+                            )
+                        })
+                        .unwrap_or(ContributionStorage::Data);
                     let Some((static_rva, static_name)) =
-                        closest_data_symbol(&symbols.statics, target_rva)
+                        closest_data_symbol(
+                            &symbols.statics,
+                            target_rva,
+                            storage,
+                            contributions,
+                        )
                     else {
                         let _reloc_va = reloc_rva + env.image_base.to_usize();
                         // @TODO: There is a "single" unnamed static relocation in base, which is a
@@ -274,6 +313,8 @@ pub fn resolve_absolute_relocations<'s>(
                         *static_rva,
                         target_rva,
                         *static_name,
+                        storage,
+                        contributions,
                     )? {
                         Some((addend, owner)) => (addend, owner),
                         None => (
@@ -337,9 +378,18 @@ mod tests {
         let mut symbols = BTreeMap::new();
         symbols.insert(0x128d20, owner);
         symbols.insert(0x128d50, alias);
+        let contributions = ContributionManifest::default();
 
         assert_eq!(
-            resolve_data_alias(&symbols, 0x128d50, 0x128d50, alias).unwrap(),
+            resolve_data_alias(
+                &symbols,
+                0x128d50,
+                0x128d50,
+                alias,
+                ContributionStorage::Data,
+                &contributions,
+            )
+            .unwrap(),
             Some((0x30, owner))
         );
     }
@@ -354,8 +404,19 @@ mod tests {
         let mut symbols = BTreeMap::new();
         symbols.insert(0x128d20, owner);
         symbols.insert(0x128d50, alias);
+        let contributions = ContributionManifest::default();
 
-        assert!(resolve_data_alias(&symbols, 0x128d50, 0x128d50, alias).is_err());
+        assert!(
+            resolve_data_alias(
+                &symbols,
+                0x128d50,
+                0x128d50,
+                alias,
+                ContributionStorage::Data,
+                &contributions,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -366,7 +427,18 @@ mod tests {
                 .into();
         let mut symbols = BTreeMap::new();
         symbols.insert(0x128d50, alias);
+        let contributions = ContributionManifest::default();
 
-        assert!(resolve_data_alias(&symbols, 0x128d50, 0x128d50, alias).is_err());
+        assert!(
+            resolve_data_alias(
+                &symbols,
+                0x128d50,
+                0x128d50,
+                alias,
+                ContributionStorage::Data,
+                &contributions,
+            )
+            .is_err()
+        );
     }
 }

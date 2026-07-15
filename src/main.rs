@@ -1,5 +1,6 @@
 #![feature(os_string_truncate)]
 
+mod contribution_manifest;
 mod data_manifest;
 mod object_files;
 mod pdb_symbols;
@@ -50,6 +51,10 @@ pub struct Cli {
     /// Reviewed public-data definitions to emit into their owning target objects.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_manifest: Option<std::path::PathBuf>,
+
+    /// Per-compiland PE contribution intervals used to disambiguate data owners.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub contribution_manifest: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -79,6 +84,7 @@ fn main() -> anyhow::Result<()> {
         write_symbol_map,
         read_symbol_map,
         data_manifest,
+        contribution_manifest,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -103,6 +109,7 @@ fn main() -> anyhow::Result<()> {
         write_symbol_map.as_deref(),
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
+        contribution_manifest.as_deref(),
     )?;
 
     Ok(())
@@ -117,14 +124,23 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     write_symbol_map: Option<&std::path::Path>,
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
+    contribution_manifest_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path)?;
+    let contribution_manifest =
+        contribution_manifest::ContributionManifest::load(contribution_manifest_path)?;
 
     let (coff_data, relocs_rva) =
-        relocs::resolve_absolute_relocations(&env, exe, &pdb_symbols, &data_manifest)?;
+        relocs::resolve_absolute_relocations(
+            &env,
+            exe,
+            &pdb_symbols,
+            &data_manifest,
+            &contribution_manifest,
+        )?;
 
     // Base side reconciles its folded names against the target's recorded
     // choices; the target side (and a plain run) just emits local defaults.
