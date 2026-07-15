@@ -1,5 +1,6 @@
 #![feature(os_string_truncate)]
 
+mod data_manifest;
 mod object_files;
 mod pdb_symbols;
 mod relocs;
@@ -9,7 +10,7 @@ mod utils;
 use crate::object_files::ObjectFiles;
 use crate::pdb_symbols::PdbSymbols;
 use crate::symbol_matcher::SymbolMatcher;
-use crate::utils::{leak, ToUsize};
+use crate::utils::{ToUsize, leak};
 
 use clap::Parser;
 use object::LittleEndian;
@@ -45,6 +46,17 @@ pub struct Cli {
     /// recorded here. Missing file is tolerated (no reconciliation).
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub read_symbol_map: Option<std::path::PathBuf>,
+
+    /// Project-supplied TSV of data owner objects, RVAs, sizes, storage, and
+    /// alignment. Symbol identities come from the PDB. See README.md, "Data
+    /// manifest".
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub data_manifest: Option<std::path::PathBuf>,
+
+    /// Require every PE base relocation targeting `.data` or `.rdata` to
+    /// resolve to a definition in `--data-manifest`.
+    #[arg(long, requires = "data_manifest")]
+    pub strict: bool,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -73,6 +85,8 @@ fn main() -> anyhow::Result<()> {
         pad_empty_rdata,
         write_symbol_map,
         read_symbol_map,
+        data_manifest,
+        strict,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -87,6 +101,11 @@ fn main() -> anyhow::Result<()> {
     if !engine_path.ends_with('\\') {
         engine_path.push('\\');
     }
+    let manifest_coverage = if strict {
+        relocs::ManifestCoverage::RequireComplete
+    } else {
+        relocs::ManifestCoverage::AllowPartial
+    };
 
     process_executable(
         exe,
@@ -96,6 +115,8 @@ fn main() -> anyhow::Result<()> {
         output_path.as_path(),
         write_symbol_map.as_deref(),
         read_symbol_map.as_deref(),
+        data_manifest.as_deref(),
+        manifest_coverage,
     )?;
 
     Ok(())
@@ -109,12 +130,20 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     output_path: &std::path::Path,
     write_symbol_map: Option<&std::path::Path>,
     read_symbol_map: Option<&std::path::Path>,
+    data_manifest_path: Option<&std::path::Path>,
+    manifest_coverage: relocs::ManifestCoverage,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
-
-    let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(&env, exe, &pdb_symbols)?;
+    let data_manifest = data_manifest::DataManifest::load(data_manifest_path, &pdb_symbols)?;
+    let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
+        &env,
+        exe,
+        &pdb_symbols,
+        &data_manifest,
+        manifest_coverage,
+    )?;
 
     // Base side reconciles its folded names against the target's recorded
     // choices; the target side (and a plain run) just emits local defaults.
@@ -139,6 +168,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         engine_path,
         pad_empty_rdata,
         &matcher,
+        &data_manifest,
     )?;
     object_files.write(output_path)?;
 

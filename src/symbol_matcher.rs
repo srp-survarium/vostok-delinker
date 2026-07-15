@@ -113,7 +113,10 @@ impl SymbolMatcher {
 
         // Target recorded the same choice for every member of the group, so the
         // first member we share with target tells us what target picked.
-        let Some(chosen) = overloads.iter().find_map(|o| target_choice.get(o.as_bytes())) else {
+        let Some(chosen) = overloads
+            .iter()
+            .find_map(|o| target_choice.get(o.as_bytes()))
+        else {
             return default;
         };
 

@@ -1,8 +1,9 @@
-use crate::pdb_symbols::PdbSymbols;
-use crate::relocs::RelocKind;
-use crate::symbol_matcher::{canonical_name, SymbolMatcher};
-use crate::utils::{contains, leak, ToU64, ToUsize};
 use crate::Env;
+use crate::data_manifest::{DataDefinition, DataManifest, DataStorage};
+use crate::pdb_symbols::PdbSymbols;
+use crate::relocs::{RelocKind, RelocationEncoding};
+use crate::symbol_matcher::{SymbolMatcher, canonical_name};
+use crate::utils::{ToU64, ToUsize, contains, leak};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -20,6 +21,7 @@ pub struct ObjectFile {
     pub object: object::write::Object<'static>,
     pub data_section_id: object::write::SectionId,
     pub rdata_section_id: object::write::SectionId,
+    pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: object::write::SectionId,
 }
 
@@ -35,6 +37,18 @@ pub enum ObjectLocation {
     Extern,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum TargetMaterialization {
+    Materialize,
+    ReferenceOnly,
+}
+
+#[derive(Copy, Clone)]
+enum SymbolReuse {
+    AlwaysCreate,
+    ReuseIfDefined,
+}
+
 impl ObjectFiles<'_> {
     pub fn parse<'s, S>(
         env: &Env,
@@ -47,6 +61,7 @@ impl ObjectFiles<'_> {
         engine_path: &[u8],
         pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
+        data_manifest: &DataManifest,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -54,6 +69,34 @@ impl ObjectFiles<'_> {
         let mut this = Self {
             objects: HashMap::new(),
         };
+
+        for definition in data_manifest.definitions() {
+            let definition_end = definition.rva.checked_add(definition.size).unwrap();
+            let section = match definition.storage {
+                DataStorage::Rdata => env.rdata,
+                DataStorage::Data | DataStorage::Bss => env.data,
+            };
+            if definition.rva < section.rva || definition_end > section.rva + section.size {
+                anyhow::bail!("data manifest storage does not match the PE section");
+            }
+            let object_file = this
+                .objects
+                .entry(definition.object)
+                .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
+            object_file.add_data_definition(*definition, coff_data)?;
+        }
+        for definition in data_manifest.definitions() {
+            this.objects
+                .get_mut(definition.object)
+                .unwrap()
+                .add_data_relocations(
+                    *definition,
+                    matcher,
+                    coff_data,
+                    &relocs_rva,
+                    data_manifest,
+                )?;
+        }
 
         let mut modules = env.dbi.modules()?;
         while let Some(module) = modules.next()? {
@@ -128,6 +171,8 @@ impl ObjectFiles<'_> {
                         coff_data,
                         &relocs_rva,
                         &mut visited,
+                        data_manifest,
+                        TargetMaterialization::Materialize,
                     )?;
                 }
             }
@@ -188,6 +233,7 @@ impl ObjectFile {
             object,
             data_section_id,
             rdata_section_id,
+            bss_section_id: None,
             text_section_id,
         }
     }
@@ -322,7 +368,10 @@ fn resolve_relative_relocations<'s>(
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(
             fun_rva + offset_in_fun - 4,
-            RelocKind::Function { overloads, relative: true },
+            RelocKind::Function {
+                overloads,
+                encoding: RelocationEncoding::Relative,
+            },
         );
 
         if let Some(old_reloc) = old_reloc {
@@ -351,13 +400,54 @@ impl ObjectFile {
         relocs_rva: &BTreeMap<usize, RelocKind>,
         // Target RVAs already expanded on this pointer chain (cycle guard).
         visited: &mut HashSet<usize>,
+        data_manifest: &DataManifest,
+        target_materialization: TargetMaterialization,
     ) -> anyhow::Result<()> {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
 
+        let target_is_manifest_definition = match reloc_kind {
+            RelocKind::Constant { target_rva, .. } | RelocKind::Static { target_rva, .. } => {
+                data_manifest.owner_and_addend_for_rva(target_rva).is_some()
+            }
+            RelocKind::Function { .. } | RelocKind::ConstantString { .. } => false,
+        };
+        if target_materialization == TargetMaterialization::ReferenceOnly
+            || target_is_manifest_definition
+        {
+            let encoding = match reloc_kind {
+                RelocKind::Function { encoding, .. } => encoding,
+                RelocKind::ConstantString { .. }
+                | RelocKind::Constant { .. }
+                | RelocKind::Static { .. } => RelocationEncoding::Absolute,
+            };
+            let symbol_reuse = if target_is_manifest_definition {
+                SymbolReuse::ReuseIfDefined
+            } else {
+                SymbolReuse::AlwaysCreate
+            };
+            self.add_relocation(
+                reloc_name,
+                ObjectLocation::Extern,
+                reloc_offset,
+                encoding,
+                symbol_reuse,
+            )?;
+            return Ok(());
+        }
+
         match reloc_kind {
-            RelocKind::Function { overloads: _, relative } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, relative)?;
+            RelocKind::Function {
+                overloads: _,
+                encoding,
+            } => {
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern,
+                    reloc_offset,
+                    encoding,
+                    SymbolReuse::AlwaysCreate,
+                )?;
             }
 
             RelocKind::ConstantString { symbol: _, data } => {
@@ -368,7 +458,8 @@ impl ObjectFile {
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
-                    false,
+                    RelocationEncoding::Absolute,
+                    SymbolReuse::AlwaysCreate,
                 )?;
             }
 
@@ -384,7 +475,8 @@ impl ObjectFile {
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
-                    false,
+                    RelocationEncoding::Absolute,
+                    SymbolReuse::AlwaysCreate,
                 )?;
 
                 // Cycle guard for self-referential RVAs.
@@ -397,6 +489,8 @@ impl ObjectFile {
                             coff_data,
                             relocs_rva,
                             visited,
+                            data_manifest,
+                            TargetMaterialization::Materialize,
                         )?;
                     }
                 }
@@ -414,7 +508,8 @@ impl ObjectFile {
                     reloc_name,
                     ObjectLocation::Offset(static_offset_in_coff_data),
                     reloc_offset,
-                    false,
+                    RelocationEncoding::Absolute,
+                    SymbolReuse::AlwaysCreate,
                 )?;
 
                 // Same cycle guard as the Constant arm above.
@@ -427,12 +522,117 @@ impl ObjectFile {
                             coff_data,
                             relocs_rva,
                             visited,
+                            data_manifest,
+                            TargetMaterialization::Materialize,
                         )?;
                     }
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn add_data_definition(
+        &mut self,
+        definition: DataDefinition,
+        coff_data: &[u8],
+    ) -> anyhow::Result<()> {
+        let definition_end = definition
+            .rva
+            .checked_add(definition.size)
+            .ok_or_else(|| anyhow::anyhow!("reviewed data definition extent overflows"))?;
+        if definition_end > coff_data.len() {
+            anyhow::bail!("reviewed data definition is outside mapped PE image");
+        }
+        let offset = match definition.storage {
+            DataStorage::Data => ObjectOffset {
+                offset: self.object.append_section_data(
+                    self.data_section_id,
+                    &coff_data[definition.rva..definition_end],
+                    definition.alignment,
+                ),
+                section_id: self.data_section_id,
+            },
+            DataStorage::Rdata => ObjectOffset {
+                offset: self.object.append_section_data(
+                    self.rdata_section_id,
+                    &coff_data[definition.rva..definition_end],
+                    definition.alignment,
+                ),
+                section_id: self.rdata_section_id,
+            },
+            DataStorage::Bss => {
+                let section_id = *self.bss_section_id.get_or_insert_with(|| {
+                    self.object
+                        .add_section(vec![], b".bss".into(), SectionKind::UninitializedData)
+                });
+                let offset = self.object.append_section_bss(
+                    section_id,
+                    definition.size.to_u64(),
+                    definition.alignment,
+                );
+                ObjectOffset { offset, section_id }
+            }
+        };
+        if self
+            .object
+            .symbol_id(definition.symbol_name.as_bytes())
+            .is_some()
+        {
+            anyhow::bail!("duplicate PDB data symbol in owner object");
+        }
+        self.object.add_symbol(object::write::Symbol {
+            name: definition.symbol_name.as_bytes().to_vec(),
+            value: offset.offset,
+            size: definition.size.to_u64(),
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(offset.section_id),
+            flags: object::SymbolFlags::None,
+        });
+        Ok(())
+    }
+
+    fn add_data_relocations(
+        &mut self,
+        definition: DataDefinition,
+        matcher: &SymbolMatcher,
+        coff_data: &[u8],
+        relocs_rva: &BTreeMap<usize, RelocKind>,
+        data_manifest: &DataManifest,
+    ) -> anyhow::Result<()> {
+        let definition_end = definition.rva.checked_add(definition.size).unwrap();
+        let symbol_id = self
+            .object
+            .symbol_id(definition.symbol_name.as_bytes())
+            .ok_or_else(|| anyhow::anyhow!("missing emitted PDB data symbol"))?;
+        let symbol = self.object.symbol(symbol_id);
+        let object::write::SymbolSection::Section(section_id) = symbol.section else {
+            anyhow::bail!("emitted PDB data symbol has no output section");
+        };
+        let offset = ObjectOffset {
+            offset: symbol.value,
+            section_id,
+        };
+        let sites = relocs_rva.range(definition.rva..definition_end);
+        if definition.storage == DataStorage::Bss && sites.clone().next().is_some() {
+            anyhow::bail!("reviewed BSS definition contains a PE base relocation");
+        }
+        for (reloc_rva, reloc_kind) in sites {
+            let mut visited = HashSet::new();
+            self.add_relocation_at(
+                *reloc_kind,
+                offset + (*reloc_rva - definition.rva),
+                matcher,
+                coff_data,
+                relocs_rva,
+                &mut visited,
+                data_manifest,
+                TargetMaterialization::ReferenceOnly,
+            )?;
+        }
         Ok(())
     }
 }
@@ -453,7 +653,8 @@ impl ObjectFile {
         name: RawString,
         location: ObjectLocation,
         offset: ObjectOffset,
-        relative: bool,
+        encoding: RelocationEncoding,
+        symbol_reuse: SymbolReuse,
     ) -> anyhow::Result<()> {
         let (value, kind, section) = match location {
             ObjectLocation::Extern => (
@@ -475,21 +676,36 @@ impl ObjectFile {
             }
         };
 
-        let symbol = self.object.add_symbol(object::write::Symbol {
-            name: name.as_bytes().to_vec(),
-            value,
-            size: u64::MAX,
-            kind,
-            scope: object::SymbolScope::Linkage,
-            weak: false,
-            section,
-            flags: object::SymbolFlags::None,
-        });
+        let symbol = match symbol_reuse {
+            SymbolReuse::ReuseIfDefined => {
+                self.object.symbol_id(name.as_bytes()).unwrap_or_else(|| {
+                    self.object.add_symbol(object::write::Symbol {
+                        name: name.as_bytes().to_vec(),
+                        value,
+                        size: u64::MAX,
+                        kind,
+                        scope: object::SymbolScope::Linkage,
+                        weak: false,
+                        section,
+                        flags: object::SymbolFlags::None,
+                    })
+                })
+            }
+            SymbolReuse::AlwaysCreate => self.object.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value,
+                size: u64::MAX,
+                kind,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section,
+                flags: object::SymbolFlags::None,
+            }),
+        };
 
-        let (kind, addend) = if relative {
-            (object::RelocationKind::Relative, -4)
-        } else {
-            (object::RelocationKind::Absolute, 0)
+        let (kind, addend) = match encoding {
+            RelocationEncoding::Relative => (object::RelocationKind::Relative, -4),
+            RelocationEncoding::Absolute => (object::RelocationKind::Absolute, 0),
         };
 
         self.object.add_relocation(
