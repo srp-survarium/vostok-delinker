@@ -1,9 +1,9 @@
 use pdb2::{FallibleIterator, RawString};
 
-use std::collections::{btree_map, BTreeMap};
+use std::collections::{BTreeMap, btree_map};
 
-use crate::utils::{leak, ToUsize};
 use crate::Env;
+use crate::utils::{ToUsize, leak};
 
 #[derive(Default)]
 pub struct PdbSymbols {
