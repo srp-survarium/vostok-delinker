@@ -129,6 +129,7 @@ pub fn resolve_absolute_relocations<'s>(
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
     contributions: &ContributionManifest,
+    unresolved: &ContributionManifest,
     recover_data_relocs_from_pdb: bool,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
     let Some(reloc_sec) = exe.section_by_name(".reloc") else {
@@ -226,6 +227,14 @@ pub fn resolve_absolute_relocations<'s>(
                                 );
                             }
                         }
+                        if unresolved
+                            .owner_for_rva(ContributionStorage::Rdata, target_rva)
+                            .is_none()
+                        {
+                            anyhow::bail!(
+                                "uncovered .rdata RVA {target_rva:#x} is absent from the explicit unresolved-data manifest"
+                            );
+                        }
                     }
                     match symbols
                         .strings
@@ -315,6 +324,7 @@ pub fn resolve_absolute_relocations<'s>(
                     }
                     let storage = contributions
                         .storage_for_rva(target_rva)
+                        .or_else(|| unresolved.storage_for_rva(target_rva))
                         .filter(|storage| {
                             matches!(
                                 storage,
@@ -334,6 +344,11 @@ pub fn resolve_absolute_relocations<'s>(
                                     "closed candidate writable contribution has no allocation owning RVA {target_rva:#x}"
                                 );
                             }
+                        }
+                        if unresolved.owner_for_rva(storage, target_rva).is_none() {
+                            anyhow::bail!(
+                                "uncovered writable RVA {target_rva:#x} is absent from the explicit unresolved-data manifest"
+                            );
                         }
                     }
                     let Some((static_rva, static_name)) =
