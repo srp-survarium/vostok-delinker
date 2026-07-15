@@ -1,9 +1,10 @@
-use crate::data_manifest::{DataDefinition, DataManifest, DataStorage};
+use crate::Env;
+use crate::contribution_manifest::ContributionStorage;
+use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::RelocKind;
-use crate::symbol_matcher::{canonical_name, SymbolMatcher};
-use crate::utils::{contains, leak, ToU64, ToUsize};
-use crate::Env;
+use crate::symbol_matcher::{SymbolMatcher, canonical_name};
+use crate::utils::{ToU64, ToUsize, contains, leak};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -362,7 +363,10 @@ fn resolve_relative_relocations<'s>(
         let old_reloc = relocs_rva.insert(
             fun_rva + offset_in_fun - 4,
             // A decoded call/jmp/jcc target -> PC-relative branch.
-            RelocKind::Function { overloads, relative: true },
+            RelocKind::Function {
+                overloads,
+                relative: true,
+            },
         );
 
         if let Some(old_reloc) = old_reloc {
@@ -407,7 +411,10 @@ impl ObjectFile {
         }
 
         match reloc_kind {
-            RelocKind::Function { overloads: _, relative } => {
+            RelocKind::Function {
+                overloads: _,
+                relative,
+            } => {
                 self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, relative)?;
             }
 
@@ -458,11 +465,26 @@ impl ObjectFile {
             RelocKind::Static {
                 symbol: _,
                 target_rva,
+                storage,
             } => {
-                let new_data =
-                    bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
-                let static_offset_in_coff_data =
-                    self.append_section_data(self.data_section_id, &new_data, 0x00);
+                let static_offset_in_coff_data = if storage == ContributionStorage::Bss {
+                    let section_id = *self.bss_section_id.get_or_insert_with(|| {
+                        self.object.add_section(
+                            vec![],
+                            b".bss".into(),
+                            SectionKind::UninitializedData,
+                        )
+                    });
+                    ObjectOffset {
+                        offset: self.object.append_section_bss(section_id, 4, 1),
+                        section_id,
+                    }
+                } else {
+                    let new_data = bytemuck::pod_read_unaligned::<[u8; 4]>(
+                        &coff_data[target_rva..target_rva + 4],
+                    );
+                    self.append_section_data(self.data_section_id, &new_data, 0x00)
+                };
                 self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(static_offset_in_coff_data),
@@ -471,18 +493,20 @@ impl ObjectFile {
                 )?;
 
                 // Same cycle guard as the Constant arm above.
-                if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
-                    if visited.insert(target_rva) {
-                        self.add_relocation_at(
-                            *reloc_kind,
-                            static_offset_in_coff_data,
-                            matcher,
-                            coff_data,
-                            relocs_rva,
-                            visited,
-                            data_manifest,
-                            true,
-                        )?;
+                if storage != ContributionStorage::Bss {
+                    if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
+                        if visited.insert(target_rva) {
+                            self.add_relocation_at(
+                                *reloc_kind,
+                                static_offset_in_coff_data,
+                                matcher,
+                                coff_data,
+                                relocs_rva,
+                                visited,
+                                data_manifest,
+                                true,
+                            )?;
+                        }
                     }
                 }
             }
@@ -496,7 +520,9 @@ impl ObjectFile {
         definition: DataDefinition,
         coff_data: &[u8],
     ) -> anyhow::Result<()> {
-        let definition_end = definition.rva.checked_add(definition.size)
+        let definition_end = definition
+            .rva
+            .checked_add(definition.size)
             .ok_or_else(|| anyhow::anyhow!("reviewed data definition extent overflows"))?;
         if definition_end > coff_data.len() {
             anyhow::bail!("reviewed data definition is outside mapped PE image");
@@ -520,31 +546,44 @@ impl ObjectFile {
             },
             DataStorage::Bss => {
                 let section_id = *self.bss_section_id.get_or_insert_with(|| {
-                    self.object.add_section(
-                        vec![], b".bss".into(), SectionKind::UninitializedData)
+                    self.object
+                        .add_section(vec![], b".bss".into(), SectionKind::UninitializedData)
                 });
                 let offset = self.object.append_section_bss(
                     section_id,
                     definition.size.to_u64(),
                     definition.alignment,
                 );
-                ObjectOffset {
-                    offset,
-                    section_id,
-                }
+                ObjectOffset { offset, section_id }
             }
         };
+        if let Some(expected) = definition.section_offset {
+            if offset.offset.to_usize() != expected {
+                anyhow::bail!(
+                    "candidate data topology mismatch for {}: expected section offset {expected:#x}, emitted {:#x}",
+                    definition.name,
+                    offset.offset,
+                );
+            }
+        }
         let symbol = self.object.add_symbol(object::write::Symbol {
             name: definition.name.as_bytes().to_vec(),
             value: offset.offset,
             size: definition.size.to_u64(),
             kind: object::SymbolKind::Data,
-            scope: object::SymbolScope::Linkage,
+            scope: match definition.scope {
+                DataScope::External => object::SymbolScope::Linkage,
+                DataScope::Local => object::SymbolScope::Compilation,
+            },
             weak: false,
             section: object::write::SymbolSection::Section(offset.section_id),
             flags: object::SymbolFlags::None,
         });
-        if self.symbols.insert(definition.name.as_bytes().to_vec(), symbol).is_some() {
+        if self
+            .symbols
+            .insert(definition.name.as_bytes().to_vec(), symbol)
+            .is_some()
+        {
             anyhow::bail!("duplicate reviewed data definition in owner object");
         }
         self.data_offsets.insert(definition.rva, offset);
@@ -706,7 +745,23 @@ impl<'a> RelocKind<'a> {
             Self::Static {
                 symbol: reloc_name,
                 target_rva: _,
+                storage: _,
             } => Name::Borrowed(reloc_name),
+        }
+    }
+
+    #[cfg(test)] fn recovered_data_storage(self) -> Option<DataStorage> {
+        match self {
+            Self::ConstantString { .. } | Self::Constant { .. } => Some(DataStorage::Rdata),
+            Self::Static {
+                storage: ContributionStorage::Data,
+                ..
+            } => Some(DataStorage::Data),
+            Self::Static {
+                storage: ContributionStorage::Bss,
+                ..
+            } => Some(DataStorage::Bss),
+            _ => None,
         }
     }
 }
@@ -728,6 +783,30 @@ impl std::ops::Add<usize> for ObjectOffset {
             offset: self.offset + rhs.to_u64(),
             section_id: self.section_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permissive_pdb_recovery_preserves_all_data_storage_classes() {
+        let symbol: RawString<'static> = b"fixture".as_slice().into();
+        let rdata = RelocKind::Constant { symbol, target_rva: 0x100 };
+        let data = RelocKind::Static {
+            symbol,
+            target_rva: 0x200,
+            storage: ContributionStorage::Data,
+        };
+        let bss = RelocKind::Static {
+            symbol,
+            target_rva: 0x300,
+            storage: ContributionStorage::Bss,
+        };
+        assert_eq!(rdata.recovered_data_storage(), Some(DataStorage::Rdata));
+        assert_eq!(data.recovered_data_storage(), Some(DataStorage::Data));
+        assert_eq!(bss.recovered_data_storage(), Some(DataStorage::Bss));
     }
 }
 

@@ -3,13 +3,20 @@ use pdb2::RawString;
 use std::collections::HashSet;
 use std::path::Path;
 
-const HEADER: &[u8] = b"name\tobject\trva\tsize\tstorage\talignment\tprovenance";
+const HEADER: &[u8] =
+    b"name\tobject\trva\tsize\tstorage\talignment\tsection_offset\tscope\tprovenance";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DataStorage {
     Data,
     Rdata,
     Bss,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataScope {
+    External,
+    Local,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20,12 +27,15 @@ pub struct DataDefinition {
     pub size: usize,
     pub storage: DataStorage,
     pub alignment: u64,
+    pub section_offset: Option<usize>,
+    pub scope: DataScope,
 }
 
 #[derive(Default)]
 pub struct DataManifest {
     definitions: Vec<DataDefinition>,
     names: HashSet<&'static [u8]>,
+    closed_groups: HashSet<(&'static [u8], DataStorage)>,
 }
 
 impl DataManifest {
@@ -68,17 +78,18 @@ impl DataManifest {
             }
 
             let columns = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-            if columns.len() != 7 {
+            if columns.len() != 9 {
                 anyhow::bail!(
-                    "{}:{}: expected exactly seven tab-separated columns",
+                    "{}:{}: expected exactly nine tab-separated columns",
                     path.display(),
                     line_number
                 );
             }
             validate_text(path, line_number, "name", columns[0])?;
             validate_text(path, line_number, "object", columns[1])?;
-            validate_text(path, line_number, "provenance", columns[6])?;
-            if columns[0].is_empty() || columns[1].is_empty() || columns[6].is_empty() {
+            validate_text(path, line_number, "scope", columns[7])?;
+            validate_text(path, line_number, "provenance", columns[8])?;
+            if columns[0].is_empty() || columns[1].is_empty() || columns[8].is_empty() {
                 anyhow::bail!(
                     "{}:{}: name, object, and provenance must be non-empty",
                     path.display(),
@@ -135,6 +146,21 @@ impl DataManifest {
                     line_number
                 );
             }
+            let section_offset = if columns[6] == b"-" {
+                None
+            } else {
+                Some(parse_number(columns[6])?)
+            };
+            let scope = match columns[7] {
+                b"external" => DataScope::External,
+                b"local" => DataScope::Local,
+                value => anyhow::bail!(
+                    "{}:{}: unsupported scope {}",
+                    path.display(),
+                    line_number,
+                    String::from_utf8_lossy(value)
+                ),
+            };
             if !names.insert(name) {
                 anyhow::bail!("{}:{}: duplicate data name", path.display(), line_number);
             }
@@ -150,13 +176,22 @@ impl DataManifest {
                 size,
                 storage,
                 alignment,
+                section_offset,
+                scope,
             });
         }
         if !saw_header {
             anyhow::bail!("{}: missing data manifest header", path.display());
         }
 
-        definitions.sort_by_key(|definition| (definition.object, definition.rva));
+        definitions.sort_by_key(|definition| {
+            (
+                definition.object,
+                definition.storage,
+                definition.section_offset.unwrap_or(definition.rva),
+                definition.rva,
+            )
+        });
         let mut by_rva = definitions.clone();
         by_rva.sort_by_key(|definition| definition.rva);
         for pair in by_rva.windows(2) {
@@ -164,7 +199,19 @@ impl DataManifest {
                 anyhow::bail!("overlapping data manifest definitions");
             }
         }
-        Ok(Self { definitions, names })
+        let closed_groups = definitions
+            .iter()
+            .filter_map(|definition| {
+                definition
+                    .section_offset
+                    .map(|_| (definition.object, definition.storage))
+            })
+            .collect();
+        Ok(Self {
+            definitions,
+            names,
+            closed_groups,
+        })
     }
 
     pub fn definitions(&self) -> &[DataDefinition] {
@@ -183,6 +230,10 @@ impl DataManifest {
                 None
             }
         })
+    }
+
+    pub fn is_closed(&self, object: &[u8], storage: DataStorage) -> bool {
+        self.closed_groups.contains(&(object, storage))
     }
 }
 
@@ -214,7 +265,8 @@ fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
 
-    const HEADER_TEXT: &str = "name\tobject\trva\tsize\tstorage\talignment\tprovenance\n";
+    const HEADER_TEXT: &str =
+        "name\tobject\trva\tsize\tstorage\talignment\tsection_offset\tscope\tprovenance\n";
 
     fn parse(body: &str) -> anyhow::Result<DataManifest> {
         DataManifest::parse(body.as_bytes(), Path::new("test.tsv"))
@@ -238,10 +290,10 @@ mod tests {
     fn accepts_comments_crlf_paths_and_all_storage_classes() {
         let text = concat!(
             "# generated evidence\r\n",
-            "name\tobject\trva\tsize\tstorage\talignment\tprovenance\r\n",
-            "table\tengine/world.c\t0x100\t0x20\tdata\t0x4\treviewed\r\n",
-            "constant\tengine/constants.c\t0X200\t16\trdata\t8\treviewed\r\n",
-            "scratch\tengine/state.c\t0x300\t4\tbss\t1\treviewed\r\n",
+            "name\tobject\trva\tsize\tstorage\talignment\tsection_offset\tscope\tprovenance\r\n",
+            "table\tengine/world.c\t0x100\t0x20\tdata\t0x4\t-\texternal\treviewed\r\n",
+            "constant\tengine/constants.c\t0X200\t16\trdata\t8\t0\tlocal\treviewed\r\n",
+            "scratch\tengine/state.c\t0x300\t4\tbss\t1\t0\tlocal\treviewed\r\n",
         );
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.definitions().len(), 3);
@@ -254,6 +306,8 @@ mod tests {
         assert_eq!(table.storage, DataStorage::Data);
         assert_eq!(table.alignment, 4);
         assert!(parsed.contains_name(b"constant"));
+        assert!(parsed.is_closed(b"engine\\constants.c", DataStorage::Rdata));
+        assert!(!parsed.is_closed(b"engine\\world.c", DataStorage::Data));
     }
 
     #[test]
@@ -288,8 +342,10 @@ mod tests {
 
     #[test]
     fn rejects_wrong_column_counts() {
-        assert!(error("a\tu.c\t0x100\t4\tdata\t4").contains("exactly seven"));
-        assert!(error("a\tu.c\t0x100\t4\tdata\t4\ttest\textra").contains("exactly seven"));
+        assert!(error("a\tu.c\t0x100\t4\tdata\t4").contains("exactly nine"));
+        assert!(
+            error("a\tu.c\t0x100\t4\tdata\t4\t-\texternal\ttest\textra").contains("exactly nine")
+        );
     }
 
     #[test]
@@ -304,7 +360,7 @@ mod tests {
             "a/./u.c",
             "a//u.c",
         ] {
-            let row = format!("a\t{object}\t0x100\t4\tdata\t4\ttest");
+            let row = format!("a\t{object}\t0x100\t4\tdata\t4\t-\texternal\ttest");
             assert!(
                 error(&row).contains("relative and normalized"),
                 "accepted {object}"
@@ -315,9 +371,9 @@ mod tests {
     #[test]
     fn rejects_nul_and_control_bytes_in_text_fields() {
         for row in [
-            "a\0b\tu.c\t0x100\t4\tdata\t4\ttest",
-            "a\tu\x7f.c\t0x100\t4\tdata\t4\ttest",
-            "a\tu.c\t0x100\t4\tdata\t4\ttest\x01",
+            "a\0b\tu.c\t0x100\t4\tdata\t4\t-\texternal\ttest",
+            "a\tu\x7f.c\t0x100\t4\tdata\t4\t-\texternal\ttest",
+            "a\tu.c\t0x100\t4\tdata\t4\t-\texternal\ttest\x01",
         ] {
             assert!(error(row).contains("control byte"));
         }
@@ -326,7 +382,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_names() {
         let text = format!(
-            "{HEADER_TEXT}a\tone.c\t0x100\t4\tdata\t4\ttest\na\ttwo.c\t0x200\t4\tdata\t4\ttest\n"
+            "{HEADER_TEXT}a\tone.c\t0x100\t4\tdata\t4\t-\texternal\ttest\na\ttwo.c\t0x200\t4\tdata\t4\t-\texternal\ttest\n"
         );
         assert!(
             parse(&text)
@@ -340,7 +396,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_rvas() {
         let text = format!(
-            "{HEADER_TEXT}a\tone.c\t0x100\t4\tdata\t4\ttest\nb\ttwo.c\t0x100\t4\tdata\t4\ttest\n"
+            "{HEADER_TEXT}a\tone.c\t0x100\t4\tdata\t4\t-\texternal\ttest\nb\ttwo.c\t0x100\t4\tdata\t4\t-\texternal\ttest\n"
         );
         assert!(
             parse(&text)
@@ -354,7 +410,7 @@ mod tests {
     #[test]
     fn rejects_overlaps_across_owner_objects() {
         let text = format!(
-            "{HEADER_TEXT}a\tone.c\t0x100\t0x20\tdata\t4\ttest\nb\ttwo.c\t0x110\t4\tdata\t4\ttest\n"
+            "{HEADER_TEXT}a\tone.c\t0x100\t0x20\tdata\t4\t-\texternal\ttest\nb\ttwo.c\t0x110\t4\tdata\t4\t-\texternal\ttest\n"
         );
         assert!(
             parse(&text)
@@ -368,27 +424,30 @@ mod tests {
     #[test]
     fn accepts_adjacent_extents_across_owner_objects() {
         let text = format!(
-            "{HEADER_TEXT}a\tone.c\t0x100\t0x20\tdata\t4\ttest\nb\ttwo.c\t0x120\t4\tdata\t4\ttest\n"
+            "{HEADER_TEXT}a\tone.c\t0x100\t0x20\tdata\t4\t-\texternal\ttest\nb\ttwo.c\t0x120\t4\tdata\t4\t-\texternal\ttest\n"
         );
         assert_eq!(parse(&text).unwrap().definitions().len(), 2);
     }
 
     #[test]
     fn rejects_extent_overflow_and_zero_size() {
-        let overflow = format!("a\tu.c\t{}\t2\tdata\t4\ttest", usize::MAX);
+        let overflow = format!("a\tu.c\t{}\t2\tdata\t4\t-\texternal\ttest", usize::MAX);
         assert!(error(&overflow).contains("overflows"));
-        assert!(error("a\tu.c\t0x100\t0\tdata\t4\ttest").contains("non-zero"));
+        assert!(error("a\tu.c\t0x100\t0\tdata\t4\t-\texternal\ttest").contains("non-zero"));
     }
 
     #[test]
     fn rejects_zero_and_non_power_of_two_alignment() {
-        assert!(error("a\tu.c\t0x100\t4\tdata\t0\ttest").contains("power of two"));
-        assert!(error("a\tu.c\t0x100\t4\tdata\t3\ttest").contains("power of two"));
+        assert!(error("a\tu.c\t0x100\t4\tdata\t0\t-\texternal\ttest").contains("power of two"));
+        assert!(error("a\tu.c\t0x100\t4\tdata\t3\t-\texternal\ttest").contains("power of two"));
     }
 
     #[test]
     fn resolves_interior_owner_and_addend_at_exact_boundaries() {
-        let parsed = parse(&manifest("table\tu.c\t0x100\t0x20\tdata\t4\ttest")).unwrap();
+        let parsed = parse(&manifest(
+            "table\tu.c\t0x100\t0x20\tdata\t4\t-\texternal\ttest",
+        ))
+        .unwrap();
         assert!(parsed.owner_and_addend_for_rva(0xff).is_none());
         let (owner, addend) = parsed.owner_and_addend_for_rva(0x100).unwrap();
         assert_eq!(owner.name.as_bytes(), b"table");

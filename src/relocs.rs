@@ -1,8 +1,8 @@
-use crate::data_manifest::DataManifest;
+use crate::Env;
 use crate::contribution_manifest::{ContributionManifest, ContributionStorage};
+use crate::data_manifest::{DataManifest, DataStorage};
 use crate::pdb_symbols;
 use crate::utils::ToUsize;
-use crate::Env;
 
 use pdb2::RawString;
 
@@ -36,6 +36,7 @@ pub enum RelocKind<'a> {
     Static {
         symbol: RawString<'static>,
         target_rva: usize,
+        storage: ContributionStorage,
     },
 }
 
@@ -128,6 +129,7 @@ pub fn resolve_absolute_relocations<'s>(
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
     contributions: &ContributionManifest,
+    recover_data_relocs_from_pdb: bool,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
     let Some(reloc_sec) = exe.section_by_name(".reloc") else {
         anyhow::bail!("Missing .reloc section");
@@ -205,19 +207,37 @@ pub fn resolve_absolute_relocations<'s>(
                     {
                         let diff = u32::try_from(addend)?;
                         coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-                        relocs_rva.insert(reloc_rva, RelocKind::Constant {
-                            symbol: owner.name,
-                            target_rva,
-                        });
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Constant {
+                                symbol: owner.name,
+                                target_rva,
+                            },
+                        );
                         continue;
                     }
-                    match symbols.strings.range(..=target_rva).rev().find(|(string_rva, _)| {
-                        contributions.same_owner(
-                            ContributionStorage::Rdata,
-                            **string_rva,
-                            target_rva,
-                        )
-                    }) {
+                    if !recover_data_relocs_from_pdb {
+                        if let Some(object) =
+                            contributions.owner_for_rva(ContributionStorage::Rdata, target_rva)
+                        {
+                            if data_manifest.is_closed(object, DataStorage::Rdata) {
+                                anyhow::bail!(
+                                    "closed candidate .rdata contribution has no allocation owning RVA {target_rva:#x}"
+                                );
+                            }
+                        }
+                    }
+                    match symbols
+                        .strings
+                        .range(..=target_rva)
+                        .rev()
+                        .find(|(string_rva, _)| {
+                            contributions.same_owner(
+                                ContributionStorage::Rdata,
+                                **string_rva,
+                                target_rva,
+                            )
+                        }) {
                         Some((string_rva, (string_mangled_name, string)))
                             if target_rva - string_rva < string.len() =>
                         {
@@ -234,14 +254,12 @@ pub fn resolve_absolute_relocations<'s>(
                         }
 
                         Some(_) | None => {
-                            let Some((constant_rva, constant_name)) =
-                                closest_data_symbol(
-                                    &symbols.constants,
-                                    target_rva,
-                                    ContributionStorage::Rdata,
-                                    contributions,
-                                )
-                            else {
+                            let Some((constant_rva, constant_name)) = closest_data_symbol(
+                                &symbols.constants,
+                                target_rva,
+                                ContributionStorage::Rdata,
+                                contributions,
+                            ) else {
                                 anyhow::bail!(
                                     "no .rdata symbol in contribution owning RVA {target_rva:#x}"
                                 );
@@ -256,10 +274,9 @@ pub fn resolve_absolute_relocations<'s>(
                                 contributions,
                             )? {
                                 Some((addend, owner)) => (addend, owner),
-                                None => (
-                                    u32::try_from(target_rva - *constant_rva)?,
-                                    *constant_name,
-                                ),
+                                None => {
+                                    (u32::try_from(target_rva - *constant_rva)?, *constant_name)
+                                }
                             };
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
@@ -277,12 +294,23 @@ pub fn resolve_absolute_relocations<'s>(
                     if let Some((owner, addend)) =
                         data_manifest.owner_and_addend_for_rva(target_rva)
                     {
+                        let storage = match owner.storage {
+                            DataStorage::Bss => ContributionStorage::Bss,
+                            DataStorage::Data => ContributionStorage::Data,
+                            DataStorage::Rdata => {
+                                anyhow::bail!(".rdata manifest owner lies in writable PE storage")
+                            }
+                        };
                         let diff = u32::try_from(addend)?;
                         coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-                        relocs_rva.insert(reloc_rva, RelocKind::Static {
-                            symbol: owner.name,
-                            target_rva,
-                        });
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Static {
+                                symbol: owner.name,
+                                target_rva,
+                                storage,
+                            },
+                        );
                         continue;
                     }
                     let storage = contributions
@@ -294,13 +322,22 @@ pub fn resolve_absolute_relocations<'s>(
                             )
                         })
                         .unwrap_or(ContributionStorage::Data);
+                    if !recover_data_relocs_from_pdb {
+                        if let Some(object) = contributions.owner_for_rva(storage, target_rva) {
+                            let manifest_storage = match storage {
+                                ContributionStorage::Data => DataStorage::Data,
+                                ContributionStorage::Bss => DataStorage::Bss,
+                                _ => unreachable!(),
+                            };
+                            if data_manifest.is_closed(object, manifest_storage) {
+                                anyhow::bail!(
+                                    "closed candidate writable contribution has no allocation owning RVA {target_rva:#x}"
+                                );
+                            }
+                        }
+                    }
                     let Some((static_rva, static_name)) =
-                        closest_data_symbol(
-                            &symbols.statics,
-                            target_rva,
-                            storage,
-                            contributions,
-                        )
+                        closest_data_symbol(&symbols.statics, target_rva, storage, contributions)
                     else {
                         let _reloc_va = reloc_rva + env.image_base.to_usize();
                         // @TODO: There is a "single" unnamed static relocation in base, which is a
@@ -317,10 +354,7 @@ pub fn resolve_absolute_relocations<'s>(
                         contributions,
                     )? {
                         Some((addend, owner)) => (addend, owner),
-                        None => (
-                            u32::try_from(target_rva - *static_rva)?,
-                            *static_name,
-                        ),
+                        None => (u32::try_from(target_rva - *static_rva)?, *static_name),
                     };
                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
@@ -329,6 +363,7 @@ pub fn resolve_absolute_relocations<'s>(
                         RelocKind::Static {
                             symbol: reloc_name,
                             target_rva,
+                            storage,
                         },
                     );
                 }
@@ -371,10 +406,9 @@ mod tests {
     #[test]
     fn canonical_alias_decodes_and_validates() {
         let owner: RawString<'static> = b"?gConfig@@3UconfigStruct@@A".as_slice().into();
-        let alias: RawString<'static> =
-            b"__homm2_data_alias$00000030$?gConfig@@3UconfigStruct@@A"
-                .as_slice()
-                .into();
+        let alias: RawString<'static> = b"__homm2_data_alias$00000030$?gConfig@@3UconfigStruct@@A"
+            .as_slice()
+            .into();
         let mut symbols = BTreeMap::new();
         symbols.insert(0x128d20, owner);
         symbols.insert(0x128d50, alias);
@@ -397,10 +431,9 @@ mod tests {
     #[test]
     fn canonical_alias_rejects_wrong_addend() {
         let owner: RawString<'static> = b"?gConfig@@3UconfigStruct@@A".as_slice().into();
-        let alias: RawString<'static> =
-            b"__homm2_data_alias$0000001C$?gConfig@@3UconfigStruct@@A"
-                .as_slice()
-                .into();
+        let alias: RawString<'static> = b"__homm2_data_alias$0000001C$?gConfig@@3UconfigStruct@@A"
+            .as_slice()
+            .into();
         let mut symbols = BTreeMap::new();
         symbols.insert(0x128d20, owner);
         symbols.insert(0x128d50, alias);

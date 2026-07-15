@@ -168,7 +168,7 @@ impl ContributionManifest {
         })
     }
 
-    fn owner_for_rva(&self, storage: ContributionStorage, rva: usize) -> Option<&'static [u8]> {
+    pub fn owner_for_rva(&self, storage: ContributionStorage, rva: usize) -> Option<&'static [u8]> {
         self.contributions.iter().find_map(|contribution| {
             if contribution.storage == storage
                 && contribution.rva <= rva
