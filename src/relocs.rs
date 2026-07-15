@@ -42,6 +42,72 @@ struct RelocHeader {
 }
 const HEADER_SIZE: usize = std::mem::size_of::<RelocHeader>();
 
+fn decode_data_alias(
+    symbol: RawString<'static>,
+    prefix: Option<&[u8]>,
+) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
+    let Some(prefix) = prefix else {
+        return Ok(None);
+    };
+    let bytes = symbol.as_bytes();
+    if !bytes.starts_with(prefix) {
+        return Ok(None);
+    }
+    let value_start = prefix.len();
+    let value_end = value_start + 8;
+    if bytes.len() <= value_end || bytes[value_end] != b'$' {
+        anyhow::bail!("malformed canonical data alias: {symbol}");
+    }
+    let mut addend = 0u32;
+    for byte in &bytes[value_start..value_end] {
+        let digit = match byte {
+            b'0'..=b'9' => u32::from(byte - b'0'),
+            b'a'..=b'f' => u32::from(byte - b'a' + 10),
+            b'A'..=b'F' => u32::from(byte - b'A' + 10),
+            _ => anyhow::bail!("malformed canonical data alias addend: {symbol}"),
+        };
+        addend = (addend << 4) | digit;
+    }
+    let owner = &bytes[value_end + 1..];
+    if owner.is_empty() {
+        anyhow::bail!("canonical data alias has no owner: {symbol}");
+    }
+    Ok(Some((addend, owner.into())))
+}
+
+fn resolve_data_alias(
+    symbols: &BTreeMap<usize, RawString<'static>>,
+    alias_rva: usize,
+    target_rva: usize,
+    alias: RawString<'static>,
+    prefix: Option<&[u8]>,
+) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
+    let Some((addend, owner)) = decode_data_alias(alias, prefix)? else {
+        return Ok(None);
+    };
+    if alias_rva != target_rva {
+        anyhow::bail!("canonical data alias is not at its exact target RVA");
+    }
+    let Some((owner_rva, _)) = symbols.iter().find(|(_, name)| **name == owner) else {
+        anyhow::bail!("canonical data alias owner is absent: {owner}");
+    };
+    if (*owner_rva as u32).wrapping_add(addend) != target_rva as u32 {
+        anyhow::bail!("canonical data alias owner/addend does not resolve to target");
+    }
+    Ok(Some((addend, owner)))
+}
+
+fn closest_data_symbol<'a>(
+    symbols: &'a BTreeMap<usize, RawString<'static>>,
+    target_rva: usize,
+    prefix: Option<&[u8]>,
+) -> Option<(&'a usize, &'a RawString<'static>)> {
+    symbols.range(..=target_rva).rev().find(|(rva, name)| {
+        **rva == target_rva
+            || prefix.is_none_or(|prefix| !name.as_bytes().starts_with(prefix))
+    })
+}
+
 #[repr(C)]
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
 struct RelocEntry {
@@ -52,6 +118,7 @@ pub fn resolve_absolute_relocations<'s>(
     env: &Env,
     exe: &'static object::read::pe::PeFile32<'static>,
     symbols: &'s pdb_symbols::PdbSymbols,
+    data_alias_prefix: Option<&[u8]>,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
     let Some(reloc_sec) = exe.section_by_name(".reloc") else {
         anyhow::bail!("Missing .reloc section");
@@ -141,21 +208,34 @@ pub fn resolve_absolute_relocations<'s>(
 
                         Some(_) | None => {
                             let Some((constant_rva, constant_name)) =
-                                symbols.constants.range(..=target_rva).next_back()
+                                closest_data_symbol(
+                                    &symbols.constants,
+                                    target_rva,
+                                    data_alias_prefix,
+                                )
                             else {
                                 unreachable!("All constants must be named");
                             };
 
-                            // @TODO: Many relocations (~2k) have very huge diffs,
-                            // meaning they do not actually belong to a found symbol.
-                            // This needs to be investigated (if this will affect objdiff matching)
-                            let diff = u32::try_from(target_rva - *constant_rva)?;
+                            let (diff, reloc_name) = match resolve_data_alias(
+                                &symbols.constants,
+                                *constant_rva,
+                                target_rva,
+                                *constant_name,
+                                data_alias_prefix,
+                            )? {
+                                Some((addend, owner)) => (addend, owner),
+                                None => (
+                                    u32::try_from(target_rva - *constant_rva)?,
+                                    *constant_name,
+                                ),
+                            };
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                             relocs_rva.insert(
                                 reloc_rva,
                                 RelocKind::Constant {
-                                    symbol: *constant_name,
+                                    symbol: reloc_name,
                                     target_rva,
                                 },
                             );
@@ -164,7 +244,11 @@ pub fn resolve_absolute_relocations<'s>(
                 }
                 () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
                     let Some((static_rva, static_name)) =
-                        symbols.statics.range(..=target_rva).next_back()
+                        closest_data_symbol(
+                            &symbols.statics,
+                            target_rva,
+                            data_alias_prefix,
+                        )
                     else {
                         let _reloc_va = reloc_rva + env.image_base.to_usize();
                         // @TODO: There is a "single" unnamed static relocation in base, which is a
@@ -172,16 +256,25 @@ pub fn resolve_absolute_relocations<'s>(
                         continue;
                     };
 
-                    // @TODO: Many relocations (~10k) have very huge diffs,
-                    // meaning they do not actually belong to a found symbol.
-                    // This needs to be investigated (if this will affect objdiff matching)
-                    let diff = u32::try_from(target_rva - *static_rva)?;
+                    let (diff, reloc_name) = match resolve_data_alias(
+                        &symbols.statics,
+                        *static_rva,
+                        target_rva,
+                        *static_name,
+                        data_alias_prefix,
+                    )? {
+                        Some((addend, owner)) => (addend, owner),
+                        None => (
+                            u32::try_from(target_rva - *static_rva)?,
+                            *static_name,
+                        ),
+                    };
                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                     relocs_rva.insert(
                         reloc_rva,
                         RelocKind::Static {
-                            symbol: *static_name,
+                            symbol: reloc_name,
                             target_rva,
                         },
                     );
@@ -216,4 +309,89 @@ fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
         }
     }
     mapped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALIAS_PREFIX: &[u8] = b"__data_alias$";
+
+    #[test]
+    fn canonical_alias_decodes_and_validates() {
+        let owner: RawString<'static> = b"?gConfig@@3UconfigStruct@@A".as_slice().into();
+        let alias: RawString<'static> =
+            b"__data_alias$00000030$?gConfig@@3UconfigStruct@@A"
+                .as_slice()
+                .into();
+        let mut symbols = BTreeMap::new();
+        symbols.insert(0x128d20, owner);
+        symbols.insert(0x128d50, alias);
+
+        assert_eq!(
+            resolve_data_alias(
+                &symbols,
+                0x128d50,
+                0x128d50,
+                alias,
+                Some(ALIAS_PREFIX),
+            )
+            .unwrap(),
+            Some((0x30, owner))
+        );
+    }
+
+    #[test]
+    fn canonical_alias_is_disabled_without_a_prefix() {
+        let alias: RawString<'static> =
+            b"__data_alias$00000030$?gConfig@@3UconfigStruct@@A"
+                .as_slice()
+                .into();
+
+        assert_eq!(decode_data_alias(alias, None).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_alias_rejects_wrong_addend() {
+        let owner: RawString<'static> = b"?gConfig@@3UconfigStruct@@A".as_slice().into();
+        let alias: RawString<'static> =
+            b"__data_alias$0000001C$?gConfig@@3UconfigStruct@@A"
+                .as_slice()
+                .into();
+        let mut symbols = BTreeMap::new();
+        symbols.insert(0x128d20, owner);
+        symbols.insert(0x128d50, alias);
+
+        assert!(
+            resolve_data_alias(
+                &symbols,
+                0x128d50,
+                0x128d50,
+                alias,
+                Some(ALIAS_PREFIX),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_alias_rejects_missing_owner() {
+        let alias: RawString<'static> =
+            b"__data_alias$00000030$?notConfig@@3UconfigStruct@@A"
+                .as_slice()
+                .into();
+        let mut symbols = BTreeMap::new();
+        symbols.insert(0x128d50, alias);
+
+        assert!(
+            resolve_data_alias(
+                &symbols,
+                0x128d50,
+                0x128d50,
+                alias,
+                Some(ALIAS_PREFIX),
+            )
+            .is_err()
+        );
+    }
 }
