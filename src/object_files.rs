@@ -663,8 +663,9 @@ impl ObjectFile {
         let symbol = if let Some(symbol) = self.symbols.get(name.as_bytes()) {
             *symbol
         } else {
-            self.object.add_symbol(object::write::Symbol {
-                name: name.as_bytes().to_vec(),
+            let name = name.as_bytes().to_vec();
+            let symbol = self.object.add_symbol(object::write::Symbol {
+                name: name.clone(),
                 value,
                 size: u64::MAX,
                 kind,
@@ -672,7 +673,9 @@ impl ObjectFile {
                 weak: false,
                 section,
                 flags: object::SymbolFlags::None,
-            })
+            });
+            self.symbols.insert(name, symbol);
+            symbol
         };
 
         // A relative branch's operand is the displacement from the END of the
@@ -807,6 +810,24 @@ mod tests {
         assert_eq!(rdata.recovered_data_storage(), Some(DataStorage::Rdata));
         assert_eq!(data.recovered_data_storage(), Some(DataStorage::Data));
         assert_eq!(bss.recovered_data_storage(), Some(DataStorage::Bss));
+    }
+
+    #[test]
+    fn relocations_reuse_one_undefined_external_symbol() {
+        let mut object = ObjectFile::empty(false);
+        let bytes = [0_u8; 8];
+        let offset = object.append_section_data(object.text_section_id, &bytes, 0x90);
+        let name: RawString<'static> = b"external".as_slice().into();
+
+        object
+            .add_relocation(name, ObjectLocation::Extern, offset, false)
+            .unwrap();
+        object
+            .add_relocation(name, ObjectLocation::Extern, offset + 4, false)
+            .unwrap();
+
+        assert_eq!(object.symbols.len(), 1);
+        assert!(object.symbols.contains_key(b"external".as_slice()));
     }
 }
 
