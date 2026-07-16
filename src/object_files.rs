@@ -31,6 +31,7 @@ pub struct ObjectFile {
     pub comdat_leaders: HashMap<usize, SymbolId>,
     pub symbols: HashMap<Vec<u8>, SymbolId>,
     pub definition_offsets: HashMap<Vec<u8>, ObjectOffset>,
+    pub definition_ranges: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 #[derive(Copy, Clone)]
@@ -122,7 +123,7 @@ impl ObjectFiles<'_> {
         }
         for definition in data_manifest.definitions() {
             let object_file = this.objects.get_mut(definition.object).unwrap();
-            if !object_file.has_assigned_data_topology() {
+            if !object_file.definition_uses_affine_topology(*definition) {
                 object_file.add_legacy_data_relocations(
                     *definition,
                     matcher,
@@ -279,6 +280,7 @@ impl ObjectFile {
             comdat_leaders: HashMap::new(),
             symbols: HashMap::new(),
             definition_offsets: HashMap::new(),
+            definition_ranges: HashMap::new(),
         }
     }
 
@@ -348,8 +350,17 @@ impl ObjectFile {
                         }
                     }
                 }
+                (Some(SectionStorage::Bss), None) => {
+                    object.append_section_bss(id, section.size as u64, section.alignment);
+                }
+                (Some(SectionStorage::Data | SectionStorage::Rdata), None) => {
+                    // A non-affine section retains the candidate COFF shape.
+                    // Reviewed definitions copy their independent retail payloads
+                    // into this deterministic zero-filled buffer below.
+                    object.set_section_data(id, vec![0; section.size], section.alignment);
+                }
                 (None, None) => object.set_section_data(id, Vec::new(), section.alignment),
-                _ => unreachable!("section manifest validates storage/RVA presence"),
+                (None, Some(_)) => unreachable!("section manifest validates assigned RVAs"),
             }
             object.section_symbol(id);
             topology_sections.insert(
@@ -399,6 +410,7 @@ impl ObjectFile {
             comdat_leaders: HashMap::new(),
             symbols: HashMap::new(),
             definition_offsets: HashMap::new(),
+            definition_ranges: HashMap::new(),
         })
     }
 }
@@ -724,16 +736,33 @@ impl ObjectFile {
             if definition_end > section.size {
                 anyhow::bail!("reviewed data definition exceeds its assigned section");
             }
-            let expected_rva = section
-                .rva
-                .unwrap()
-                .checked_add(section_offset)
-                .ok_or_else(|| anyhow::anyhow!("reviewed data section placement overflows"))?;
-            if definition.rva != expected_rva {
-                anyhow::bail!(
-                    "reviewed data definition RVA disagrees with section placement: expected {expected_rva:#x}, got {:#x}",
-                    definition.rva
-                );
+            if let Some(section_rva) = section.rva {
+                let expected_rva = section_rva
+                    .checked_add(section_offset)
+                    .ok_or_else(|| anyhow::anyhow!("reviewed data section placement overflows"))?;
+                if definition.rva != expected_rva {
+                    anyhow::bail!(
+                        "reviewed data definition RVA disagrees with section placement: expected {expected_rva:#x}, got {:#x}",
+                        definition.rva
+                    );
+                }
+            }
+            let ranges = self
+                .definition_ranges
+                .entry(definition.section_ordinal.unwrap())
+                .or_default();
+            if ranges
+                .iter()
+                .any(|(start, end)| section_offset < *end && *start < definition_end)
+            {
+                anyhow::bail!("reviewed data definitions overlap in their candidate section");
+            }
+            ranges.push((section_offset, definition_end));
+
+            if section.rva.is_none() && definition.storage != DataStorage::Bss {
+                self.object.section_mut(section.section_id).data_mut()
+                    [section_offset..definition_end]
+                    .copy_from_slice(&coff_data[definition.rva..definition.rva + definition.size]);
             }
         }
         let offset = if let Some(section) = topology_section {
@@ -845,10 +874,11 @@ impl ObjectFile {
         Ok(())
     }
 
-    fn has_assigned_data_topology(&self) -> bool {
-        self.topology_sections
-            .values()
-            .any(|section| section.storage.is_some())
+    fn definition_uses_affine_topology(&self, definition: DataDefinition) -> bool {
+        definition
+            .section_ordinal
+            .and_then(|ordinal| self.topology_sections.get(&ordinal))
+            .is_some_and(|section| section.rva.is_some())
     }
 
     fn add_topology_section_relocations(
@@ -862,7 +892,7 @@ impl ObjectFile {
             .topology_sections
             .values()
             .copied()
-            .filter(|section| section.storage.is_some())
+            .filter(|section| section.rva.is_some())
             .collect::<Vec<_>>();
         for section in sections {
             let rva = section.rva.unwrap();
@@ -1243,6 +1273,168 @@ mod tests {
                 .unwrap(),
             "??_C@fixture"
         );
+    }
+
+    #[test]
+    fn non_affine_topology_copies_reviewed_payloads_and_relocations_by_definition() {
+        let sections = [DataSection {
+            object: b"SOURCE\\a.c",
+            ordinal: 1,
+            name: b".data",
+            rva: None,
+            size: 0x10,
+            alignment: 8,
+            characteristics: 0xc040_0040,
+            comdat_selection: 0,
+            associative_ordinal: None,
+            storage: Some(SectionStorage::Data),
+        }];
+        let mut image = [0_u8; 0x50];
+        image[0x10..0x14].copy_from_slice(b"left");
+        image[0x30..0x34].copy_from_slice(b"rght");
+        image[0x34..0x38].copy_from_slice(&3_u32.to_le_bytes());
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 2,
+            data: &[],
+        };
+        let data = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 3,
+            data: &image,
+        };
+        let definitions = [
+            DataDefinition {
+                name: b"left".as_slice().into(),
+                object: b"SOURCE\\a.c",
+                rva: 0x10,
+                size: 4,
+                storage: DataStorage::Data,
+                alignment: 4,
+                section_ordinal: Some(1),
+                section_offset: Some(0),
+                scope: DataScope::External,
+                provisional: false,
+                address_authoritative: true,
+            },
+            DataDefinition {
+                name: b"right".as_slice().into(),
+                object: b"SOURCE\\a.c",
+                rva: 0x30,
+                size: 8,
+                storage: DataStorage::Data,
+                alignment: 4,
+                section_ordinal: Some(1),
+                section_offset: Some(8),
+                scope: DataScope::External,
+                provisional: false,
+                address_authoritative: true,
+            },
+        ];
+        let mut output = ObjectFile::with_sections(&sections, empty, data, &image, false).unwrap();
+        for definition in definitions {
+            output.add_data_definition(definition, &image).unwrap();
+        }
+
+        let mut relocs = BTreeMap::new();
+        relocs.insert(
+            0x34,
+            RelocKind::Static {
+                symbol: b"external".as_slice().into(),
+                target_rva: 0x40,
+                storage: ContributionStorage::Data,
+            },
+        );
+        output
+            .add_topology_section_relocations(
+                &SymbolMatcher::off(),
+                &image,
+                &relocs,
+                &DataManifest::default(),
+            )
+            .unwrap();
+        for definition in definitions {
+            assert!(!output.definition_uses_affine_topology(definition));
+            output
+                .add_legacy_data_relocations(
+                    definition,
+                    &SymbolMatcher::off(),
+                    &image,
+                    &relocs,
+                    &DataManifest::default(),
+                )
+                .unwrap();
+        }
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let section = object.section_by_name(".data").unwrap();
+        assert_eq!(section.data().unwrap(), b"left\0\0\0\0rght\x03\0\0\0");
+        let relocation = section.relocations().next().unwrap();
+        assert_eq!(relocation.0, 0xc);
+        let object::RelocationTarget::Symbol(symbol) = relocation.1.target() else {
+            panic!("data relocation must target an external symbol");
+        };
+        assert_eq!(
+            object.symbol_by_index(symbol).unwrap().name(),
+            Ok("external")
+        );
+    }
+
+    #[test]
+    fn non_affine_topology_rejects_candidate_offset_overlaps() {
+        let sections = [DataSection {
+            object: b"SOURCE\\a.c",
+            ordinal: 1,
+            name: b".data",
+            rva: None,
+            size: 8,
+            alignment: 4,
+            characteristics: 0xc030_0040,
+            comdat_selection: 0,
+            associative_ordinal: None,
+            storage: Some(SectionStorage::Data),
+        }];
+        let image = [0_u8; 0x20];
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 2,
+            data: &[],
+        };
+        let data = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 3,
+            data: &image,
+        };
+        let mut output = ObjectFile::with_sections(&sections, empty, data, &image, false).unwrap();
+        let definition = |name: &'static [u8], rva, offset| DataDefinition {
+            name: RawString::from(name),
+            object: b"SOURCE\\a.c",
+            rva,
+            size: 4,
+            storage: DataStorage::Data,
+            alignment: 1,
+            section_ordinal: Some(1),
+            section_offset: Some(offset),
+            scope: DataScope::Local,
+            provisional: false,
+            address_authoritative: true,
+        };
+        output
+            .add_data_definition(definition(b"first", 0x10, 0), &image)
+            .unwrap();
+        let error = output
+            .add_data_definition(definition(b"second", 0x14, 2), &image)
+            .unwrap_err();
+        assert!(error.to_string().contains("overlap"));
     }
 
     #[test]

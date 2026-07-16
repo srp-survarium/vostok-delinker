@@ -131,17 +131,21 @@ impl DataSectionManifest {
                     String::from_utf8_lossy(value)
                 ),
             };
-            if storage.is_some() != rva.is_some() {
+            if rva.is_some() && storage.is_none() {
                 anyhow::bail!(
-                    "{}:{}: data section storage/RVA must both be present or absent",
+                    "{}:{}: an assigned data section RVA requires a storage class",
                     path.display(),
                     line_number
                 );
             }
             if let Some(rva) = rva {
-                if rva & (alignment as usize - 1) != 0 || rva.checked_add(size).is_none() {
+                // The RVA is a retail copy source, not the linked address of the
+                // emitted COFF section.  NB09 contribution ranges exclude linker
+                // padding and therefore need not retain the input section's
+                // alignment.
+                if rva.checked_add(size).is_none() {
                     anyhow::bail!(
-                        "{}:{}: data section RVA/extent violates alignment or overflows",
+                        "{}:{}: data section RVA extent overflows",
                         path.display(),
                         line_number
                     );
@@ -346,7 +350,7 @@ mod tests {
 
     #[test]
     fn rejects_misaligned_overlapping_and_storage_inconsistent_sections() {
-        assert!(parse("a.c\t1\t.data\t0x102\t4\t4\t0xc0300040\t0\t-\tdata\ttest\n").is_err());
+        assert!(parse("a.c\t1\t.data\t0x102\t4\t4\t0xc0300040\t0\t-\tdata\ttest\n").is_ok());
         assert!(
             parse(
                 "a.c\t1\t.data\t0x100\t8\t4\t0xc0300040\t0\t-\tdata\ttest\n\
@@ -355,6 +359,15 @@ mod tests {
             .is_err()
         );
         assert!(parse("a.c\t1\t.rdata\t0x100\t4\t4\t0xc0300040\t0\t-\trdata\ttest\n").is_err());
+    }
+
+    #[test]
+    fn permits_storage_assigned_sections_without_an_affine_retail_rva() {
+        let manifest =
+            parse("a.c\t1\t.data\t-\t0x10\t8\t0xc0400040\t0\t-\tdata\treviewed-definitions\n")
+                .unwrap();
+        assert_eq!(manifest.sections()[0].rva, None);
+        assert_eq!(manifest.sections()[0].storage, Some(SectionStorage::Data));
     }
 
     #[test]
