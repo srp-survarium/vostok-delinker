@@ -117,6 +117,38 @@ fn closest_data_symbol<'a>(
     })
 }
 
+fn classify_retail_storage(
+    rdata_rva: usize,
+    rdata_size: usize,
+    data_rva: usize,
+    data_size: usize,
+    data_raw_size: usize,
+    target_rva: usize,
+) -> Option<ContributionStorage> {
+    if (rdata_rva..rdata_rva + rdata_size).contains(&target_rva) {
+        Some(ContributionStorage::Rdata)
+    } else if (data_rva..data_rva + data_size).contains(&target_rva) {
+        Some(if target_rva - data_rva < data_raw_size {
+            ContributionStorage::Data
+        } else {
+            ContributionStorage::Bss
+        })
+    } else {
+        None
+    }
+}
+
+fn retail_storage_for_rva(env: &Env, target_rva: usize) -> Option<ContributionStorage> {
+    classify_retail_storage(
+        env.rdata.rva,
+        env.rdata.size,
+        env.data.rva,
+        env.data.size,
+        env.data.data.len(),
+        target_rva,
+    )
+}
+
 #[repr(C)]
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
 struct RelocEntry {
@@ -217,24 +249,29 @@ pub fn resolve_absolute_relocations<'s>(
                         );
                         continue;
                     }
+                    let object =
+                        contributions.owner_for_rva(ContributionStorage::Rdata, target_rva);
+                    if let Some((owner, addend)) = data_manifest
+                        .hypothesis_owner_and_addend_for_rva(
+                            target_rva,
+                            Some(DataStorage::Rdata),
+                            object,
+                        )
+                    {
+                        coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Constant {
+                                symbol: owner.name,
+                                target_rva,
+                            },
+                        );
+                        continue;
+                    }
                     if !recover_data_relocs_from_pdb {
-                        if let Some(object) =
-                            contributions.owner_for_rva(ContributionStorage::Rdata, target_rva)
-                        {
-                            if data_manifest.is_closed(object, DataStorage::Rdata) {
-                                anyhow::bail!(
-                                    "closed candidate .rdata contribution has no allocation owning RVA {target_rva:#x}"
-                                );
-                            }
-                        }
-                        if unresolved
-                            .owner_for_rva(ContributionStorage::Rdata, target_rva)
-                            .is_none()
-                        {
-                            anyhow::bail!(
-                                "uncovered .rdata RVA {target_rva:#x} is absent from the explicit unresolved-data manifest"
-                            );
-                        }
+                        anyhow::bail!(
+                            "no candidate .rdata identity can represent retail RVA {target_rva:#x}"
+                        );
                     }
                     match symbols
                         .strings
@@ -331,25 +368,46 @@ pub fn resolve_absolute_relocations<'s>(
                                 ContributionStorage::Data | ContributionStorage::Bss
                             )
                         })
-                        .unwrap_or(ContributionStorage::Data);
+                        .or_else(|| retail_storage_for_rva(env, target_rva))
+                        .filter(|storage| {
+                            matches!(
+                                storage,
+                                ContributionStorage::Data | ContributionStorage::Bss
+                            )
+                        })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "writable relocation target {target_rva:#x} has no storage class"
+                            )
+                        })?;
+                    let manifest_storage = match storage {
+                        ContributionStorage::Data => DataStorage::Data,
+                        ContributionStorage::Bss => DataStorage::Bss,
+                        _ => unreachable!(),
+                    };
+                    let object = contributions.owner_for_rva(storage, target_rva);
+                    if let Some((owner, addend)) = data_manifest
+                        .hypothesis_owner_and_addend_for_rva(
+                            target_rva,
+                            Some(manifest_storage),
+                            object,
+                        )
+                    {
+                        coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Static {
+                                symbol: owner.name,
+                                target_rva,
+                                storage,
+                            },
+                        );
+                        continue;
+                    }
                     if !recover_data_relocs_from_pdb {
-                        if let Some(object) = contributions.owner_for_rva(storage, target_rva) {
-                            let manifest_storage = match storage {
-                                ContributionStorage::Data => DataStorage::Data,
-                                ContributionStorage::Bss => DataStorage::Bss,
-                                _ => unreachable!(),
-                            };
-                            if data_manifest.is_closed(object, manifest_storage) {
-                                anyhow::bail!(
-                                    "closed candidate writable contribution has no allocation owning RVA {target_rva:#x}"
-                                );
-                            }
-                        }
-                        if unresolved.owner_for_rva(storage, target_rva).is_none() {
-                            anyhow::bail!(
-                                "uncovered writable RVA {target_rva:#x} is absent from the explicit unresolved-data manifest"
-                            );
-                        }
+                        anyhow::bail!(
+                            "no candidate writable identity can represent retail RVA {target_rva:#x}"
+                        );
                     }
                     let Some((static_rva, static_name)) =
                         closest_data_symbol(&symbols.statics, target_rva, storage, contributions)
@@ -388,6 +446,20 @@ pub fn resolve_absolute_relocations<'s>(
     }
 
     Ok((coff_data, relocs_rva))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retail_storage_distinguishes_readonly_initialized_and_zero_fill() {
+        let classify = |rva| classify_retail_storage(0x100, 0x20, 0x200, 0x40, 0x18, rva);
+        assert_eq!(classify(0x110), Some(ContributionStorage::Rdata));
+        assert_eq!(classify(0x217), Some(ContributionStorage::Data));
+        assert_eq!(classify(0x218), Some(ContributionStorage::Bss));
+        assert_eq!(classify(0x240), None);
+    }
 }
 
 fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {

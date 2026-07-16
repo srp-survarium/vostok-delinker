@@ -68,7 +68,10 @@ impl ObjectFiles<'_> {
                 DataStorage::Rdata => env.rdata,
                 DataStorage::Data | DataStorage::Bss => env.data,
             };
-            if definition.rva < section.rva || definition_end > section.rva + section.size {
+            if !definition.provisional
+                && (definition.rva < section.rva
+                    || definition_end > section.rva + section.size)
+            {
                 anyhow::bail!("data manifest storage does not match the PE section");
             }
             let object_file = this

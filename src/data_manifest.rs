@@ -29,6 +29,8 @@ pub struct DataDefinition {
     pub alignment: u64,
     pub section_offset: Option<usize>,
     pub scope: DataScope,
+    pub provisional: bool,
+    pub address_authoritative: bool,
 }
 
 #[derive(Default)]
@@ -51,7 +53,7 @@ impl DataManifest {
         let mut names = HashSet::new();
         let mut external_names = HashSet::new();
         let mut local_names = HashSet::new();
-        let mut rvas = HashSet::new();
+        let mut proved_rvas = HashSet::new();
         let mut saw_header = false;
 
         for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
@@ -163,6 +165,14 @@ impl DataManifest {
                     String::from_utf8_lossy(value)
                 ),
             };
+            let provisional = columns[8].starts_with(b"provisional-");
+            let address_authoritative = !provisional
+                || columns[8] == b"provisional-candidate-coff-public-anchor"
+                || columns[8].windows(b"source-reviewed-DATA".len())
+                    .any(|window| window == b"source-reviewed-DATA");
+            if address_authoritative && !proved_rvas.insert(rva) {
+                anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
+            }
             let object: &'static [u8] = object.into_bytes().leak();
             match scope {
                 DataScope::External if !external_names.insert(name) => {
@@ -180,10 +190,6 @@ impl DataManifest {
                 _ => {}
             }
             names.insert(name);
-            if !rvas.insert(rva) {
-                anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
-            }
-
             definitions.push(DataDefinition {
                 name: RawString::from(name),
                 object,
@@ -193,6 +199,8 @@ impl DataManifest {
                 alignment,
                 section_offset,
                 scope,
+                provisional,
+                address_authoritative,
             });
         }
         if !saw_header {
@@ -210,7 +218,10 @@ impl DataManifest {
         let mut by_rva = definitions.clone();
         by_rva.sort_by_key(|definition| definition.rva);
         for pair in by_rva.windows(2) {
-            if pair[0].rva.checked_add(pair[0].size).unwrap() > pair[1].rva {
+            if !pair[0].provisional
+                && !pair[1].provisional
+                && pair[0].rva.checked_add(pair[0].size).unwrap() > pair[1].rva
+            {
                 anyhow::bail!("overlapping data manifest definitions");
             }
         }
@@ -219,6 +230,7 @@ impl DataManifest {
             .filter_map(|definition| {
                 definition
                     .section_offset
+                    .filter(|_| !definition.provisional)
                     .map(|_| (definition.object, definition.storage))
             })
             .collect();
@@ -238,13 +250,39 @@ impl DataManifest {
     }
 
     pub fn owner_and_addend_for_rva(&self, rva: usize) -> Option<(DataDefinition, usize)> {
-        self.definitions.iter().copied().find_map(|definition| {
-            if definition.rva <= rva && rva - definition.rva < definition.size {
-                Some((definition, rva - definition.rva))
-            } else {
-                None
-            }
-        })
+        self.definitions
+            .iter()
+            .copied()
+            .filter(|definition| definition.address_authoritative)
+            .find_map(|definition| {
+                if definition.rva <= rva && rva - definition.rva < definition.size {
+                    Some((definition, rva - definition.rva))
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn hypothesis_owner_and_addend_for_rva(
+        &self,
+        rva: usize,
+        storage: Option<DataStorage>,
+        object: Option<&[u8]>,
+    ) -> Option<(DataDefinition, u32)> {
+        let candidates = self.definitions.iter().copied().filter(|definition| {
+            storage.map_or(true, |expected| definition.storage == expected)
+                && object.map_or(true, |owner| definition.object == owner)
+        });
+        let definition = candidates.min_by_key(|definition| {
+            let contains = definition.rva <= rva && rva - definition.rva < definition.size;
+            (
+                !contains,
+                definition.rva.abs_diff(rva),
+                definition.section_offset.unwrap_or(definition.rva),
+                definition.name.as_bytes(),
+            )
+        })?;
+        Some((definition, (rva as u32).wrapping_sub(definition.rva as u32)))
     }
 
     pub fn is_closed(&self, object: &[u8], storage: DataStorage) -> bool {
@@ -462,6 +500,29 @@ mod tests {
             "{HEADER_TEXT}a\tone.c\t0x100\t0x20\tdata\t4\t-\texternal\ttest\nb\ttwo.c\t0x120\t4\tdata\t4\t-\texternal\ttest\n"
         );
         assert_eq!(parse(&text).unwrap().definitions().len(), 2);
+    }
+
+    #[test]
+    fn provisional_extents_may_overlap_without_claiming_closed_ownership() {
+        let parsed = parse(&format!(
+            "{HEADER_TEXT}a\tone.c\t0x100\t0x20\tdata\t4\t0\texternal\tprovisional-replay\n\
+             b\ttwo.c\t0x110\t4\tdata\t4\t0\texternal\tproved\n"
+        ))
+        .unwrap();
+        assert_eq!(parsed.definitions().len(), 2);
+        assert!(!parsed.is_closed(b"one.c", DataStorage::Data));
+        assert!(parsed.is_closed(b"two.c", DataStorage::Data));
+        assert_eq!(parsed.owner_and_addend_for_rva(0x110).unwrap().0.object, b"two.c");
+    }
+
+    #[test]
+    fn source_reviewed_provisional_address_is_authoritative() {
+        let parsed = parse(&manifest(
+            "source\tu.c\t0x100\t4\tdata\t4\t0\texternal\tprovisional-source-reviewed-DATA",
+        ))
+        .unwrap();
+        assert_eq!(parsed.owner_and_addend_for_rva(0x100).unwrap().0.object, b"u.c");
+        assert!(!parsed.is_closed(b"u.c", DataStorage::Data));
     }
 
     #[test]
