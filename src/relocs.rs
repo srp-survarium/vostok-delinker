@@ -39,6 +39,11 @@ pub enum RelocKind<'a> {
         target_rva: usize,
         storage: ContributionStorage,
     },
+
+    // .idata IAT slot
+    Import {
+        symbol: RawString<'static>,
+    },
 }
 
 #[repr(C)]
@@ -517,6 +522,15 @@ pub fn resolve_absolute_relocations<'s>(
                             storage,
                         },
                     );
+                }
+                () if (env.idata.rva..env.idata.rva + env.idata.size).contains(&target_rva) => {
+                    let Some(symbol) = symbols.imports.get(&target_rva) else {
+                        anyhow::bail!(
+                            "IAT relocation target {target_rva:#x} has no exact PDB symbol"
+                        );
+                    };
+                    coff_data_reloc.copy_from_slice(&0u32.to_le_bytes());
+                    relocs_rva.insert(reloc_rva, RelocKind::Import { symbol: *symbol });
                 }
                 () => (),
             }

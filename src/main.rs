@@ -251,6 +251,7 @@ pub struct Env<'a> {
     pub text: SecInfo<'a>,
     pub rdata: SecInfo<'a>,
     pub data: SecInfo<'a>,
+    pub idata: SecInfo<'a>,
 
     pub dbi: &'static pdb2::DebugInformation<'static>,
     pub string_table: &'static pdb2::StringTable<'static>,
@@ -296,16 +297,21 @@ impl Env<'_> {
         let Some(data_sec) = exe.section_by_name(".data") else {
             anyhow::bail!("Missing .data section");
         };
+        let Some(idata_sec) = exe.section_by_name(".idata") else {
+            anyhow::bail!("Missing .idata section");
+        };
 
         let text = build_sec_info(text_sec)?;
         let rdata = build_sec_info(rdata_sec)?;
         let data = build_sec_info(data_sec)?;
+        let idata = build_sec_info(idata_sec)?;
 
         Ok(Self {
             image_base,
             text,
             rdata,
             data,
+            idata,
 
             dbi,
             string_table,

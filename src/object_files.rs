@@ -692,6 +692,10 @@ impl ObjectFile {
                     }
                 }
             }
+
+            RelocKind::Import { symbol: _ } => {
+                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, false)?;
+            }
         }
 
         Ok(())
@@ -1100,6 +1104,7 @@ impl<'a> RelocKind<'a> {
                 target_rva: _,
                 storage: _,
             } => Name::Borrowed(reloc_name),
+            Self::Import { symbol } => Name::Borrowed(symbol),
         }
     }
 
@@ -1115,6 +1120,7 @@ impl<'a> RelocKind<'a> {
                 storage: ContributionStorage::Bss,
                 ..
             } => Some(DataStorage::Bss),
+            Self::Import { .. } => None,
             _ => None,
         }
     }
@@ -1611,9 +1617,11 @@ mod tests {
             target_rva: 0x300,
             storage: ContributionStorage::Bss,
         };
+        let import = RelocKind::Import { symbol };
         assert_eq!(rdata.recovered_data_storage(), Some(DataStorage::Rdata));
         assert_eq!(data.recovered_data_storage(), Some(DataStorage::Data));
         assert_eq!(bss.recovered_data_storage(), Some(DataStorage::Bss));
+        assert_eq!(import.recovered_data_storage(), None);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub struct PdbSymbols {
 
     pub constants: BTreeMap<usize, RawString<'static>>,
     pub statics: BTreeMap<usize, RawString<'static>>,
+    pub imports: BTreeMap<usize, RawString<'static>>,
 }
 
 impl PdbSymbols {
@@ -56,6 +57,7 @@ impl PdbSymbols {
                 () if offset.section == env.text.id => env.text.rva + offset.offset.to_usize(),
                 () if offset.section == env.rdata.id => env.rdata.rva + offset.offset.to_usize(),
                 () if offset.section == env.data.id => env.data.rva + offset.offset.to_usize(),
+                () if offset.section == env.idata.id => env.idata.rva + offset.offset.to_usize(),
                 _ => continue,
             };
 
@@ -99,6 +101,13 @@ impl PdbSymbols {
                     assert_eq!(old_symbol, None, "Static symbols cannot repeat");
                 }
 
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
+                    if offset.section == env.idata.id =>
+                {
+                    let old_symbol = self.imports.insert(symbol_rva, name);
+                    assert_eq!(old_symbol, None, "Import symbols cannot repeat");
+                }
+
                 // Unmangled data symbols to cover missing spots.
                 pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
                     if offset.section == env.rdata.id =>
@@ -109,6 +118,11 @@ impl PdbSymbols {
                     if offset.section == env.data.id =>
                 {
                     static_data_symbols.push((symbol_rva, name));
+                }
+                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                    if offset.section == env.idata.id =>
+                {
+                    self.imports.entry(symbol_rva).or_insert(name);
                 }
                 _ => {}
             }
@@ -178,6 +192,9 @@ impl PdbSymbols {
                             () if offset.section == env.data.id => {
                                 env.data.rva + offset.offset.to_usize()
                             }
+                            () if offset.section == env.idata.id => {
+                                env.idata.rva + offset.offset.to_usize()
+                            }
                             _ => continue,
                         };
 
@@ -190,6 +207,9 @@ impl PdbSymbols {
                                 // As those are closer to the original symbols.
                                 // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
                                 let _old_symbol = self.statics.insert(symbol_rva, name);
+                            }
+                            () if offset.section == env.idata.id => {
+                                let _old_symbol = self.imports.insert(symbol_rva, name);
                             }
                             _ => continue,
                         };
