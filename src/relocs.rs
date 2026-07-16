@@ -448,20 +448,6 @@ pub fn resolve_absolute_relocations<'s>(
     Ok((coff_data, relocs_rva))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retail_storage_distinguishes_readonly_initialized_and_zero_fill() {
-        let classify = |rva| classify_retail_storage(0x100, 0x20, 0x200, 0x40, 0x18, rva);
-        assert_eq!(classify(0x110), Some(ContributionStorage::Rdata));
-        assert_eq!(classify(0x217), Some(ContributionStorage::Data));
-        assert_eq!(classify(0x218), Some(ContributionStorage::Bss));
-        assert_eq!(classify(0x240), None);
-    }
-}
-
 fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
     let image_base = exe
         .nt_headers()
@@ -489,6 +475,15 @@ fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retail_storage_distinguishes_readonly_initialized_and_zero_fill() {
+        let classify = |rva| classify_retail_storage(0x100, 0x20, 0x200, 0x40, 0x18, rva);
+        assert_eq!(classify(0x110), Some(ContributionStorage::Rdata));
+        assert_eq!(classify(0x217), Some(ContributionStorage::Data));
+        assert_eq!(classify(0x218), Some(ContributionStorage::Bss));
+        assert_eq!(classify(0x240), None);
+    }
 
     #[test]
     fn canonical_alias_decodes_and_validates() {
