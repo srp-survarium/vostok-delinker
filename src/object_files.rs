@@ -3,7 +3,7 @@ use crate::contribution_manifest::ContributionStorage;
 use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
 use crate::data_section_manifest::{DataSection, DataSectionManifest, SectionStorage};
 use crate::pdb_symbols::PdbSymbols;
-use crate::reloc_alias_manifest::RelocAliasManifest;
+use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::relocs::RelocKind;
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
 use crate::utils::{ToU64, ToUsize, contains, leak};
@@ -70,7 +70,7 @@ impl ObjectFiles<'_> {
         data_manifest: &DataManifest,
         data_section_manifest: &DataSectionManifest,
         reloc_aliases: &RelocAliasManifest,
-        observed_aliases: &mut BTreeMap<(usize, usize), usize>,
+        observed_aliases: &mut RelocAliasObservations,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -499,7 +499,7 @@ fn resolve_relative_relocations<'s>(
     coff_data: &[u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
     reloc_aliases: &RelocAliasManifest,
-    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
+    observed_aliases: &mut RelocAliasObservations,
 ) -> anyhow::Result<Vec<u8>> {
     let fun_va = env.image_base.to_usize() + fun_rva;
 
@@ -547,16 +547,18 @@ fn resolve_relative_relocations<'s>(
         };
 
         let overloads = overloads.as_slice();
+        let reloc_rva = fun_rva + offset_in_fun - 4;
         let symbol = reloc_aliases.resolve_function_alias(
             fun_rva,
             target_rva.to_usize(),
+            reloc_rva,
             overloads,
             observed_aliases,
         )?;
 
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(
-            fun_rva + offset_in_fun - 4,
+            reloc_rva,
             // A decoded call/jmp/jcc target -> PC-relative branch.
             RelocKind::Function {
                 overloads,

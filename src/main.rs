@@ -63,7 +63,8 @@ pub struct Cli {
     pub contribution_manifest: Option<std::path::PathBuf>,
 
     /// Exact encoded-address to symbol/addend spellings. These reviewed aliases
-    /// take precedence over ordinary nearest-symbol and data-owner selection.
+    /// take precedence over ordinary nearest-symbol and data-owner selection;
+    /// numeric site RVAs override wildcard rows for one exact relocation field.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub reloc_alias_manifest: Option<std::path::PathBuf>,
 
@@ -179,6 +180,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         contribution_manifest::ContributionManifest::load(contribution_manifest_path)?;
     let reloc_alias_manifest =
         reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
+    reloc_alias_manifest.validate_site_membership(&pdb_symbols.functions)?;
     let unresolved_data_manifest = if recover_data_relocs_from_pdb {
         contribution_manifest::ContributionManifest::load(unresolved_data_manifest_path)?
     } else {
