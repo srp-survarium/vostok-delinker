@@ -143,12 +143,15 @@ impl ObjectFiles<'_> {
                     .entry(filename)
                     .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
 
-                let fun_name = match symbols.functions.get(&fun_rva) {
-                    Some(overloads) => matcher.pick(overloads, canonical_name(overloads)),
-                    _ => fun_name,
-                };
+                let overloads = symbols
+                    .functions
+                    .get(&fun_rva)
+                    .map(Vec::as_slice)
+                    .unwrap_or_else(|| std::slice::from_ref(&fun_name));
+                let fun_name = matcher.pick(overloads, canonical_name(overloads));
 
-                let fun_offset_in_coff_text = object_file.add_function(fun_name, &fun_bytes);
+                let fun_offset_in_coff_text =
+                    object_file.add_function(fun_name, overloads, &fun_bytes);
 
                 for (reloc_rva, reloc_kind) in relocs_rva.range(fun_rva..fun_rva + fun_size) {
                     let reloc_rva = *reloc_rva;
@@ -709,19 +712,35 @@ impl ObjectFile {
         Ok(())
     }
 
-    fn add_function(&mut self, name: RawString, body: &[u8]) -> ObjectOffset {
+    fn add_function(
+        &mut self,
+        name: RawString,
+        aliases: &[RawString],
+        body: &[u8],
+    ) -> ObjectOffset {
         let fun_offset_in_coff_text = self.append_section_data(self.text_section_id, body, 0x90);
 
-        self.object.add_symbol(object::write::Symbol {
-            name: name.as_bytes().to_vec(),
-            value: fun_offset_in_coff_text.offset,
-            size: u64::MAX,
-            kind: object::SymbolKind::Text,
-            scope: object::SymbolScope::Linkage,
-            weak: false,
-            section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
-            flags: object::SymbolFlags::None,
-        });
+        let mut names = vec![name];
+        for alias in aliases {
+            if !names
+                .iter()
+                .any(|existing| existing.as_bytes() == alias.as_bytes())
+            {
+                names.push(*alias);
+            }
+        }
+        for name in names {
+            self.object.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value: fun_offset_in_coff_text.offset,
+                size: u64::MAX,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
+                flags: object::SymbolFlags::None,
+            });
+        }
 
         fun_offset_in_coff_text
     }
@@ -795,6 +814,7 @@ impl std::ops::Add<usize> for ObjectOffset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 
     #[test]
     fn permissive_pdb_recovery_preserves_all_data_storage_classes() {
@@ -831,6 +851,46 @@ mod tests {
 
         assert_eq!(object.symbols.len(), 1);
         assert!(object.symbols.contains_key(b"external".as_slice()));
+    }
+
+    #[test]
+    fn folded_function_emits_all_real_aliases_at_one_offset() {
+        let mut output = ObjectFile::empty(false);
+        let primary: RawString<'static> = b"ret_a".as_slice().into();
+        let aliases = [primary, b"ret_b".as_slice().into()];
+        output.add_function(primary, &aliases, &[0xc3]);
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let definitions = object
+            .symbols()
+            .filter(|symbol| symbol.is_definition() && symbol.address() == 0)
+            .map(|symbol| symbol.name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert!(definitions.iter().any(|name| name == "ret_a"));
+        assert!(definitions.iter().any(|name| name == "ret_b"));
+        assert!(definitions.iter().all(|name| name != "empty_stub"));
+    }
+
+    #[test]
+    fn cross_object_call_uses_real_folded_identity() {
+        let mut caller = ObjectFile::empty(false);
+        let call_field = caller.append_section_data(caller.text_section_id, &[0; 4], 0x90);
+        let callee: RawString<'static> = b"ret_a".as_slice().into();
+        caller
+            .add_relocation(callee, ObjectLocation::Extern, call_field, true)
+            .unwrap();
+
+        let bytes = caller.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let text = object.section_by_name(".text").unwrap();
+        let (_, relocation) = text.relocations().next().unwrap();
+        let object::RelocationTarget::Symbol(symbol_index) = relocation.target() else {
+            panic!("cross-object call must target a symbol");
+        };
+        let symbol = object.symbol_by_index(symbol_index).unwrap();
+        assert_eq!(symbol.name().unwrap(), "ret_a");
+        assert!(symbol.is_undefined());
     }
 }
 

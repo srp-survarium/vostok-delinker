@@ -65,6 +65,12 @@ pub struct Cli {
     /// preferred because this mode can retain synthetic const/string identities.
     #[arg(long)]
     pub recover_data_relocs_from_pdb: bool,
+
+    /// Legacy compatibility: replace known byte-identical function groups
+    /// with synthetic common names. By default every real PDB identity and
+    /// alias is retained.
+    #[arg(long)]
+    pub coalesce_common_functions: bool,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -97,6 +103,7 @@ fn main() -> anyhow::Result<()> {
         contribution_manifest,
         unresolved_data_manifest,
         recover_data_relocs_from_pdb,
+        coalesce_common_functions,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -124,6 +131,7 @@ fn main() -> anyhow::Result<()> {
         contribution_manifest.as_deref(),
         unresolved_data_manifest.as_deref(),
         recover_data_relocs_from_pdb,
+        coalesce_common_functions,
     )?;
 
     Ok(())
@@ -141,10 +149,11 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     contribution_manifest_path: Option<&std::path::Path>,
     unresolved_data_manifest_path: Option<&std::path::Path>,
     recover_data_relocs_from_pdb: bool,
+    coalesce_common_functions: bool,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
-    let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
+    let pdb_symbols = PdbSymbols::parse(&env, &mut pdb, coalesce_common_functions)?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path)?;
     let contribution_manifest =
         contribution_manifest::ContributionManifest::load(contribution_manifest_path)?;

@@ -15,14 +15,18 @@ pub struct PdbSymbols {
 }
 
 impl PdbSymbols {
-    pub fn parse<S>(env: &Env, pdb: &mut pdb2::PDB<'static, S>) -> anyhow::Result<Self>
+    pub fn parse<S>(
+        env: &Env,
+        pdb: &mut pdb2::PDB<'static, S>,
+        coalesce_common_functions: bool,
+    ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
     {
         let mut this = Self::default();
 
         this.iterate_symbol_table(env)?;
-        this.iterate_modules(env, pdb)?;
+        this.iterate_modules(env, pdb, coalesce_common_functions)?;
 
         Ok(this)
     }
@@ -63,7 +67,7 @@ impl PdbSymbols {
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { function, .. }) if function => {
                     assert_eq!(offset.section, env.text.id);
 
-                    self.functions.entry(symbol_rva).or_default().push(name);
+                    Self::push_function_name(self.functions.entry(symbol_rva).or_default(), name);
                 }
 
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
@@ -131,6 +135,7 @@ impl PdbSymbols {
 
         env: &Env,
         pdb: &mut pdb2::PDB<'static, S>,
+        coalesce_common_functions: bool,
     ) -> anyhow::Result<()>
     where
         S: pdb2::Source<'static> + 'static,
@@ -152,10 +157,18 @@ impl PdbSymbols {
                         offset,
                         len,
                         ..
-                    })) => self.add_function_symbol(env, name, offset, len),
+                    })) => {
+                        self.add_function_symbol(env, name, offset, len, coalesce_common_functions)
+                    }
                     Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
                         name, offset, len, ..
-                    })) => self.add_function_symbol(env, name, offset, u32::from(len)),
+                    })) => self.add_function_symbol(
+                        env,
+                        name,
+                        offset,
+                        u32::from(len),
+                        coalesce_common_functions,
+                    ),
 
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
                         let symbol_rva = match () {
@@ -201,12 +214,23 @@ impl PdbSymbols {
         name: RawString<'static>,
         offset: pdb2::PdbInternalSectionOffset,
         size: u32,
+        coalesce_common_functions: bool,
     ) {
         let symbol_rva = env.text.rva + offset.offset.to_usize();
 
         let fun_offset_in_text = offset.offset.to_usize();
         let fun_body = &env.text.data[fun_offset_in_text..fun_offset_in_text + size.to_usize()];
 
+        self.add_function_at_rva(symbol_rva, name, fun_body, coalesce_common_functions);
+    }
+
+    fn add_function_at_rva(
+        &mut self,
+        symbol_rva: usize,
+        name: RawString<'static>,
+        fun_body: &[u8],
+        coalesce_common_functions: bool,
+    ) {
         #[rustfmt::skip]
         const COMMON_FUNCTION_RENAMES: &[(&[u8], &[u8])] = &[
             (b"empty_stub", &[0xC3]),
@@ -215,10 +239,14 @@ impl PdbSymbols {
             (b"vec_size",   &[0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3]),
         ];
 
-        let fun_rename = COMMON_FUNCTION_RENAMES
-            .iter()
-            .find(|(_, code)| *code == fun_body)
-            .map(|(name, _)| (*name).into());
+        let fun_rename = if coalesce_common_functions {
+            COMMON_FUNCTION_RENAMES
+                .iter()
+                .find(|(_, code)| *code == fun_body)
+                .map(|(name, _)| (*name).into())
+        } else {
+            None
+        };
 
         match self.functions.entry(symbol_rva) {
             btree_map::Entry::Vacant(entry) => {
@@ -226,8 +254,61 @@ impl PdbSymbols {
             }
             btree_map::Entry::Occupied(mut entry) => match fun_rename {
                 Some(fun_rename) => *entry.get_mut() = vec![fun_rename],
-                None => (),
+                None => Self::push_function_name(entry.get_mut(), name),
             },
+        }
+    }
+
+    fn push_function_name(names: &mut Vec<RawString<'static>>, name: RawString<'static>) {
+        if !names
+            .iter()
+            .any(|existing| existing.as_bytes() == name.as_bytes())
+        {
+            names.push(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMMON_FIXTURES: &[(&[u8], &[u8])] = &[
+        (b"empty_stub", &[0xC3]),
+        (b"identity", &[0x8B, 0x44, 0x24, 0x04, 0xC3]),
+        (b"vec_begin", &[0x8B, 0x0, 0xC3]),
+        (
+            b"vec_size",
+            &[0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3],
+        ),
+    ];
+
+    #[test]
+    fn common_byte_patterns_keep_real_names_and_aliases_by_default() {
+        for (index, (synthetic, body)) in COMMON_FIXTURES.iter().enumerate() {
+            let mut symbols = PdbSymbols::default();
+            let rva = 0x1000 + index;
+            symbols.add_function_at_rva(rva, b"real_a".as_slice().into(), body, false);
+            symbols.add_function_at_rva(rva, b"real_b".as_slice().into(), body, false);
+
+            let names = &symbols.functions[&rva];
+            assert_eq!(names.len(), 2);
+            assert_eq!(names[0].as_bytes(), b"real_a");
+            assert_eq!(names[1].as_bytes(), b"real_b");
+            assert!(names.iter().all(|name| name.as_bytes() != *synthetic));
+        }
+    }
+
+    #[test]
+    fn legacy_opt_in_coalesces_all_common_byte_patterns() {
+        for (index, (synthetic, body)) in COMMON_FIXTURES.iter().enumerate() {
+            let mut symbols = PdbSymbols::default();
+            let rva = 0x1000 + index;
+            symbols.add_function_at_rva(rva, b"real".as_slice().into(), body, true);
+
+            let names = &symbols.functions[&rva];
+            assert_eq!(names.len(), 1);
+            assert_eq!(names[0].as_bytes(), *synthetic);
         }
     }
 }
