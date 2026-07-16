@@ -105,6 +105,32 @@ impl RelocAliasManifest {
         self.aliases.get(&(function_rva, target_rva)).copied()
     }
 
+    pub fn resolve_function_alias(
+        &self,
+        function_rva: usize,
+        target_rva: usize,
+        overloads: &[RawString<'static>],
+        observed: &mut BTreeMap<(usize, usize), usize>,
+    ) -> anyhow::Result<Option<RawString<'static>>> {
+        let Some(alias) = self.get(function_rva, target_rva) else {
+            return Ok(None);
+        };
+        if alias.addend != 0 {
+            anyhow::bail!(
+                "function relocation alias {function_rva:#x}/{target_rva:#x} has non-zero addend {:#x}",
+                alias.addend
+            );
+        }
+        if !overloads.iter().any(|name| *name == alias.owner) {
+            anyhow::bail!(
+                "function relocation alias owner {} is absent at target RVA {target_rva:#x}",
+                alias.owner
+            );
+        }
+        *observed.entry((function_rva, target_rva)).or_default() += 1;
+        Ok(Some(alias.owner))
+    }
+
     pub fn validate_occurrences(
         &self,
         observed: &BTreeMap<(usize, usize), usize>,
@@ -182,5 +208,33 @@ mod tests {
                 .is_ok()
         );
         assert!(manifest.validate_occurrences(&BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn resolves_reviewed_function_alias() {
+        let manifest = RelocAliasManifest::parse(
+            b"function_rva\ttarget_rva\towner\taddend\toccurrences\tprovenance\n\
+              0x4a0f0\t0xe0130\t__write\t0\t2\treviewed-crt-alias\n",
+            Path::new("aliases.tsv"),
+        )
+        .unwrap();
+        let overloads = [
+            RawString::from(b"__write".as_slice()),
+            RawString::from(b"_write".as_slice()),
+        ];
+        let mut observed = BTreeMap::new();
+        assert_eq!(
+            manifest
+                .resolve_function_alias(0x4a0f0, 0xe0130, &overloads, &mut observed)
+                .unwrap(),
+            Some(RawString::from(b"__write".as_slice()))
+        );
+        assert_eq!(
+            manifest
+                .resolve_function_alias(0x4a0f0, 0xe0130, &overloads, &mut observed)
+                .unwrap(),
+            Some(RawString::from(b"__write".as_slice()))
+        );
+        assert!(manifest.validate_occurrences(&observed).is_ok());
     }
 }

@@ -185,7 +185,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         contribution_manifest::ContributionManifest::default()
     };
 
-    let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
+    let (coff_data, relocs_rva, mut observed_reloc_aliases) = relocs::resolve_absolute_relocations(
         &env,
         exe,
         &pdb_symbols,
@@ -221,7 +221,10 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &matcher,
         &data_manifest,
         &data_section_manifest,
+        &reloc_alias_manifest,
+        &mut observed_reloc_aliases,
     )?;
+    reloc_alias_manifest.validate_occurrences(&observed_reloc_aliases)?;
     object_files.write(output_path)?;
 
     // Target side: record the choices base will later try to reproduce.
