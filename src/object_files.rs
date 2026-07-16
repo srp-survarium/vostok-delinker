@@ -19,14 +19,15 @@ use object::{ComdatKind, SectionFlags, SectionKind};
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
+    zero_section_aux_checksums: bool,
 }
 
 pub struct ObjectFile {
     pub object: object::write::Object<'static>,
-    pub data_section_id: object::write::SectionId,
-    pub rdata_section_id: object::write::SectionId,
+    pub data_section_id: Option<object::write::SectionId>,
+    pub rdata_section_id: Option<object::write::SectionId>,
     pub bss_section_id: Option<object::write::SectionId>,
-    pub text_section_id: object::write::SectionId,
+    pub text_section_id: Option<object::write::SectionId>,
     pub topology_sections: HashMap<usize, TopologySection>,
     pub data_comdats: Vec<(usize, object::write::SectionId, u8)>,
     pub comdat_leaders: HashMap<usize, SymbolId>,
@@ -52,7 +53,7 @@ pub struct ObjectOffset {
 #[derive(Copy, Clone)]
 pub enum ObjectLocation {
     Offset(ObjectOffset),
-    Extern,
+    Extern(object::SymbolKind),
 }
 
 impl ObjectFiles<'_> {
@@ -77,6 +78,18 @@ impl ObjectFiles<'_> {
     {
         let mut this = Self {
             objects: HashMap::new(),
+            // object-rs emits modern JamCRC values in section-definition
+            // auxiliaries. The candidate manifest models MSVC 4.2 objects,
+            // whose corresponding field is always zero.
+            zero_section_aux_checksums: data_section_manifest.is_authoritative(),
+        };
+
+        let empty_object = || {
+            if data_section_manifest.is_authoritative() {
+                ObjectFile::manifest_empty(pad_empty_rdata)
+            } else {
+                ObjectFile::empty(pad_empty_rdata)
+            }
         };
 
         let mut sections_by_object = HashMap::<&[u8], Vec<DataSection>>::new();
@@ -113,7 +126,7 @@ impl ObjectFiles<'_> {
             let object_file = this
                 .objects
                 .entry(definition.object)
-                .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
+                .or_insert_with(empty_object);
             object_file.add_data_definition(*definition, coff_data)?;
         }
         for object_file in this.objects.values_mut() {
@@ -184,10 +197,7 @@ impl ObjectFiles<'_> {
                     observed_aliases,
                 )?;
 
-                let object_file = this
-                    .objects
-                    .entry(filename)
-                    .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
+                let object_file = this.objects.entry(filename).or_insert_with(empty_object);
 
                 let overloads = symbols
                     .functions
@@ -245,14 +255,47 @@ impl ObjectFiles<'_> {
 
             std::fs::create_dir_all(path.parent().unwrap())?;
             object_file.finish_data_comdats()?;
-            std::fs::write(&path, object_file.object.write()?)?;
+            let mut bytes = object_file.object.write()?;
+            if self.zero_section_aux_checksums {
+                zero_coff_section_aux_checksums(&mut bytes)?;
+            }
+            std::fs::write(&path, bytes)?;
         }
         Ok(())
     }
 }
 
 impl ObjectFile {
+    fn data_section(&mut self) -> object::write::SectionId {
+        *self.data_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(vec![], b".data".into(), SectionKind::Data)
+        })
+    }
+
+    fn rdata_section(&mut self) -> object::write::SectionId {
+        *self.rdata_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData)
+        })
+    }
+
+    fn text_section(&mut self) -> object::write::SectionId {
+        *self.text_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(vec![], b".text".into(), SectionKind::Text)
+        })
+    }
+
     fn empty(pad_rdata: bool) -> Self {
+        Self::empty_with_topology_mode(pad_rdata, false)
+    }
+
+    fn manifest_empty(pad_rdata: bool) -> Self {
+        Self::empty_with_topology_mode(pad_rdata, true)
+    }
+
+    fn empty_with_topology_mode(pad_rdata: bool, exact_topology: bool) -> Self {
         let mut object = object::write::Object::new(
             object::BinaryFormat::Coff,
             object::Architecture::I386,
@@ -260,17 +303,22 @@ impl ObjectFile {
         );
         object.set_mangling(object::write::Mangling::None);
 
-        let data_section_id = object.add_section(vec![], b".data".into(), SectionKind::Data);
-        let rdata_section_id =
-            object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
-        let text_section_id = object.add_section(vec![], b".text".into(), SectionKind::Text);
+        let (data_section_id, rdata_section_id, text_section_id) = if exact_topology {
+            (None, None, None)
+        } else {
+            (
+                Some(object.add_section(vec![], b".data".into(), SectionKind::Data)),
+                Some(object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData)),
+                Some(object.add_section(vec![], b".text".into(), SectionKind::Text)),
+            )
+        };
 
         // objdiff considers allocations to match if name is equal OR(!) offset
         // into reloc table is the same.
         //
         // This makes different relocations with different data and different names
         // to match, if they offsets match. These 4 bytes prevent that.
-        if pad_rdata {
+        if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
             object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
         }
 
@@ -394,14 +442,7 @@ impl ObjectFile {
                 data_comdats.push((section.ordinal, id, section.comdat_selection));
             }
         }
-        let data_section_id = data_section_id
-            .unwrap_or_else(|| object.add_section(vec![], b".data".into(), SectionKind::Data));
-        let rdata_section_id = rdata_section_id.unwrap_or_else(|| {
-            object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData)
-        });
-        let text_section_id = text_section_id
-            .unwrap_or_else(|| object.add_section(vec![], b".text".into(), SectionKind::Text));
-        if pad_rdata {
+        if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
             object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
         }
         Ok(Self {
@@ -606,7 +647,12 @@ impl ObjectFile {
                 RelocKind::Function { relative, .. } => relative,
                 _ => false,
             };
-            self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, relative)?;
+            self.add_relocation(
+                reloc_name,
+                ObjectLocation::Extern(reloc_kind.external_symbol_kind()),
+                reloc_offset,
+                relative,
+            )?;
             return Ok(());
         }
 
@@ -616,12 +662,18 @@ impl ObjectFile {
                 symbol: _,
                 relative,
             } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, relative)?;
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern(object::SymbolKind::Text),
+                    reloc_offset,
+                    relative,
+                )?;
             }
 
             RelocKind::ConstantString { symbol: _, data } => {
+                let rdata_section_id = self.rdata_section();
                 let const_offset_in_coff_rdata =
-                    self.append_section_data(self.rdata_section_id, data, 0x00);
+                    self.append_section_data(rdata_section_id, data, 0x00);
 
                 self.add_relocation(
                     reloc_name,
@@ -637,8 +689,9 @@ impl ObjectFile {
             } => {
                 let new_data =
                     bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
+                let rdata_section_id = self.rdata_section();
                 let const_offset_in_coff_rdata =
-                    self.append_section_data(self.rdata_section_id, &new_data, 0x00);
+                    self.append_section_data(rdata_section_id, &new_data, 0x00);
                 self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
@@ -684,7 +737,8 @@ impl ObjectFile {
                     let new_data = bytemuck::pod_read_unaligned::<[u8; 4]>(
                         &coff_data[target_rva..target_rva + 4],
                     );
-                    self.append_section_data(self.data_section_id, &new_data, 0x00)
+                    let data_section_id = self.data_section();
+                    self.append_section_data(data_section_id, &new_data, 0x00)
                 };
                 self.add_relocation(
                     reloc_name,
@@ -713,7 +767,12 @@ impl ObjectFile {
             }
 
             RelocKind::Import { symbol: _ } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, false)?;
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern(object::SymbolKind::Unknown),
+                    reloc_offset,
+                    false,
+                )?;
             }
         }
 
@@ -795,22 +854,28 @@ impl ObjectFile {
             }
         } else {
             match definition.storage {
-                DataStorage::Data => ObjectOffset {
-                    offset: self.object.append_section_data(
-                        self.data_section_id,
-                        &coff_data[definition.rva..definition_end],
-                        definition.alignment,
-                    ),
-                    section_id: self.data_section_id,
-                },
-                DataStorage::Rdata => ObjectOffset {
-                    offset: self.object.append_section_data(
-                        self.rdata_section_id,
-                        &coff_data[definition.rva..definition_end],
-                        definition.alignment,
-                    ),
-                    section_id: self.rdata_section_id,
-                },
+                DataStorage::Data => {
+                    let section_id = self.data_section();
+                    ObjectOffset {
+                        offset: self.object.append_section_data(
+                            section_id,
+                            &coff_data[definition.rva..definition_end],
+                            definition.alignment,
+                        ),
+                        section_id,
+                    }
+                }
+                DataStorage::Rdata => {
+                    let section_id = self.rdata_section();
+                    ObjectOffset {
+                        offset: self.object.append_section_data(
+                            section_id,
+                            &coff_data[definition.rva..definition_end],
+                            definition.alignment,
+                        ),
+                        section_id,
+                    }
+                }
                 DataStorage::Bss => {
                     let section_id = *self.bss_section_id.get_or_insert_with(|| {
                         self.object.add_section(
@@ -998,13 +1063,9 @@ impl ObjectFile {
         relative: bool,
     ) -> anyhow::Result<()> {
         let (value, kind, section) = match location {
-            ObjectLocation::Extern => (
-                0,
-                object::SymbolKind::Unknown,
-                object::write::SymbolSection::Undefined,
-            ),
+            ObjectLocation::Extern(kind) => (0, kind, object::write::SymbolSection::Undefined),
             ObjectLocation::Offset(ObjectOffset { offset, section_id }) => {
-                let kind = if section_id == self.text_section_id {
+                let kind = if Some(section_id) == self.text_section_id {
                     object::SymbolKind::Text
                 } else {
                     object::SymbolKind::Data
@@ -1069,7 +1130,8 @@ impl ObjectFile {
         aliases: &[RawString],
         body: &[u8],
     ) -> ObjectOffset {
-        let fun_offset_in_coff_text = self.append_section_data(self.text_section_id, body, 0x90);
+        let text_section_id = self.text_section();
+        let fun_offset_in_coff_text = self.append_section_data(text_section_id, body, 0x90);
 
         let mut names = vec![name];
         for alias in aliases {
@@ -1105,6 +1167,13 @@ enum Name<'a> {
 }
 
 impl<'a> RelocKind<'a> {
+    fn external_symbol_kind(self) -> object::SymbolKind {
+        match self {
+            Self::Function { .. } => object::SymbolKind::Text,
+            _ => object::SymbolKind::Unknown,
+        }
+    }
+
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
             Self::Function {
@@ -1171,6 +1240,57 @@ impl std::ops::Add<usize> for ObjectOffset {
 mod tests {
     use super::*;
     use object::{Object as _, ObjectComdat as _, ObjectSection as _, ObjectSymbol as _};
+
+    fn section_aux_checksums(bytes: &[u8]) -> Vec<u32> {
+        const SECTION_HEADER_SIZE: usize = 40;
+        const SYMBOL_SIZE: usize = 18;
+        let section_count = u16::from_le_bytes(bytes[2..4].try_into().unwrap()) as usize;
+        let symbol_table = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let symbol_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let optional_header = u16::from_le_bytes(bytes[16..18].try_into().unwrap()) as usize;
+        let section_table = 20 + optional_header;
+        let mut checksums = Vec::new();
+        let mut index = 0;
+        while index < symbol_count {
+            let symbol = symbol_table + index * SYMBOL_SIZE;
+            let section = i16::from_le_bytes(bytes[symbol + 12..symbol + 14].try_into().unwrap());
+            let storage = bytes[symbol + 16];
+            let aux_count = bytes[symbol + 17] as usize;
+            if storage == object::pe::IMAGE_SYM_CLASS_STATIC
+                && aux_count == 1
+                && section > 0
+                && section as usize <= section_count
+            {
+                let section_header = section_table + (section as usize - 1) * SECTION_HEADER_SIZE;
+                if bytes[symbol..symbol + 8] == bytes[section_header..section_header + 8] {
+                    let checksum = symbol + SYMBOL_SIZE + 8;
+                    checksums.push(u32::from_le_bytes(
+                        bytes[checksum..checksum + 4].try_into().unwrap(),
+                    ));
+                }
+            }
+            index += 1 + aux_count;
+        }
+        checksums
+    }
+
+    fn short_coff_symbol_type(bytes: &[u8], name: &[u8]) -> u16 {
+        assert!(name.len() <= 8);
+        let symbol_table = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let symbol_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let mut padded_name = [0_u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        let mut index = 0;
+        while index < symbol_count {
+            let symbol = symbol_table + index * 18;
+            let aux_count = bytes[symbol + 17] as usize;
+            if bytes[symbol..symbol + 8] == padded_name {
+                return u16::from_le_bytes(bytes[symbol + 14..symbol + 16].try_into().unwrap());
+            }
+            index += 1 + aux_count;
+        }
+        panic!("missing COFF symbol {}", String::from_utf8_lossy(name));
+    }
 
     #[test]
     fn topology_emits_distinct_data_sections_and_comdat_auxiliary_record() {
@@ -1262,7 +1382,18 @@ mod tests {
         }
         output.finish_data_comdats().unwrap();
 
-        let bytes = output.object.write().unwrap();
+        let mut bytes = output.object.write().unwrap();
+        assert!(
+            section_aux_checksums(&bytes)
+                .iter()
+                .any(|checksum| *checksum != 0)
+        );
+        assert_eq!(zero_coff_section_aux_checksums(&mut bytes).unwrap(), 3);
+        assert!(
+            section_aux_checksums(&bytes)
+                .iter()
+                .all(|checksum| *checksum == 0)
+        );
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let parsed_sections = object.sections().collect::<Vec<_>>();
         let section_names = parsed_sections
@@ -1299,6 +1430,41 @@ mod tests {
                 .name()
                 .unwrap(),
             "??_C@fixture"
+        );
+    }
+
+    #[test]
+    fn manifest_topology_does_not_invent_empty_data_sections() {
+        let sections = [DataSection {
+            object: b"SOURCE\\only_code.c",
+            ordinal: 1,
+            name: b".text",
+            rva: None,
+            size: 0,
+            alignment: 16,
+            characteristics: 0x6050_0020,
+            comdat_selection: 0,
+            associative_ordinal: None,
+            storage: None,
+        }];
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 0,
+            data: &[],
+        };
+        let mut output = ObjectFile::with_sections(&sections, empty, empty, &[], false).unwrap();
+        output.add_function(b"only_code".as_slice().into(), &[], &[0xc3]);
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            object
+                .sections()
+                .map(|section| section.name().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            [".text"]
         );
     }
 
@@ -1649,14 +1815,24 @@ mod tests {
     fn relocations_reuse_one_undefined_external_symbol() {
         let mut object = ObjectFile::empty(false);
         let bytes = [0_u8; 8];
-        let offset = object.append_section_data(object.text_section_id, &bytes, 0x90);
+        let offset = object.append_section_data(object.text_section_id.unwrap(), &bytes, 0x90);
         let name: RawString<'static> = b"external".as_slice().into();
 
         object
-            .add_relocation(name, ObjectLocation::Extern, offset, false)
+            .add_relocation(
+                name,
+                ObjectLocation::Extern(object::SymbolKind::Unknown),
+                offset,
+                false,
+            )
             .unwrap();
         object
-            .add_relocation(name, ObjectLocation::Extern, offset + 4, false)
+            .add_relocation(
+                name,
+                ObjectLocation::Extern(object::SymbolKind::Unknown),
+                offset + 4,
+                false,
+            )
             .unwrap();
 
         assert_eq!(object.symbols.len(), 1);
@@ -1685,10 +1861,15 @@ mod tests {
     #[test]
     fn cross_object_call_uses_real_folded_identity() {
         let mut caller = ObjectFile::empty(false);
-        let call_field = caller.append_section_data(caller.text_section_id, &[0; 4], 0x90);
+        let call_field = caller.append_section_data(caller.text_section_id.unwrap(), &[0; 4], 0x90);
         let callee: RawString<'static> = b"ret_a".as_slice().into();
         caller
-            .add_relocation(callee, ObjectLocation::Extern, call_field, true)
+            .add_relocation(
+                callee,
+                ObjectLocation::Extern(object::SymbolKind::Text),
+                call_field,
+                true,
+            )
             .unwrap();
 
         let bytes = caller.object.write().unwrap();
@@ -1701,6 +1882,31 @@ mod tests {
         let symbol = object.symbol_by_index(symbol_index).unwrap();
         assert_eq!(symbol.name().unwrap(), "ret_a");
         assert!(symbol.is_undefined());
+        assert_eq!(symbol.kind(), object::SymbolKind::Text);
+    }
+
+    #[test]
+    fn absolute_function_reference_is_still_typed_as_a_coff_function() {
+        let mut caller = ObjectFile::empty(false);
+        let field = caller.append_section_data(caller.text_section_id.unwrap(), &[0; 4], 0x90);
+        caller
+            .add_relocation(
+                b"fn_ptr".as_slice().into(),
+                ObjectLocation::Extern(object::SymbolKind::Text),
+                field,
+                false,
+            )
+            .unwrap();
+
+        let bytes = caller.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let symbol = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("fn_ptr"))
+            .unwrap();
+        assert!(symbol.is_undefined());
+        assert_eq!(symbol.kind(), object::SymbolKind::Text);
+        assert_eq!(short_coff_symbol_type(&bytes, b"fn_ptr"), 0x20);
     }
 }
 
@@ -1728,6 +1934,95 @@ fn append_with_padding(
     }
 
     offset
+}
+
+/// object-rs deliberately writes the modern COFF section checksum, but MSVC
+/// 4.2 leaves the checksum field in every section-definition auxiliary record
+/// at zero. Keep this as a narrow post-write normalization until object-rs
+/// exposes the field as a writer option.
+fn zero_coff_section_aux_checksums(bytes: &mut [u8]) -> anyhow::Result<usize> {
+    const FILE_HEADER_SIZE: usize = 20;
+    const SECTION_HEADER_SIZE: usize = 40;
+    const SYMBOL_SIZE: usize = 18;
+    const AUX_CHECKSUM_OFFSET: usize = 8;
+
+    let read_u16 = |offset: usize| -> anyhow::Result<u16> {
+        let value = bytes
+            .get(offset..offset + 2)
+            .ok_or_else(|| anyhow::anyhow!("truncated COFF header"))?;
+        Ok(u16::from_le_bytes(value.try_into().unwrap()))
+    };
+    let read_u32 = |offset: usize| -> anyhow::Result<u32> {
+        let value = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow::anyhow!("truncated COFF header"))?;
+        Ok(u32::from_le_bytes(value.try_into().unwrap()))
+    };
+
+    let section_count = read_u16(2)? as usize;
+    let symbol_table_offset = read_u32(8)? as usize;
+    let symbol_count = read_u32(12)? as usize;
+    let optional_header_size = read_u16(16)? as usize;
+    let section_table_offset = FILE_HEADER_SIZE
+        .checked_add(optional_header_size)
+        .ok_or_else(|| anyhow::anyhow!("COFF section table offset overflows"))?;
+    let section_table_end = section_table_offset
+        .checked_add(
+            section_count
+                .checked_mul(SECTION_HEADER_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("COFF section table size overflows"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("COFF section table extent overflows"))?;
+    let symbol_table_end = symbol_table_offset
+        .checked_add(
+            symbol_count
+                .checked_mul(SYMBOL_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("COFF symbol table size overflows"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("COFF symbol table extent overflows"))?;
+    if section_table_end > bytes.len() || symbol_table_end > bytes.len() {
+        anyhow::bail!("truncated COFF section or symbol table");
+    }
+
+    let mut index = 0;
+    let mut normalized = 0;
+    while index < symbol_count {
+        let symbol_offset = symbol_table_offset + index * SYMBOL_SIZE;
+        let section_number = i16::from_le_bytes(
+            bytes[symbol_offset + 12..symbol_offset + 14]
+                .try_into()
+                .unwrap(),
+        );
+        let storage_class = bytes[symbol_offset + 16];
+        let aux_count = bytes[symbol_offset + 17] as usize;
+        let next_index = index
+            .checked_add(1 + aux_count)
+            .ok_or_else(|| anyhow::anyhow!("COFF auxiliary symbol count overflows"))?;
+        if next_index > symbol_count {
+            anyhow::bail!("COFF auxiliary symbol extends beyond the symbol table");
+        }
+
+        // Section-definition symbols are static, name their own positive
+        // section number, and have one IMAGE_AUX_SYMBOL_SECTION record.
+        if storage_class == object::pe::IMAGE_SYM_CLASS_STATIC
+            && aux_count == 1
+            && section_number > 0
+            && section_number as usize <= section_count
+        {
+            let section_name_offset =
+                section_table_offset + (section_number as usize - 1) * SECTION_HEADER_SIZE;
+            if bytes[symbol_offset..symbol_offset + 8]
+                == bytes[section_name_offset..section_name_offset + 8]
+            {
+                let checksum_offset = symbol_offset + SYMBOL_SIZE + AUX_CHECKSUM_OFFSET;
+                bytes[checksum_offset..checksum_offset + 4].fill(0);
+                normalized += 1;
+            }
+        }
+        index = next_index;
+    }
+
+    Ok(normalized)
 }
 
 //

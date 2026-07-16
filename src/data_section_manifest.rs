@@ -27,6 +27,7 @@ pub struct DataSection {
 #[derive(Default)]
 pub struct DataSectionManifest {
     sections: Vec<DataSection>,
+    authoritative: bool,
 }
 
 impl DataSectionManifest {
@@ -270,11 +271,20 @@ impl DataSectionManifest {
                 );
             }
         }
-        Ok(Self { sections })
+        Ok(Self {
+            sections,
+            authoritative: true,
+        })
     }
 
     pub fn sections(&self) -> &[DataSection] {
         &self.sections
+    }
+
+    /// A supplied manifest is authoritative even when it contains no rows.
+    /// This distinguishes it from the legacy, absent-manifest fallback.
+    pub fn is_authoritative(&self) -> bool {
+        self.authoritative
     }
 }
 
@@ -328,6 +338,12 @@ mod tests {
             format!("{HEADER_TEXT}{rows}").as_bytes(),
             Path::new("test.tsv"),
         )
+    }
+
+    #[test]
+    fn supplied_manifest_is_authoritative_even_without_section_rows() {
+        assert!(!DataSectionManifest::default().is_authoritative());
+        assert!(parse("").unwrap().is_authoritative());
     }
 
     #[test]
