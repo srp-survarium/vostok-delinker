@@ -2,6 +2,7 @@
 
 mod contribution_manifest;
 mod data_manifest;
+mod data_section_manifest;
 mod object_files;
 mod pdb_symbols;
 mod relocs;
@@ -52,11 +53,16 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_manifest: Option<std::path::PathBuf>,
 
+    /// Candidate COFF section table and COMDAT metadata for target objects.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub data_section_manifest: Option<std::path::PathBuf>,
+
     /// Per-compiland PE contribution intervals used to disambiguate data owners.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub contribution_manifest: Option<std::path::PathBuf>,
 
-    /// Explicit contribution ranges where legacy PDB fallback remains allowed.
+    /// Compatibility-only storage ranges for legacy PDB fallback. Ignored by
+    /// the canonical candidate-manifest path.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub unresolved_data_manifest: Option<std::path::PathBuf>,
 
@@ -100,6 +106,7 @@ fn main() -> anyhow::Result<()> {
         write_symbol_map,
         read_symbol_map,
         data_manifest,
+        data_section_manifest,
         contribution_manifest,
         unresolved_data_manifest,
         recover_data_relocs_from_pdb,
@@ -128,6 +135,7 @@ fn main() -> anyhow::Result<()> {
         write_symbol_map.as_deref(),
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
+        data_section_manifest.as_deref(),
         contribution_manifest.as_deref(),
         unresolved_data_manifest.as_deref(),
         recover_data_relocs_from_pdb,
@@ -146,6 +154,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     write_symbol_map: Option<&std::path::Path>,
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
+    data_section_manifest_path: Option<&std::path::Path>,
     contribution_manifest_path: Option<&std::path::Path>,
     unresolved_data_manifest_path: Option<&std::path::Path>,
     recover_data_relocs_from_pdb: bool,
@@ -155,10 +164,15 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb, coalesce_common_functions)?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path)?;
+    let data_section_manifest =
+        data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
     let contribution_manifest =
         contribution_manifest::ContributionManifest::load(contribution_manifest_path)?;
-    let unresolved_data_manifest =
-        contribution_manifest::ContributionManifest::load(unresolved_data_manifest_path)?;
+    let unresolved_data_manifest = if recover_data_relocs_from_pdb {
+        contribution_manifest::ContributionManifest::load(unresolved_data_manifest_path)?
+    } else {
+        contribution_manifest::ContributionManifest::default()
+    };
 
     let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
         &env,
@@ -194,6 +208,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         pad_empty_rdata,
         &matcher,
         &data_manifest,
+        &data_section_manifest,
     )?;
     object_files.write(output_path)?;
 

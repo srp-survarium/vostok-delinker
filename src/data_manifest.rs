@@ -3,8 +3,10 @@ use pdb2::RawString;
 use std::collections::HashSet;
 use std::path::Path;
 
-const HEADER: &[u8] =
+const LEGACY_HEADER: &[u8] =
     b"name\tobject\trva\tsize\tstorage\talignment\tsection_offset\tscope\tprovenance";
+const SECTION_HEADER: &[u8] =
+    b"name\tobject\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope\tprovenance";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DataStorage {
@@ -27,6 +29,7 @@ pub struct DataDefinition {
     pub size: usize,
     pub storage: DataStorage,
     pub alignment: u64,
+    pub section_ordinal: Option<usize>,
     pub section_offset: Option<usize>,
     pub scope: DataScope,
     pub provisional: bool,
@@ -37,7 +40,6 @@ pub struct DataDefinition {
 pub struct DataManifest {
     definitions: Vec<DataDefinition>,
     names: HashSet<&'static [u8]>,
-    closed_groups: HashSet<(&'static [u8], DataStorage)>,
 }
 
 impl DataManifest {
@@ -55,6 +57,7 @@ impl DataManifest {
         let mut local_names = HashSet::new();
         let mut proved_rvas = HashSet::new();
         let mut saw_header = false;
+        let mut has_section_ordinals = false;
 
         for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
             let line_number = line_index + 1;
@@ -63,17 +66,18 @@ impl DataManifest {
                 continue;
             }
             if !saw_header {
-                if line != HEADER {
+                if line != LEGACY_HEADER && line != SECTION_HEADER {
                     anyhow::bail!(
                         "{}:{}: invalid data manifest header",
                         path.display(),
                         line_number
                     );
                 }
+                has_section_ordinals = line == SECTION_HEADER;
                 saw_header = true;
                 continue;
             }
-            if line == HEADER {
+            if line == LEGACY_HEADER || line == SECTION_HEADER {
                 anyhow::bail!(
                     "{}:{}: duplicate data manifest header",
                     path.display(),
@@ -82,18 +86,33 @@ impl DataManifest {
             }
 
             let columns = line.split(|byte| *byte == b'\t').collect::<Vec<_>>();
-            if columns.len() != 9 {
+            let expected_columns = if has_section_ordinals { 10 } else { 9 };
+            if columns.len() != expected_columns {
+                if has_section_ordinals {
+                    anyhow::bail!(
+                        "{}:{}: expected exactly ten tab-separated columns",
+                        path.display(),
+                        line_number,
+                    );
+                }
                 anyhow::bail!(
                     "{}:{}: expected exactly nine tab-separated columns",
                     path.display(),
-                    line_number
+                    line_number,
                 );
             }
+            let section_ordinal_column = if has_section_ordinals { Some(6) } else { None };
+            let section_offset_column = if has_section_ordinals { 7 } else { 6 };
+            let scope_column = if has_section_ordinals { 8 } else { 7 };
+            let provenance_column = if has_section_ordinals { 9 } else { 8 };
             validate_text(path, line_number, "name", columns[0])?;
             validate_text(path, line_number, "object", columns[1])?;
-            validate_text(path, line_number, "scope", columns[7])?;
-            validate_text(path, line_number, "provenance", columns[8])?;
-            if columns[0].is_empty() || columns[1].is_empty() || columns[8].is_empty() {
+            validate_text(path, line_number, "scope", columns[scope_column])?;
+            validate_text(path, line_number, "provenance", columns[provenance_column])?;
+            if columns[0].is_empty()
+                || columns[1].is_empty()
+                || columns[provenance_column].is_empty()
+            {
                 anyhow::bail!(
                     "{}:{}: name, object, and provenance must be non-empty",
                     path.display(),
@@ -150,12 +169,30 @@ impl DataManifest {
                     line_number
                 );
             }
-            let section_offset = if columns[6] == b"-" {
+            let section_ordinal = match section_ordinal_column {
+                Some(column) if columns[column] != b"-" => Some(parse_number(columns[column])?),
+                _ => None,
+            };
+            if section_ordinal == Some(0) {
+                anyhow::bail!(
+                    "{}:{}: section ordinal must be non-zero",
+                    path.display(),
+                    line_number
+                );
+            }
+            let section_offset = if columns[section_offset_column] == b"-" {
                 None
             } else {
-                Some(parse_number(columns[6])?)
+                Some(parse_number(columns[section_offset_column])?)
             };
-            let scope = match columns[7] {
+            if has_section_ordinals && section_ordinal.is_some() != section_offset.is_some() {
+                anyhow::bail!(
+                    "{}:{}: section ordinal/offset must both be present or absent",
+                    path.display(),
+                    line_number
+                );
+            }
+            let scope = match columns[scope_column] {
                 b"external" => DataScope::External,
                 b"local" => DataScope::Local,
                 value => anyhow::bail!(
@@ -165,10 +202,11 @@ impl DataManifest {
                     String::from_utf8_lossy(value)
                 ),
             };
-            let provisional = columns[8].starts_with(b"provisional-");
+            let provenance = columns[provenance_column];
+            let provisional = provenance.starts_with(b"provisional-");
             let address_authoritative = !provisional
-                || columns[8] == b"provisional-candidate-coff-public-anchor"
-                || columns[8]
+                || provenance == b"provisional-candidate-coff-public-anchor"
+                || provenance
                     .windows(b"source-reviewed-DATA".len())
                     .any(|window| window == b"source-reviewed-DATA");
             if address_authoritative && !proved_rvas.insert(rva) {
@@ -200,6 +238,7 @@ impl DataManifest {
                 size,
                 storage,
                 alignment,
+                section_ordinal,
                 section_offset,
                 scope,
                 provisional,
@@ -214,6 +253,7 @@ impl DataManifest {
             (
                 definition.object,
                 definition.storage,
+                definition.section_ordinal.unwrap_or(0),
                 definition.section_offset.unwrap_or(definition.rva),
                 definition.rva,
             )
@@ -228,20 +268,7 @@ impl DataManifest {
                 anyhow::bail!("overlapping data manifest definitions");
             }
         }
-        let closed_groups = definitions
-            .iter()
-            .filter_map(|definition| {
-                definition
-                    .section_offset
-                    .filter(|_| !definition.provisional)
-                    .map(|_| (definition.object, definition.storage))
-            })
-            .collect();
-        Ok(Self {
-            definitions,
-            names,
-            closed_groups,
-        })
+        Ok(Self { definitions, names })
     }
 
     pub fn definitions(&self) -> &[DataDefinition] {
@@ -273,8 +300,8 @@ impl DataManifest {
         object: Option<&[u8]>,
     ) -> Option<(DataDefinition, u32)> {
         let candidates = self.definitions.iter().copied().filter(|definition| {
-            storage.map_or(true, |expected| definition.storage == expected)
-                && object.map_or(true, |owner| definition.object == owner)
+            storage.is_none_or(|expected| definition.storage == expected)
+                && object.is_none_or(|owner| definition.object == owner)
         });
         let definition = candidates.min_by_key(|definition| {
             let contains = definition.rva <= rva && rva - definition.rva < definition.size;
@@ -286,10 +313,6 @@ impl DataManifest {
             )
         })?;
         Some((definition, (rva as u32).wrapping_sub(definition.rva as u32)))
-    }
-
-    pub fn is_closed(&self, object: &[u8], storage: DataStorage) -> bool {
-        self.closed_groups.contains(&(object, storage))
     }
 }
 
@@ -362,8 +385,19 @@ mod tests {
         assert_eq!(table.storage, DataStorage::Data);
         assert_eq!(table.alignment, 4);
         assert!(parsed.contains_name(b"constant"));
-        assert!(parsed.is_closed(b"engine\\constants.c", DataStorage::Rdata));
-        assert!(!parsed.is_closed(b"engine\\world.c", DataStorage::Data));
+        assert_eq!(table.section_offset, None);
+    }
+
+    #[test]
+    fn accepts_section_ordinal_and_section_local_value() {
+        let parsed = parse(concat!(
+            "name\tobject\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope\tprovenance\n",
+            "literal\tengine/world.c\t0x120\t4\tdata\t4\t5\t0\texternal\treviewed\n",
+        ))
+        .unwrap();
+        let definition = parsed.definitions()[0];
+        assert_eq!(definition.section_ordinal, Some(5));
+        assert_eq!(definition.section_offset, Some(0));
     }
 
     #[test]
@@ -515,8 +549,8 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(parsed.definitions().len(), 2);
-        assert!(!parsed.is_closed(b"one.c", DataStorage::Data));
-        assert!(parsed.is_closed(b"two.c", DataStorage::Data));
+        assert!(parsed.definitions().iter().any(|row| row.provisional));
+        assert!(parsed.definitions().iter().any(|row| !row.provisional));
         assert_eq!(
             parsed.owner_and_addend_for_rva(0x110).unwrap().0.object,
             b"two.c"
@@ -533,7 +567,7 @@ mod tests {
             parsed.owner_and_addend_for_rva(0x100).unwrap().0.object,
             b"u.c"
         );
-        assert!(!parsed.is_closed(b"u.c", DataStorage::Data));
+        assert!(parsed.definitions()[0].provisional);
     }
 
     #[test]
