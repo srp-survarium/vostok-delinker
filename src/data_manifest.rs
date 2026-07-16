@@ -168,7 +168,8 @@ impl DataManifest {
             let provisional = columns[8].starts_with(b"provisional-");
             let address_authoritative = !provisional
                 || columns[8] == b"provisional-candidate-coff-public-anchor"
-                || columns[8].windows(b"source-reviewed-DATA".len())
+                || columns[8]
+                    .windows(b"source-reviewed-DATA".len())
                     .any(|window| window == b"source-reviewed-DATA");
             if address_authoritative && !proved_rvas.insert(rva) {
                 anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
@@ -178,13 +179,15 @@ impl DataManifest {
                 DataScope::External if !external_names.insert(name) => {
                     anyhow::bail!(
                         "{}:{}: duplicate external data name",
-                        path.display(), line_number
+                        path.display(),
+                        line_number
                     );
                 }
                 DataScope::Local if !local_names.insert((object, name)) => {
                     anyhow::bail!(
                         "{}:{}: duplicate local data name in owner",
-                        path.display(), line_number
+                        path.display(),
+                        line_number
                     );
                 }
                 _ => {}
@@ -459,11 +462,13 @@ mod tests {
             "{HEADER_TEXT}local\ta.c\t0x100\t4\tdata\t4\t0\tlocal\tone\n\
              local\ta.c\t0x104\t4\tdata\t4\t4\tlocal\ttwo\n"
         );
-        assert!(parse(&duplicate)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("duplicate local data name in owner"));
+        assert!(
+            parse(&duplicate)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("duplicate local data name in owner")
+        );
     }
 
     #[test]
@@ -512,7 +517,10 @@ mod tests {
         assert_eq!(parsed.definitions().len(), 2);
         assert!(!parsed.is_closed(b"one.c", DataStorage::Data));
         assert!(parsed.is_closed(b"two.c", DataStorage::Data));
-        assert_eq!(parsed.owner_and_addend_for_rva(0x110).unwrap().0.object, b"two.c");
+        assert_eq!(
+            parsed.owner_and_addend_for_rva(0x110).unwrap().0.object,
+            b"two.c"
+        );
     }
 
     #[test]
@@ -521,7 +529,10 @@ mod tests {
             "source\tu.c\t0x100\t4\tdata\t4\t0\texternal\tprovisional-source-reviewed-DATA",
         ))
         .unwrap();
-        assert_eq!(parsed.owner_and_addend_for_rva(0x100).unwrap().0.object, b"u.c");
+        assert_eq!(
+            parsed.owner_and_addend_for_rva(0x100).unwrap().0.object,
+            b"u.c"
+        );
         assert!(!parsed.is_closed(b"u.c", DataStorage::Data));
     }
 

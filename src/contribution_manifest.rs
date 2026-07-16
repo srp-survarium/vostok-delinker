@@ -228,7 +228,10 @@ SOURCE\\ONE.c\tbss\t0x300\t0x10\t3\t.data\ttest\n";
     fn storage_classes_do_not_alias() {
         let manifest = ContributionManifest::parse(MANIFEST, Path::new("test.tsv")).unwrap();
         assert!(!manifest.same_owner(ContributionStorage::Bss, 0x200, 0x300));
-        assert_eq!(manifest.storage_for_rva(0x30f), Some(ContributionStorage::Bss));
+        assert_eq!(
+            manifest.storage_for_rva(0x30f),
+            Some(ContributionStorage::Bss)
+        );
     }
 
     #[test]

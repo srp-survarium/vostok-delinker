@@ -69,8 +69,7 @@ impl ObjectFiles<'_> {
                 DataStorage::Data | DataStorage::Bss => env.data,
             };
             if !definition.provisional
-                && (definition.rva < section.rva
-                    || definition_end > section.rva + section.size)
+                && (definition.rva < section.rva || definition_end > section.rva + section.size)
             {
                 anyhow::bail!("data manifest storage does not match the PE section");
             }
@@ -775,7 +774,8 @@ impl<'a> RelocKind<'a> {
         }
     }
 
-    #[cfg(test)] fn recovered_data_storage(self) -> Option<DataStorage> {
+    #[cfg(test)]
+    fn recovered_data_storage(self) -> Option<DataStorage> {
         match self {
             Self::ConstantString { .. } | Self::Constant { .. } => Some(DataStorage::Rdata),
             Self::Static {
@@ -819,7 +819,10 @@ mod tests {
     #[test]
     fn permissive_pdb_recovery_preserves_all_data_storage_classes() {
         let symbol: RawString<'static> = b"fixture".as_slice().into();
-        let rdata = RelocKind::Constant { symbol, target_rva: 0x100 };
+        let rdata = RelocKind::Constant {
+            symbol,
+            target_rva: 0x100,
+        };
         let data = RelocKind::Static {
             symbol,
             target_rva: 0x200,
