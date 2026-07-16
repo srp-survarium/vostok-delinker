@@ -160,27 +160,27 @@ impl DataSectionManifest {
                 );
             }
             if let Some(storage) = storage {
-                let (expected_name, required, forbidden) = match storage {
+                let (name_matches, required, forbidden) = match storage {
                     SectionStorage::Data => (
-                        b".data".as_slice(),
+                        name == b".data" || name.starts_with(b".CRT$"),
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA,
                     ),
                     SectionStorage::Rdata => (
-                        b".rdata".as_slice(),
+                        name == b".rdata",
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                     ),
                     SectionStorage::Bss => (
-                        b".bss".as_slice(),
+                        name == b".bss",
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
                     ),
                 };
-                if name != expected_name
+                if !name_matches
                     || characteristics & required != required
                     || characteristics & forbidden != 0
                 {
@@ -359,6 +359,13 @@ mod tests {
             .is_err()
         );
         assert!(parse("a.c\t1\t.rdata\t0x100\t4\t4\t0xc0300040\t0\t-\trdata\ttest\n").is_err());
+    }
+
+    #[test]
+    fn accepts_linker_sorted_initialized_writable_sections() {
+        let manifest =
+            parse("a.c\t1\t.CRT$XCU\t0x100\t4\t4\t0xc0300040\t0\t-\tdata\ttest\n").unwrap();
+        assert_eq!(manifest.sections()[0].storage, Some(SectionStorage::Data));
     }
 
     #[test]
