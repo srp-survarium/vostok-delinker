@@ -2,6 +2,7 @@ use crate::Env;
 use crate::contribution_manifest::{ContributionManifest, ContributionStorage};
 use crate::data_manifest::{DataManifest, DataStorage};
 use crate::pdb_symbols;
+use crate::reloc_alias_manifest::RelocAliasManifest;
 use crate::utils::ToUsize;
 
 use pdb2::RawString;
@@ -105,6 +106,30 @@ fn resolve_data_alias(
     Ok(Some((addend, owner)))
 }
 
+fn resolve_manifest_alias(
+    aliases: &RelocAliasManifest,
+    symbols: &BTreeMap<usize, RawString<'static>>,
+    functions: &BTreeMap<usize, Vec<RawString<'static>>>,
+    observed: &mut BTreeMap<(usize, usize), usize>,
+    reloc_rva: usize,
+    target_rva: usize,
+) -> anyhow::Result<Option<(u32, RawString<'static>, usize)>> {
+    let Some((function_rva, _)) = functions.range(..=reloc_rva).next_back() else {
+        return Ok(None);
+    };
+    let Some(alias) = aliases.get(*function_rva, target_rva) else {
+        return Ok(None);
+    };
+    *observed.entry((*function_rva, target_rva)).or_default() += 1;
+    let Some((owner_rva, _)) = symbols.iter().find(|(_, name)| **name == alias.owner) else {
+        anyhow::bail!("relocation alias owner is absent: {}", alias.owner);
+    };
+    if (*owner_rva as u32).wrapping_add(alias.addend) != target_rva as u32 {
+        anyhow::bail!("relocation alias owner/addend does not resolve to target");
+    }
+    Ok(Some((alias.addend, alias.owner, *owner_rva)))
+}
+
 fn closest_data_symbol<'a>(
     symbols: &'a BTreeMap<usize, RawString<'static>>,
     target_rva: usize,
@@ -161,6 +186,7 @@ pub fn resolve_absolute_relocations<'s>(
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
     contributions: &ContributionManifest,
+    reloc_aliases: &RelocAliasManifest,
     unresolved: &ContributionManifest,
     recover_data_relocs_from_pdb: bool,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
@@ -171,6 +197,7 @@ pub fn resolve_absolute_relocations<'s>(
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
+    let mut observed_aliases = BTreeMap::<(usize, usize), usize>::new();
 
     let mut pos = 0;
     let reloc_data = reloc_sec.data()?;
@@ -235,6 +262,24 @@ pub fn resolve_absolute_relocations<'s>(
                     );
                 }
                 () if (env.rdata.rva..env.rdata.rva + env.rdata.size).contains(&target_rva) => {
+                    if let Some((addend, owner, _owner_rva)) = resolve_manifest_alias(
+                        reloc_aliases,
+                        &symbols.constants,
+                        &symbols.functions,
+                        &mut observed_aliases,
+                        reloc_rva,
+                        target_rva,
+                    )? {
+                        coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Constant {
+                                symbol: owner,
+                                target_rva,
+                            },
+                        );
+                        continue;
+                    }
                     if let Some((owner, addend)) =
                         data_manifest.owner_and_addend_for_rva(target_rva)
                     {
@@ -337,6 +382,39 @@ pub fn resolve_absolute_relocations<'s>(
                     };
                 }
                 () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
+                    if let Some((addend, owner, owner_rva)) = resolve_manifest_alias(
+                        reloc_aliases,
+                        &symbols.statics,
+                        &symbols.functions,
+                        &mut observed_aliases,
+                        reloc_rva,
+                        target_rva,
+                    )? {
+                        let storage = contributions
+                            .storage_for_rva(owner_rva)
+                            .or_else(|| retail_storage_for_rva(env, owner_rva))
+                            .filter(|storage| {
+                                matches!(
+                                    storage,
+                                    ContributionStorage::Data | ContributionStorage::Bss
+                                )
+                            })
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "relocation alias owner {owner_rva:#x} has no writable storage"
+                                )
+                            })?;
+                        coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Static {
+                                symbol: owner,
+                                target_rva,
+                                storage,
+                            },
+                        );
+                        continue;
+                    }
                     if let Some((owner, addend)) =
                         data_manifest.owner_and_addend_for_rva(target_rva)
                     {
@@ -445,6 +523,7 @@ pub fn resolve_absolute_relocations<'s>(
         }
     }
 
+    reloc_aliases.validate_occurrences(&observed_aliases)?;
     Ok((coff_data, relocs_rva))
 }
 

@@ -5,6 +5,7 @@ mod data_manifest;
 mod data_section_manifest;
 mod object_files;
 mod pdb_symbols;
+mod reloc_alias_manifest;
 mod relocs;
 mod symbol_matcher;
 mod utils;
@@ -61,6 +62,11 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub contribution_manifest: Option<std::path::PathBuf>,
 
+    /// Exact encoded-address to symbol/addend spellings. These reviewed aliases
+    /// take precedence over ordinary nearest-symbol and data-owner selection.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub reloc_alias_manifest: Option<std::path::PathBuf>,
+
     /// Compatibility-only storage ranges for legacy PDB fallback. Ignored by
     /// the canonical candidate-manifest path.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
@@ -108,6 +114,7 @@ fn main() -> anyhow::Result<()> {
         data_manifest,
         data_section_manifest,
         contribution_manifest,
+        reloc_alias_manifest,
         unresolved_data_manifest,
         recover_data_relocs_from_pdb,
         coalesce_common_functions,
@@ -137,6 +144,7 @@ fn main() -> anyhow::Result<()> {
         data_manifest.as_deref(),
         data_section_manifest.as_deref(),
         contribution_manifest.as_deref(),
+        reloc_alias_manifest.as_deref(),
         unresolved_data_manifest.as_deref(),
         recover_data_relocs_from_pdb,
         coalesce_common_functions,
@@ -156,6 +164,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     data_manifest_path: Option<&std::path::Path>,
     data_section_manifest_path: Option<&std::path::Path>,
     contribution_manifest_path: Option<&std::path::Path>,
+    reloc_alias_manifest_path: Option<&std::path::Path>,
     unresolved_data_manifest_path: Option<&std::path::Path>,
     recover_data_relocs_from_pdb: bool,
     coalesce_common_functions: bool,
@@ -168,6 +177,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
     let contribution_manifest =
         contribution_manifest::ContributionManifest::load(contribution_manifest_path)?;
+    let reloc_alias_manifest =
+        reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
     let unresolved_data_manifest = if recover_data_relocs_from_pdb {
         contribution_manifest::ContributionManifest::load(unresolved_data_manifest_path)?
     } else {
@@ -180,6 +191,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &pdb_symbols,
         &data_manifest,
         &contribution_manifest,
+        &reloc_alias_manifest,
         &unresolved_data_manifest,
         recover_data_relocs_from_pdb,
     )?;
