@@ -67,7 +67,9 @@ always determine:
 - the complete byte extent of a standalone data definition;
 - whether the original allocation was `.data`, `.rdata`, or `.bss`;
 - its original alignment;
-- the translation unit that should own the complete definition.
+- the translation unit that should own the complete definition;
+- its position in the candidate object's storage section;
+- whether its COFF symbol has external or compilation-local scope.
 
 A reconstruction project that has reviewed those facts supplies them with
 `--data-manifest`. The PDB continues to provide symbol and module topology; the
@@ -106,11 +108,11 @@ lines beginning with `#` are ignored. The first non-comment line must be this
 exact ASCII header:
 
 ```text
-object	rva	size	storage	alignment
+object	rva	size	storage	alignment	section_offset	scope
 ```
 
 Vostok parses the complete byte input with a `nom` grammar for LF/CRLF line
-boundaries and the exact five-field row shape. It then applies semantic checks
+boundaries and the exact seven-field row shape. It then applies semantic checks
 for paths, numbers, storage, extents, uniqueness, and overlap.
 
 Each subsequent line defines one complete allocation:
@@ -122,6 +124,8 @@ Each subsequent line defines one complete allocation:
 | `size` | Complete allocation extent in bytes, in decimal or `0x` hexadecimal notation. |
 | `storage` | `data`, `rdata`, or `bss`. |
 | `alignment` | Required byte alignment; it must be a non-zero power of two. |
+| `section_offset` | Expected byte offset in the candidate object's storage section, or `-` when that topology has not been reviewed. Numeric offsets control emission order and are verified against the emitted COFF object. |
+| `scope` | `external` for a linkage-visible COFF symbol or `local` for a compilation-local symbol. |
 
 Start RVAs must be unique. Extents must be non-zero, non-overlapping,
 non-overflowing, and contained in the corresponding linked PE section. Storage
@@ -131,21 +135,24 @@ PE base relocation.
 Example:
 
 ```text
-object	rva	size	storage	alignment
-vendor\zlib\infutil.c	0x00123450	0x44	data	0x4
+object	rva	size	storage	alignment	section_offset	scope
+vendor\zlib\infutil.c	0x00123450	0x44	data	0x4	0x20	local
 ```
 
 This says that the existing PDB data symbol at RVA `0x00123450` is a 68-byte
-initialized definition, aligned to four bytes and owned by
+initialized definition, aligned to four bytes, compilation-local, located at
+offset `0x20` in its candidate `.data` section, and owned by
 `vendor\zlib\infutil.c.obj`. The manifest does not supply or invent its name.
 
 ### What the manifest improves
 
 For each row Vostok copies the complete `.data` or `.rdata` payload, or allocates
 the complete `.bss` extent, in the named object. It defines the existing PDB
-symbol at that location with the reviewed size and alignment and keeps references
-from other objects external. A reference to an interior address is represented
-as that PDB symbol plus its in-place COFF addend.
+symbol at that location with the reviewed size, alignment, and scope and keeps
+references from other objects external. Numeric candidate offsets order definitions
+within each object's storage section and reject a layout that emits a different
+offset. A reference to an interior address is represented as that PDB symbol plus
+its in-place COFF addend.
 
 Relocation sites are not invented by the manifest. Vostok starts from existing
 PE `HIGHLOW` base-relocation entries, resolves their data targets through the
@@ -160,6 +167,6 @@ table was emitted as a four-byte fragment and matched its compiler definition at
 `0.7782101%`. Supplying its single reviewed manifest row emitted all 1,024 bytes
 in the owner object and matched the definition at `100.0%`.
 
-The manifest restores reviewed definitions; it does not by itself reconstruct
-multiple original data sections, COMDAT grouping, or section ordering. Those are
-separate pieces of COFF topology.
+The manifest restores reviewed definitions and their order within each emitted
+storage section. It does not by itself reconstruct multiple same-name original
+sections or COMDAT grouping. Those are separate pieces of COFF topology.

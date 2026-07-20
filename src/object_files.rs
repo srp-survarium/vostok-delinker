@@ -1,5 +1,5 @@
 use crate::Env;
-use crate::data_manifest::{DataDefinition, DataManifest, DataStorage};
+use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::{RelocKind, RelocationEncoding};
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
@@ -70,7 +70,9 @@ impl ObjectFiles<'_> {
             objects: HashMap::new(),
         };
 
-        for definition in data_manifest.definitions() {
+        let definitions = data_manifest.definitions_in_emission_order();
+
+        for definition in &definitions {
             let definition_end = definition.rva.checked_add(definition.size).unwrap();
             let section = match definition.storage {
                 DataStorage::Rdata => env.rdata,
@@ -85,7 +87,7 @@ impl ObjectFiles<'_> {
                 .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
             object_file.add_data_definition(*definition, coff_data)?;
         }
-        for definition in data_manifest.definitions() {
+        for definition in &definitions {
             this.objects
                 .get_mut(definition.object)
                 .unwrap()
@@ -575,19 +577,34 @@ impl ObjectFile {
                 ObjectOffset { offset, section_id }
             }
         };
+        if let Some(expected) = definition.section_offset
+            && offset.offset.to_usize() != expected
+        {
+            anyhow::bail!(
+                "candidate data topology mismatch for {}: expected section offset {expected:#x}, emitted {:#x}",
+                definition.symbol_name,
+                offset.offset,
+            );
+        }
         if self
             .object
             .symbol_id(definition.symbol_name.as_bytes())
             .is_some()
         {
-            anyhow::bail!("duplicate PDB data symbol in owner object");
+            anyhow::bail!(
+                "duplicate PDB data symbol {} in owner object",
+                definition.symbol_name
+            );
         }
         self.object.add_symbol(object::write::Symbol {
             name: definition.symbol_name.as_bytes().to_vec(),
             value: offset.offset,
             size: definition.size.to_u64(),
             kind: object::SymbolKind::Data,
-            scope: object::SymbolScope::Linkage,
+            scope: match definition.scope {
+                DataScope::External => object::SymbolScope::Linkage,
+                DataScope::Local => object::SymbolScope::Compilation,
+            },
             weak: false,
             section: object::write::SymbolSection::Section(offset.section_id),
             flags: object::SymbolFlags::None,
@@ -840,5 +857,46 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
             })
             .collect::<Vec<_>>(),
         () => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn definition(scope: DataScope, section_offset: usize) -> DataDefinition {
+        DataDefinition {
+            symbol_name: RawString::from(&b"fixture"[..]),
+            object: b"fixture.c",
+            rva: 0,
+            size: 4,
+            storage: DataStorage::Data,
+            alignment: 4,
+            section_offset: Some(section_offset),
+            scope,
+        }
+    }
+
+    #[test]
+    fn emits_reviewed_compilation_scope() {
+        let mut object = ObjectFile::empty(false);
+        object
+            .add_data_definition(definition(DataScope::Local, 0), &[1, 2, 3, 4])
+            .unwrap();
+        let symbol_id = object.object.symbol_id(b"fixture").unwrap();
+        assert_eq!(
+            object.object.symbol(symbol_id).scope,
+            object::SymbolScope::Compilation
+        );
+    }
+
+    #[test]
+    fn rejects_a_candidate_offset_that_was_not_emitted() {
+        let mut object = ObjectFile::empty(false);
+        let error = object
+            .add_data_definition(definition(DataScope::External, 4), &[1, 2, 3, 4])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("expected section offset 0x4, emitted 0x0"));
     }
 }

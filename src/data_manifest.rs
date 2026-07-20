@@ -11,7 +11,7 @@ use pdb2::RawString;
 use std::collections::HashSet;
 use std::path::Path;
 
-const HEADER: &[u8] = b"object\trva\tsize\tstorage\talignment";
+const HEADER: &[u8] = b"object\trva\tsize\tstorage\talignment\tsection_offset\tscope";
 
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
@@ -20,6 +20,8 @@ struct ManifestRow<'a> {
     size: &'a [u8],
     storage: &'a [u8],
     alignment: &'a [u8],
+    section_offset: &'a [u8],
+    scope: &'a [u8],
 }
 
 fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
@@ -35,7 +37,9 @@ fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
-    let (input, (object, rva, size, storage, alignment)) = (
+    let (input, (object, rva, size, storage, alignment, section_offset, scope)) = (
+        terminated(field, tag(&b"\t"[..])),
+        terminated(field, tag(&b"\t"[..])),
         terminated(field, tag(&b"\t"[..])),
         terminated(field, tag(&b"\t"[..])),
         terminated(field, tag(&b"\t"[..])),
@@ -52,15 +56,23 @@ fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
             size,
             storage,
             alignment,
+            section_offset,
+            scope,
         },
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum DataStorage {
     Data,
     Rdata,
     Bss,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataScope {
+    External,
+    Local,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,6 +83,8 @@ pub struct DataDefinition {
     pub size: usize,
     pub storage: DataStorage,
     pub alignment: u64,
+    pub section_offset: Option<usize>,
+    pub scope: DataScope,
 }
 
 #[derive(Default)]
@@ -121,7 +135,7 @@ impl DataManifest {
 
             let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
                 anyhow::anyhow!(
-                    "{}:{}: expected exactly five tab-separated columns",
+                    "{}:{}: expected exactly seven tab-separated columns",
                     path.display(),
                     line_number
                 )
@@ -182,11 +196,34 @@ impl DataManifest {
                     line_number
                 );
             }
+            let section_offset = if row.section_offset == b"-" {
+                None
+            } else {
+                let offset = parse_number(row.section_offset)?;
+                if offset.checked_add(size).is_none() {
+                    anyhow::bail!(
+                        "{}:{}: candidate data extent overflows the object section",
+                        path.display(),
+                        line_number
+                    );
+                }
+                Some(offset)
+            };
+            let scope = match row.scope {
+                b"external" => DataScope::External,
+                b"local" => DataScope::Local,
+                value => anyhow::bail!(
+                    "{}:{}: unsupported scope {}",
+                    path.display(),
+                    line_number,
+                    String::from_utf8_lossy(value)
+                ),
+            };
             if !rvas.insert(rva) {
                 anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
             }
 
-            let name = match storage {
+            let symbol_name = match storage {
                 DataStorage::Data | DataStorage::Bss => symbols.statics.get(&rva).copied(),
                 DataStorage::Rdata => symbols
                     .constants
@@ -204,12 +241,14 @@ impl DataManifest {
 
             let object: &'static [u8] = object.into_bytes().leak();
             definitions.push(DataDefinition {
-                symbol_name: name,
+                symbol_name,
                 object,
                 rva,
                 size,
                 storage,
                 alignment,
+                section_offset,
+                scope,
             });
         }
         if !saw_header {
@@ -225,8 +264,22 @@ impl DataManifest {
         Ok(Self { definitions })
     }
 
+    #[cfg(test)]
     pub fn definitions(&self) -> &[DataDefinition] {
         &self.definitions
+    }
+
+    pub fn definitions_in_emission_order(&self) -> Vec<DataDefinition> {
+        let mut definitions = self.definitions.clone();
+        definitions.sort_unstable_by_key(|definition| {
+            (
+                definition.object,
+                definition.storage,
+                definition.section_offset.unwrap_or(definition.rva),
+                definition.rva,
+            )
+        });
+        definitions
     }
 
     pub fn owner_and_addend_for_rva(&self, rva: usize) -> Option<(DataDefinition, usize)> {
@@ -267,7 +320,7 @@ fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
 
-    const HEADER_TEXT: &str = "object\trva\tsize\tstorage\talignment\n";
+    const HEADER_TEXT: &str = "object\trva\tsize\tstorage\talignment\tsection_offset\tscope\n";
 
     fn symbols() -> PdbSymbols {
         let mut symbols = PdbSymbols::default();
@@ -309,10 +362,10 @@ mod tests {
     fn accepts_comments_crlf_paths_and_all_storage_classes() {
         let text = concat!(
             "# generated evidence\r\n",
-            "object\trva\tsize\tstorage\talignment\r\n",
-            "engine/world.c\t0x100\t0x20\tdata\t0x4\r\n",
-            "engine/constants.c\t0X200\t16\trdata\t8\r\n",
-            "engine/state.c\t0x300\t4\tbss\t1\r\n",
+            "object\trva\tsize\tstorage\talignment\tsection_offset\tscope\r\n",
+            "engine/world.c\t0x100\t0x20\tdata\t0x4\t0\texternal\r\n",
+            "engine/constants.c\t0X200\t16\trdata\t8\t-\tlocal\r\n",
+            "engine/state.c\t0x300\t4\tbss\t1\t0\texternal\r\n",
         );
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.definitions().len(), 3);
@@ -324,18 +377,26 @@ mod tests {
         assert_eq!(table.object, b"engine\\world.c");
         assert_eq!(table.storage, DataStorage::Data);
         assert_eq!(table.alignment, 4);
+        assert_eq!(table.section_offset, Some(0));
         assert!(
             parsed
                 .definitions()
                 .iter()
                 .any(|row| row.symbol_name.as_bytes() == b"constant")
         );
+        let constant = parsed
+            .definitions()
+            .iter()
+            .find(|row| row.symbol_name.as_bytes() == b"constant")
+            .unwrap();
+        assert_eq!(constant.section_offset, None);
+        assert_eq!(constant.scope, DataScope::Local);
     }
 
     #[test]
     fn accepts_missing_final_line_ending_and_uses_raw_pdb_symbol_bytes() {
         let mut bytes = HEADER.to_vec();
-        bytes.extend_from_slice(b"\nu.c\t0x180\t4\tdata\t4");
+        bytes.extend_from_slice(b"\nu.c\t0x180\t4\tdata\t4\t0\texternal");
         let parsed = DataManifest::parse(&bytes, Path::new("test.tsv"), &symbols()).unwrap();
         assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"\x80raw");
     }
@@ -343,7 +404,7 @@ mod tests {
     #[test]
     fn rejects_bare_carriage_return_line_endings() {
         let mut bytes = HEADER.to_vec();
-        bytes.extend_from_slice(b"\ru.c\t0x100\t4\tdata\t4");
+        bytes.extend_from_slice(b"\ru.c\t0x100\t4\tdata\t4\t0\texternal");
         let error = DataManifest::parse(&bytes, Path::new("test.tsv"), &symbols())
             .err()
             .unwrap()
@@ -383,8 +444,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_column_counts() {
-        assert!(error("u.c\t0x100\t4\tdata").contains("exactly five"));
-        assert!(error("u.c\t0x100\t4\tdata\t4\textra").contains("exactly five"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t0").contains("exactly seven"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t0\texternal\textra").contains("exactly seven"));
     }
 
     #[test]
@@ -399,7 +460,7 @@ mod tests {
             "a/./u.c",
             "a//u.c",
         ] {
-            let row = format!("{object}\t0x100\t4\tdata\t4");
+            let row = format!("{object}\t0x100\t4\tdata\t4\t0\texternal");
             assert!(
                 error(&row).contains("relative and normalized"),
                 "accepted {object}"
@@ -409,20 +470,25 @@ mod tests {
 
     #[test]
     fn rejects_nul_and_control_bytes_in_text_fields() {
-        for row in ["a\0b.c\t0x100\t4\tdata\t4", "u\x7f.c\t0x100\t4\tdata\t4"] {
+        for row in [
+            "a\0b.c\t0x100\t4\tdata\t4\t0\texternal",
+            "u\x7f.c\t0x100\t4\tdata\t4\t0\texternal",
+        ] {
             assert!(error(row).contains("control byte"));
         }
     }
 
     #[test]
     fn rejects_allocations_without_compatible_pdb_symbols() {
-        assert!(error("u.c\t0x101\t4\tdata\t4").contains("PDB data symbol"));
-        assert!(error("u.c\t0x100\t4\trdata\t4").contains("PDB data symbol"));
+        assert!(error("u.c\t0x101\t4\tdata\t4\t0\texternal").contains("PDB data symbol"));
+        assert!(error("u.c\t0x100\t4\trdata\t4\t0\texternal").contains("PDB data symbol"));
     }
 
     #[test]
     fn rejects_duplicate_rvas() {
-        let text = format!("{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\ntwo.c\t0x100\t4\tdata\t4\n");
+        let text = format!(
+            "{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t0\texternal\ntwo.c\t0x100\t4\tdata\t4\t0\texternal\n"
+        );
         assert!(
             parse(&text)
                 .err()
@@ -434,7 +500,9 @@ mod tests {
 
     #[test]
     fn rejects_overlaps_across_owner_objects() {
-        let text = format!("{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\ntwo.c\t0x110\t4\tdata\t4\n");
+        let text = format!(
+            "{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\t0\texternal\ntwo.c\t0x110\t4\tdata\t4\t0\texternal\n"
+        );
         assert!(
             parse(&text)
                 .err()
@@ -446,27 +514,32 @@ mod tests {
 
     #[test]
     fn accepts_adjacent_extents_across_owner_objects() {
-        let text = format!("{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\ntwo.c\t0x120\t4\tdata\t4\n");
+        let text = format!(
+            "{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\t0\texternal\ntwo.c\t0x120\t4\tdata\t4\t0\texternal\n"
+        );
         assert_eq!(parse(&text).unwrap().definitions().len(), 2);
     }
 
     #[test]
     fn rejects_extent_overflow_and_zero_size() {
-        let overflow = format!("u.c\t{}\t2\tdata\t4", usize::MAX);
+        let overflow = format!("u.c\t{}\t2\tdata\t4\t0\texternal", usize::MAX);
         assert!(error(&overflow).contains("overflows"));
-        assert!(error("u.c\t0x100\t0\tdata\t4").contains("non-zero"));
+        assert!(error("u.c\t0x100\t0\tdata\t4\t0\texternal").contains("non-zero"));
+        let offset_overflow = format!("u.c\t0x100\t4\tdata\t4\t{}\texternal", usize::MAX);
+        assert!(error(&offset_overflow).contains("object section"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t0\tglobal").contains("unsupported scope"));
     }
 
     #[test]
     fn rejects_zero_and_non_power_of_two_alignment() {
-        assert!(error("u.c\t0x100\t4\tdata\t0").contains("power of two"));
-        assert!(error("u.c\t0x100\t4\tdata\t3").contains("power of two"));
+        assert!(error("u.c\t0x100\t4\tdata\t0\t0\texternal").contains("power of two"));
+        assert!(error("u.c\t0x100\t4\tdata\t3\t0\texternal").contains("power of two"));
     }
 
     #[test]
     fn resolves_interior_owner_and_addend_at_exact_boundaries() {
         let parsed = parse(&format!(
-            "{HEADER_TEXT}v.c\t0x140\t0x10\tdata\t4\nu.c\t0x100\t0x20\tdata\t4\n"
+            "{HEADER_TEXT}v.c\t0x140\t0x10\tdata\t4\t0\texternal\nu.c\t0x100\t0x20\tdata\t4\t0\texternal\n"
         ))
         .unwrap();
         assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"table");
@@ -482,5 +555,19 @@ mod tests {
         assert_eq!(parsed.owner_and_addend_for_rva(0x140).unwrap().1, 0);
         assert_eq!(parsed.owner_and_addend_for_rva(0x14f).unwrap().1, 0xf);
         assert!(parsed.owner_and_addend_for_rva(0x150).is_none());
+    }
+
+    #[test]
+    fn candidate_offsets_control_emission_without_changing_the_rva_index() {
+        let parsed = parse(&format!(
+            "{HEADER_TEXT}u.c\t0x100\t4\tdata\t4\t4\texternal\nu.c\t0x140\t4\tdata\t4\t0\texternal\n"
+        ))
+        .unwrap();
+        assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"table");
+        assert_eq!(parsed.definitions()[1].symbol_name.as_bytes(), b"later");
+
+        let emission = parsed.definitions_in_emission_order();
+        assert_eq!(emission[0].symbol_name.as_bytes(), b"later");
+        assert_eq!(emission[1].symbol_name.as_bytes(), b"table");
     }
 }
