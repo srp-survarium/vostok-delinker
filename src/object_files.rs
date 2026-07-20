@@ -1,7 +1,7 @@
 use crate::Env;
 use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
 use crate::data_section_manifest::{
-    ComdatSelection, DataSection, DataSectionManifest, SectionStorage,
+    ComdatSelection, DataSection, DataSectionManifest, SectionStorage, SectionTopology,
 };
 use crate::pdb_symbols::PdbSymbols;
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
@@ -24,10 +24,10 @@ pub struct ObjectFiles<'a> {
 
 pub struct ObjectFile {
     pub object: object::write::Object<'static>,
-    pub data_section_id: object::write::SectionId,
-    pub rdata_section_id: object::write::SectionId,
+    pub data_section_id: Option<object::write::SectionId>,
+    pub rdata_section_id: Option<object::write::SectionId>,
     pub bss_section_id: Option<object::write::SectionId>,
-    pub text_section_id: object::write::SectionId,
+    pub text_section_id: Option<object::write::SectionId>,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
     topology_sections: Vec<EmittedTopologySection>,
     definition_ranges: Vec<Vec<(usize, usize)>>,
@@ -97,6 +97,8 @@ impl ObjectFiles<'_> {
         let mut this = Self {
             objects: HashMap::new(),
         };
+        let topology = data_section_manifest.topology();
+        let empty_object = || ObjectFile::empty_with_topology(pad_empty_rdata, topology);
 
         let mut sections_by_object = HashMap::<&[u8], Vec<DataSection>>::new();
         for section in data_section_manifest.sections() {
@@ -132,7 +134,7 @@ impl ObjectFiles<'_> {
             let object_file = this
                 .objects
                 .entry(definition.object)
-                .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
+                .or_insert_with(empty_object);
             object_file.add_data_definition(*definition, coff_data)?;
         }
         for object_file in this.objects.values_mut() {
@@ -203,10 +205,7 @@ impl ObjectFiles<'_> {
                     observed_aliases,
                 )?;
 
-                let object_file = this
-                    .objects
-                    .entry(filename)
-                    .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
+                let object_file = this.objects.entry(filename).or_insert_with(empty_object);
 
                 let overloads = symbols
                     .functions
@@ -271,7 +270,28 @@ impl ObjectFiles<'_> {
 }
 
 impl ObjectFile {
-    fn empty(pad_rdata: bool) -> Self {
+    fn data_section(&mut self) -> object::write::SectionId {
+        *self.data_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(Vec::new(), b".data".into(), SectionKind::Data)
+        })
+    }
+
+    fn rdata_section(&mut self) -> object::write::SectionId {
+        *self.rdata_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData)
+        })
+    }
+
+    fn text_section(&mut self) -> object::write::SectionId {
+        *self.text_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(Vec::new(), b".text".into(), SectionKind::Text)
+        })
+    }
+
+    fn empty_with_topology(pad_rdata: bool, topology: SectionTopology) -> Self {
         let mut object = object::write::Object::new(
             object::BinaryFormat::Coff,
             object::Architecture::I386,
@@ -279,17 +299,21 @@ impl ObjectFile {
         );
         object.set_mangling(object::write::Mangling::None);
 
-        let data_section_id = object.add_section(vec![], b".data".into(), SectionKind::Data);
-        let rdata_section_id =
-            object.add_section(vec![], b".rdata".into(), SectionKind::ReadOnlyData);
-        let text_section_id = object.add_section(vec![], b".text".into(), SectionKind::Text);
+        let (data_section_id, rdata_section_id, text_section_id) = match topology {
+            SectionTopology::Synthesized => (
+                Some(object.add_section(Vec::new(), b".data".into(), SectionKind::Data)),
+                Some(object.add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData)),
+                Some(object.add_section(Vec::new(), b".text".into(), SectionKind::Text)),
+            ),
+            SectionTopology::Exact => (None, None, None),
+        };
 
         // objdiff considers allocations to match if name is equal OR(!) offset
         // into reloc table is the same.
         //
         // This makes different relocations with different data and different names
         // to match, if they offsets match. These 4 bytes prevent that.
-        if pad_rdata {
+        if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
             object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
         }
 
@@ -415,14 +439,7 @@ impl ObjectFile {
             }
         }
 
-        let data_section_id = data_section_id
-            .unwrap_or_else(|| object.add_section(Vec::new(), b".data".into(), SectionKind::Data));
-        let rdata_section_id = rdata_section_id.unwrap_or_else(|| {
-            object.add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData)
-        });
-        let text_section_id = text_section_id
-            .unwrap_or_else(|| object.add_section(Vec::new(), b".text".into(), SectionKind::Text));
-        if pad_rdata {
+        if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
             object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
         }
 
@@ -662,8 +679,9 @@ impl ObjectFile {
             }
 
             RelocKind::ConstantString { symbol: _, data } => {
+                let rdata_section_id = self.rdata_section();
                 let const_offset_in_coff_rdata =
-                    self.append_section_data(self.rdata_section_id, data, 0x00);
+                    self.append_section_data(rdata_section_id, data, 0x00);
 
                 self.add_relocation(
                     reloc_name,
@@ -680,8 +698,9 @@ impl ObjectFile {
             } => {
                 let new_data =
                     bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
+                let rdata_section_id = self.rdata_section();
                 let const_offset_in_coff_rdata =
-                    self.append_section_data(self.rdata_section_id, &new_data, 0x00);
+                    self.append_section_data(rdata_section_id, &new_data, 0x00);
                 self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
@@ -713,8 +732,9 @@ impl ObjectFile {
             } => {
                 let new_data =
                     bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
+                let data_section_id = self.data_section();
                 let static_offset_in_coff_data =
-                    self.append_section_data(self.data_section_id, &new_data, 0x00);
+                    self.append_section_data(data_section_id, &new_data, 0x00);
                 self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(static_offset_in_coff_data),
@@ -818,22 +838,28 @@ impl ObjectFile {
             }
         } else {
             match definition.storage {
-                DataStorage::Data => ObjectOffset {
-                    offset: self.object.append_section_data(
-                        self.data_section_id,
-                        &coff_data[definition.rva..definition_end],
-                        definition.alignment,
-                    ),
-                    section_id: self.data_section_id,
-                },
-                DataStorage::Rdata => ObjectOffset {
-                    offset: self.object.append_section_data(
-                        self.rdata_section_id,
-                        &coff_data[definition.rva..definition_end],
-                        definition.alignment,
-                    ),
-                    section_id: self.rdata_section_id,
-                },
+                DataStorage::Data => {
+                    let section_id = self.data_section();
+                    ObjectOffset {
+                        offset: self.object.append_section_data(
+                            section_id,
+                            &coff_data[definition.rva..definition_end],
+                            definition.alignment,
+                        ),
+                        section_id,
+                    }
+                }
+                DataStorage::Rdata => {
+                    let section_id = self.rdata_section();
+                    ObjectOffset {
+                        offset: self.object.append_section_data(
+                            section_id,
+                            &coff_data[definition.rva..definition_end],
+                            definition.alignment,
+                        ),
+                        section_id,
+                    }
+                }
                 DataStorage::Bss => {
                     let section_id = *self.bss_section_id.get_or_insert_with(|| {
                         self.object.add_section(
@@ -1043,7 +1069,7 @@ impl ObjectFile {
                 object::write::SymbolSection::Undefined,
             ),
             ObjectLocation::Offset(ObjectOffset { offset, section_id }) => {
-                let kind = if section_id == self.text_section_id {
+                let kind = if Some(section_id) == self.text_section_id {
                     object::SymbolKind::Text
                 } else {
                     object::SymbolKind::Data
@@ -1113,7 +1139,8 @@ impl ObjectFile {
         aliases: &[RawString],
         body: &[u8],
     ) -> ObjectOffset {
-        let fun_offset_in_coff_text = self.append_section_data(self.text_section_id, body, 0x90);
+        let text_section_id = self.text_section();
+        let fun_offset_in_coff_text = self.append_section_data(text_section_id, body, 0x90);
 
         let mut names = vec![name];
         for alias in aliases {
@@ -1264,7 +1291,7 @@ mod tests {
 
     #[test]
     fn emits_reviewed_compilation_scope() {
-        let mut object = ObjectFile::empty(false);
+        let mut object = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
         object
             .add_data_definition(definition(DataScope::Local, 0), &[1, 2, 3, 4])
             .unwrap();
@@ -1277,7 +1304,7 @@ mod tests {
 
     #[test]
     fn rejects_a_candidate_offset_that_was_not_emitted() {
-        let mut object = ObjectFile::empty(false);
+        let mut object = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
         let error = object
             .add_data_definition(definition(DataScope::External, 4), &[1, 2, 3, 4])
             .unwrap_err()
@@ -1287,8 +1314,9 @@ mod tests {
 
     #[test]
     fn repeated_external_relocations_reuse_one_undefined_symbol() {
-        let mut object = ObjectFile::empty(false);
-        let offset = object.append_section_data(object.text_section_id, &[0; 8], 0x90);
+        let mut object = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let text_section_id = object.text_section();
+        let offset = object.append_section_data(text_section_id, &[0; 8], 0x90);
         let name = RawString::from(&b"external"[..]);
 
         object
@@ -1320,7 +1348,7 @@ mod tests {
 
     #[test]
     fn folded_function_emits_all_pdb_aliases_at_one_offset() {
-        let mut output = ObjectFile::empty(false);
+        let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
         let primary = RawString::from(&b"real_a"[..]);
         let aliases = [primary, RawString::from(&b"real_b"[..])];
         output.add_function(primary, &aliases, &[0xc3]);
@@ -1434,6 +1462,41 @@ mod tests {
                 .name()
                 .unwrap(),
             "fold"
+        );
+    }
+
+    #[test]
+    fn exact_topology_does_not_invent_empty_sections() {
+        let sections = [DataSection {
+            object: b"SOURCE\\only_code.c",
+            ordinal: 1,
+            name: b".text",
+            rva: None,
+            size: 0,
+            alignment: 16,
+            characteristics: 0x6050_0020,
+            comdat_selection: ComdatSelection::None,
+            associative_ordinal: None,
+            storage: None,
+        }];
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 0,
+            data: &[],
+        };
+        let mut output = ObjectFile::with_sections(&sections, empty, empty, &[], false).unwrap();
+        output.add_function(RawString::from(&b"only_code"[..]), &[], &[0xc3]);
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            object
+                .sections()
+                .map(|section| section.name().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            [".text"]
         );
     }
 

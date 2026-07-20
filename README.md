@@ -177,6 +177,11 @@ ranges, and COMDAT relationships. The PDB still owns symbol names. Data-manifest
 rows bind definitions to these sections by ordinal and offset; the section
 manifest never creates or renames a definition.
 
+When this manifest is supplied, its section table is exact: Vostok does not add
+unused `.data`, `.rdata`, or `.text` sections that are absent from its rows. A
+section needed by emitted content is created only when that content is actually
+encountered. Without the manifest, Vostok synthesizes its default section set.
+
 Vostok materializes affine `.data`, `.rdata`, and `.bss` ranges directly from
 the linked image. For a storage-assigned section without an affine RVA, it
 creates the complete candidate extent, places every reviewed data-manifest
