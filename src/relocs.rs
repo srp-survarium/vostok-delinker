@@ -1,6 +1,7 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
 use crate::pdb_symbols;
+use crate::reloc_alias_manifest::RelocAliasManifest;
 use crate::utils::ToUsize;
 
 use pdb2::RawString;
@@ -47,6 +48,44 @@ pub enum ManifestCoverage {
     RequireComplete,
 }
 
+fn resolve_manifest_alias(
+    aliases: &RelocAliasManifest,
+    symbols: &BTreeMap<usize, RawString<'static>>,
+    functions: &BTreeMap<usize, Vec<RawString<'static>>>,
+    observed: &mut BTreeMap<(usize, usize), usize>,
+    reloc_rva: usize,
+    target_rva: usize,
+) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
+    let Some((function_rva, _)) = functions.range(..=reloc_rva).next_back() else {
+        return Ok(None);
+    };
+    let Some(alias) = aliases.get(*function_rva, target_rva) else {
+        return Ok(None);
+    };
+
+    let mut owners = symbols
+        .iter()
+        .filter(|(_, symbol_name)| **symbol_name == alias.owner);
+    let Some((owner_rva, _)) = owners.next() else {
+        anyhow::bail!(
+            "relocation alias owner is absent from the PDB: {}",
+            alias.owner
+        );
+    };
+    if owners.next().is_some() {
+        anyhow::bail!(
+            "relocation alias owner is ambiguous in the PDB: {}",
+            alias.owner
+        );
+    }
+    if (*owner_rva as u32).wrapping_add(alias.addend) != target_rva as u32 {
+        anyhow::bail!("relocation alias owner/addend does not resolve to target");
+    }
+
+    *observed.entry((*function_rva, target_rva)).or_default() += 1;
+    Ok(Some((alias.addend, alias.owner)))
+}
+
 #[repr(C)]
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
 struct RelocHeader {
@@ -66,6 +105,7 @@ pub fn resolve_absolute_relocations<'s>(
     exe: &'static object::read::pe::PeFile32<'static>,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
     let Some(reloc_sec) = exe.section_by_name(".reloc") else {
@@ -75,6 +115,7 @@ pub fn resolve_absolute_relocations<'s>(
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
+    let mut observed_aliases = BTreeMap::<(usize, usize), usize>::new();
 
     let mut pos = 0;
     let reloc_data = reloc_sec.data()?;
@@ -138,6 +179,26 @@ pub fn resolve_absolute_relocations<'s>(
                     );
                 }
                 () if (env.rdata.rva..env.rdata.rva + env.rdata.size).contains(&target_rva) => {
+                    if (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
+                        && let Some((addend, owner)) = resolve_manifest_alias(
+                            reloc_aliases,
+                            &symbols.constants,
+                            &symbols.functions,
+                            &mut observed_aliases,
+                            reloc_rva,
+                            target_rva,
+                        )?
+                    {
+                        coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Constant {
+                                symbol: owner,
+                                target_rva,
+                            },
+                        );
+                        continue;
+                    }
                     let owner = data_manifest.owner_and_addend_for_rva(target_rva);
                     match (manifest_coverage, owner) {
                         (_, Some((owner, addend))) => {
@@ -200,6 +261,26 @@ pub fn resolve_absolute_relocations<'s>(
                     }
                 }
                 () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
+                    if (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
+                        && let Some((addend, owner)) = resolve_manifest_alias(
+                            reloc_aliases,
+                            &symbols.statics,
+                            &symbols.functions,
+                            &mut observed_aliases,
+                            reloc_rva,
+                            target_rva,
+                        )?
+                    {
+                        coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(
+                            reloc_rva,
+                            RelocKind::Static {
+                                symbol: owner,
+                                target_rva,
+                            },
+                        );
+                        continue;
+                    }
                     let owner = data_manifest.owner_and_addend_for_rva(target_rva);
                     match (manifest_coverage, owner) {
                         (_, Some((owner, addend))) => {
@@ -250,6 +331,7 @@ pub fn resolve_absolute_relocations<'s>(
         }
     }
 
+    reloc_aliases.validate_occurrences(&observed_aliases)?;
     Ok((coff_data, relocs_rva))
 }
 
