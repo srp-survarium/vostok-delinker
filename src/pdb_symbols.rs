@@ -10,6 +10,8 @@ pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
     function_extents: BTreeMap<usize, usize>,
     incremental_trampolines: BTreeMap<usize, PdbIncrementalTrampoline>,
+    text_data: HashMap<PdbModuleIndex, BTreeMap<usize, PdbTextData>>,
+    text_symbols: HashMap<PdbModuleIndex, BTreeMap<usize, Vec<PdbTextSymbol>>>,
     pub imports: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
@@ -21,6 +23,39 @@ pub struct PdbSymbols {
 struct PdbIncrementalTrampoline {
     target_rva: usize,
     size: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PdbModuleIndex(usize);
+
+impl PdbModuleIndex {
+    pub(crate) const fn new(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PdbTextSymbolScope {
+    Local,
+    Global,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PdbTextSymbolKind {
+    Data,
+    Label,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PdbTextSymbol {
+    pub name: RawString<'static>,
+    pub scope: PdbTextSymbolScope,
+    pub kind: PdbTextSymbolKind,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PdbTextData {
+    size: Option<usize>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -214,8 +249,11 @@ impl PdbSymbols {
         S: pdb2::Source<'static> + 'static,
     {
         let mut modules = env.dbi.modules()?;
+        let mut module_ordinal = 0;
 
         while let Some(module) = modules.next()? {
+            let module_index = PdbModuleIndex::new(module_ordinal);
+            module_ordinal += 1;
             let Some(module_info) = pdb.module_info(&module)? else {
                 continue;
             };
@@ -243,6 +281,7 @@ impl PdbSymbols {
                     })) => self.add_incremental_trampoline(env, thunk, target, size.into())?,
 
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol {
+                        global,
                         offset,
                         name,
                         type_index,
@@ -253,6 +292,9 @@ impl PdbSymbols {
                             continue;
                         }
                         let symbol_rva = match () {
+                            () if offset.section == env.text.id => {
+                                env.text.rva + offset.offset.to_usize()
+                            }
                             () if offset.section == env.rdata.id => {
                                 env.rdata.rva + offset.offset.to_usize()
                             }
@@ -263,6 +305,19 @@ impl PdbSymbols {
                         };
 
                         match () {
+                            () if offset.section == env.text.id => {
+                                self.add_text_data_at_rva(
+                                    module_index,
+                                    symbol_rva,
+                                    name,
+                                    type_sizes.size_of(type_index),
+                                    if global {
+                                        PdbTextSymbolScope::Global
+                                    } else {
+                                        PdbTextSymbolScope::Local
+                                    },
+                                )?;
+                            }
                             () if offset.section == env.rdata.id => {
                                 let _old_symbol = self.constants.insert(
                                     symbol_rva,
@@ -280,6 +335,19 @@ impl PdbSymbols {
                             }
                             _ => continue,
                         };
+                    }
+
+                    Ok(pdb2::SymbolData::Label(pdb2::LabelSymbol { offset, name, .. }))
+                        if offset.section == env.text.id =>
+                    {
+                        let symbol_rva = env.text.rva + offset.offset.to_usize();
+                        self.add_text_symbol_at_rva(
+                            module_index,
+                            symbol_rva,
+                            name,
+                            PdbTextSymbolScope::Local,
+                            PdbTextSymbolKind::Label,
+                        );
                     }
 
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })) => {
@@ -442,6 +510,143 @@ impl PdbSymbols {
 
     pub fn is_incremental_trampoline(&self, rva: usize) -> bool {
         self.incremental_trampolines.contains_key(&rva)
+    }
+
+    pub(crate) fn add_text_data_at_rva(
+        &mut self,
+        module: PdbModuleIndex,
+        symbol_rva: usize,
+        name: RawString<'static>,
+        size: Option<usize>,
+        scope: PdbTextSymbolScope,
+    ) -> anyhow::Result<()> {
+        if let Some(size) = size {
+            symbol_rva
+                .checked_add(size)
+                .ok_or_else(|| anyhow::anyhow!("PDB text data extent overflows RVA"))?;
+        }
+        let text_data = self.text_data.entry(module).or_default();
+        match text_data.entry(symbol_rva) {
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(PdbTextData { size });
+            }
+            btree_map::Entry::Occupied(mut entry) => match (entry.get().size, size) {
+                (Some(left), Some(right)) if left != right => anyhow::bail!(
+                    "PDB text data records at RVA {symbol_rva:#x} disagree on size: {left} and {right}"
+                ),
+                (None, Some(_)) => entry.get_mut().size = size,
+                _ => {}
+            },
+        }
+        let kind = if name.as_bytes().starts_with(b"$L") {
+            PdbTextSymbolKind::Label
+        } else {
+            PdbTextSymbolKind::Data
+        };
+        self.add_text_symbol_at_rva(module, symbol_rva, name, scope, kind);
+        Ok(())
+    }
+
+    pub(crate) fn add_text_symbol_at_rva(
+        &mut self,
+        module: PdbModuleIndex,
+        symbol_rva: usize,
+        name: RawString<'static>,
+        scope: PdbTextSymbolScope,
+        kind: PdbTextSymbolKind,
+    ) {
+        let symbols = self
+            .text_symbols
+            .entry(module)
+            .or_default()
+            .entry(symbol_rva)
+            .or_default();
+        if !symbols.iter().any(|symbol| {
+            symbol.name.as_bytes() == name.as_bytes()
+                && symbol.scope == scope
+                && symbol.kind == kind
+        }) {
+            symbols.push(PdbTextSymbol { name, scope, kind });
+        }
+    }
+
+    pub(crate) fn function_extent(&self, function_rva: usize) -> Option<std::ops::Range<usize>> {
+        let size = self.function_extents.get(&function_rva).copied()?;
+        Some(function_rva..function_rva.checked_add(size)?)
+    }
+
+    fn text_data_extent(
+        &self,
+        module: PdbModuleIndex,
+        function_rva: usize,
+        data_rva: usize,
+    ) -> anyhow::Result<Option<std::ops::Range<usize>>> {
+        let Some(function_extent) = self.function_extent(function_rva) else {
+            return Ok(None);
+        };
+        if !function_extent.contains(&data_rva) {
+            return Ok(None);
+        }
+        let Some(text_data) = self.text_data.get(&module) else {
+            return Ok(None);
+        };
+        let Some(data) = text_data.get(&data_rva) else {
+            return Ok(None);
+        };
+        let next_start = text_data
+            .range(data_rva.saturating_add(1)..function_extent.end)
+            .next()
+            .map(|(rva, _)| *rva)
+            .unwrap_or(function_extent.end);
+        let end = match data.size {
+            Some(size) => data_rva
+                .checked_add(size)
+                .ok_or_else(|| anyhow::anyhow!("PDB text data extent overflows RVA"))?,
+            None => next_start,
+        };
+        anyhow::ensure!(
+            end <= next_start,
+            "PDB text data extent overlaps another text data record"
+        );
+        Ok(Some(data_rva..end))
+    }
+
+    pub(crate) fn text_data_extents(
+        &self,
+        module: PdbModuleIndex,
+        function_rva: usize,
+    ) -> anyhow::Result<Vec<std::ops::Range<usize>>> {
+        let Some(function_extent) = self.function_extent(function_rva) else {
+            return Ok(Vec::new());
+        };
+        let Some(text_data) = self.text_data.get(&module) else {
+            return Ok(Vec::new());
+        };
+        text_data
+            .range(function_extent)
+            .map(|(data_rva, _)| {
+                self.text_data_extent(module, function_rva, *data_rva)?
+                    .ok_or_else(|| anyhow::anyhow!("PDB text data has no containing procedure"))
+            })
+            .collect()
+    }
+
+    pub(crate) fn text_symbols(
+        &self,
+        module: PdbModuleIndex,
+    ) -> Option<&BTreeMap<usize, Vec<PdbTextSymbol>>> {
+        self.text_symbols.get(&module)
+    }
+
+    pub(crate) fn text_symbols_at_rva(
+        &self,
+        module: PdbModuleIndex,
+        rva: usize,
+    ) -> &[PdbTextSymbol] {
+        self.text_symbols(module)
+            .and_then(|symbols| symbols.get(&rva))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn relocation_field_in_function(
@@ -730,6 +935,141 @@ mod tests {
             .to_string();
         assert!(error.contains("RVA 0x1000 disagree on size: 32 and 36"));
         assert_eq!(symbols.functions[&0x1000].len(), 1);
+    }
+
+    #[test]
+    fn text_data_extent_uses_type_size_or_next_pdb_boundary() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"owner"[..]), Some(0x30))
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                0x1010,
+                RawString::from(&b"typed"[..]),
+                Some(8),
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                0x1020,
+                RawString::from(&b"untyped"[..]),
+                None,
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+
+        assert_eq!(
+            symbols
+                .text_data_extent(PdbModuleIndex::new(0), 0x1000, 0x1010)
+                .unwrap(),
+            Some(0x1010..0x1018)
+        );
+        assert_eq!(
+            symbols
+                .text_data_extent(PdbModuleIndex::new(0), 0x1000, 0x1020)
+                .unwrap(),
+            Some(0x1020..0x1030)
+        );
+    }
+
+    #[test]
+    fn text_data_extent_rejects_overlap_with_next_record() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"owner"[..]), Some(0x30))
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                0x1010,
+                RawString::from(&b"left"[..]),
+                Some(0x18),
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                0x1020,
+                RawString::from(&b"right"[..]),
+                None,
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+
+        let error = symbols
+            .text_data_extent(PdbModuleIndex::new(0), 0x1000, 0x1010)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("overlaps another text data record"));
+    }
+
+    #[test]
+    fn msvc_compiler_text_data_name_keeps_coff_label_kind() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                0x1010,
+                RawString::from(&b"$L1193"[..]),
+                None,
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+
+        assert_eq!(
+            symbols.text_symbols[&PdbModuleIndex::new(0)][&0x1010][0].kind,
+            PdbTextSymbolKind::Label
+        );
+    }
+
+    #[test]
+    fn text_data_and_labels_remain_module_scoped_at_folded_rva() {
+        let left = PdbModuleIndex::new(0);
+        let right = PdbModuleIndex::new(1);
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"folded"[..]), Some(0x20))
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                left,
+                0x1010,
+                RawString::from(&b"$L_left"[..]),
+                Some(4),
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                right,
+                0x1010,
+                RawString::from(&b"$L_right"[..]),
+                Some(8),
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+
+        let left_extents = symbols.text_data_extents(left, 0x1000).unwrap();
+        let right_extents = symbols.text_data_extents(right, 0x1000).unwrap();
+        assert_eq!(left_extents.len(), 1);
+        assert_eq!(right_extents.len(), 1);
+        assert_eq!(left_extents[0], 0x1010..0x1014);
+        assert_eq!(right_extents[0], 0x1010..0x1018);
+        assert_eq!(
+            symbols.text_symbols_at_rva(left, 0x1010)[0].name.as_bytes(),
+            b"$L_left"
+        );
+        assert_eq!(
+            symbols.text_symbols_at_rva(right, 0x1010)[0]
+                .name
+                .as_bytes(),
+            b"$L_right"
+        );
     }
 
     #[test]

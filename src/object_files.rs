@@ -3,7 +3,9 @@ use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage}
 use crate::data_section_manifest::{
     ComdatSelection, DataSection, DataSectionManifest, SectionStorage, SectionTopology,
 };
-use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
+use crate::pdb_symbols::{
+    FunctionRelocationField, PdbModuleIndex, PdbSymbols, PdbTextSymbolKind, PdbTextSymbolScope,
+};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::relocs::{
     CodeRelocationRecovery, ManifestCoverage, RelocKind, RelocationEncoding,
@@ -32,6 +34,7 @@ pub struct ObjectFile {
     pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: Option<object::write::SectionId>,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
+    text_symbols: HashMap<Vec<u8>, SymbolId>,
     topology_sections: Vec<EmittedTopologySection>,
     definition_ranges: Vec<Vec<(usize, usize)>>,
     reviewed_section_checksums: Vec<([u8; 8], u32)>,
@@ -188,7 +191,10 @@ impl ObjectFiles<'_> {
 
         let mut function_claims = FunctionClaims::default();
         let mut modules = env.dbi.modules()?;
+        let mut module_ordinal = 0;
         while let Some(module) = modules.next()? {
+            let module_index = PdbModuleIndex::new(module_ordinal);
+            module_ordinal += 1;
             let Some(module_info) = pdb.module_info(&module)? else {
                 continue;
             };
@@ -233,6 +239,7 @@ impl ObjectFiles<'_> {
                     env.image_base,
                     fun_rva,
                     fun_size,
+                    module_index,
                     symbols,
                     coff_data,
                     &mut relocs_rva,
@@ -254,6 +261,21 @@ impl ObjectFiles<'_> {
 
                 let fun_offset_in_coff_text =
                     object_file.add_function(fun_name, overloads, &fun_bytes)?;
+                if let Some(text_symbols) = symbols.text_symbols(module_index) {
+                    for (symbol_rva, text_symbols) in
+                        text_symbols.range(fun_rva..fun_rva + fun_size)
+                    {
+                        let symbol_offset = fun_offset_in_coff_text + (*symbol_rva - fun_rva);
+                        for symbol in text_symbols {
+                            object_file.add_text_symbol(
+                                symbol.name,
+                                symbol.scope,
+                                symbol.kind,
+                                symbol_offset,
+                            )?;
+                        }
+                    }
+                }
 
                 for (reloc_rva, reloc_kind) in relocs_rva.range(fun_rva..fun_rva + fun_size) {
                     let reloc_rva = *reloc_rva;
@@ -363,6 +385,7 @@ impl ObjectFile {
             bss_section_id: None,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            text_symbols: HashMap::new(),
             topology_sections: Vec::new(),
             definition_ranges: Vec::new(),
             reviewed_section_checksums: Vec::new(),
@@ -494,6 +517,7 @@ impl ObjectFile {
             bss_section_id,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            text_symbols: HashMap::new(),
             topology_sections,
             definition_ranges: vec![Vec::new(); sections.len()],
             reviewed_section_checksums,
@@ -602,6 +626,7 @@ fn resolve_code_relocations<'s>(
 
     fun_rva: usize,
     fun_size: usize,
+    module: PdbModuleIndex,
 
     symbols: &'s PdbSymbols,
 
@@ -617,137 +642,222 @@ fn resolve_code_relocations<'s>(
 
     // @NOTE: Requires a new allocation, since capstone cannot borrow function code mutably.
     let mut fun_bytes = coff_data[fun_rva..fun_rva + fun_size].to_vec();
+    let text_data_extents = symbols.text_data_extents(module, fun_rva)?;
 
-    let code = &coff_data[fun_rva..fun_rva + fun_size];
-    let mut decoder = Decoder::with_ip(32, code, fun_va as u64, DecoderOptions::NONE);
-    let mut ix = Instruction::default();
+    if code_relocation_recovery == CodeRelocationRecovery::ExactPdbInstructionOperands {
+        recover_pdb_text_data_relocations(
+            image_base,
+            fun_rva,
+            module,
+            symbols,
+            coff_data,
+            &mut fun_bytes,
+            relocs_rva,
+            &text_data_extents,
+        )?;
+    }
 
-    while decoder.can_decode() {
-        decoder.decode_out(&mut ix);
+    let function_end = fun_rva
+        .checked_add(fun_size)
+        .ok_or_else(|| anyhow::anyhow!("PDB function extent overflows RVA"))?;
+    let mut code_extents = Vec::with_capacity(text_data_extents.len() + 1);
+    let mut code_start = fun_rva;
+    for data_extent in &text_data_extents {
+        if code_start < data_extent.start {
+            code_extents.push(code_start..data_extent.start);
+        }
+        code_start = data_extent.end;
+    }
+    if code_start < function_end {
+        code_extents.push(code_start..function_end);
+    }
 
-        match code_relocation_recovery {
-            CodeRelocationRecovery::RetainedOnly => {}
-            CodeRelocationRecovery::ExactPdbInstructionOperands => {
-                let instruction_offset = (ix.ip() - fun_va as u64) as usize;
-                for field in decoded_absolute_operand_fields(&decoder, &ix)
-                    .into_iter()
-                    .flatten()
-                {
-                    let field_offset = instruction_offset + field.offset;
-                    let reloc_rva = fun_rva + field_offset;
-                    if relocs_rva.contains_key(&reloc_rva) {
-                        continue;
+    for code_extent in code_extents {
+        let code = &coff_data[code_extent.clone()];
+        let code_va = image_base.to_usize() + code_extent.start;
+        let mut decoder = Decoder::with_ip(32, code, code_va as u64, DecoderOptions::NONE);
+        let mut ix = Instruction::default();
+
+        while decoder.can_decode() {
+            decoder.decode_out(&mut ix);
+
+            match code_relocation_recovery {
+                CodeRelocationRecovery::RetainedOnly => {}
+                CodeRelocationRecovery::ExactPdbInstructionOperands => {
+                    let instruction_offset = (ix.ip() - fun_va as u64) as usize;
+                    for field in decoded_absolute_operand_fields(&decoder, &ix)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let field_offset = instruction_offset + field.offset;
+                        let reloc_rva = fun_rva + field_offset;
+                        if relocs_rva.contains_key(&reloc_rva) {
+                            continue;
+                        }
+                        let FunctionRelocationField::Within { .. } =
+                            symbols.relocation_field_in_function(fun_rva, reloc_rva)
+                        else {
+                            continue;
+                        };
+                        let encoded_va = bytemuck::pod_read_unaligned::<u32>(
+                            &coff_data[reloc_rva..reloc_rva + 4],
+                        );
+                        let Some(target_rva) =
+                            encoded_va.checked_sub(image_base).map(ToUsize::to_usize)
+                        else {
+                            continue;
+                        };
+                        let Some((kind, addend)) = classify_exact_pdb_target(
+                            symbols,
+                            data_manifest,
+                            reloc_aliases,
+                            observed_aliases,
+                            manifest_coverage,
+                            fun_rva,
+                            reloc_rva,
+                            target_rva,
+                        )?
+                        else {
+                            continue;
+                        };
+                        fun_bytes[field_offset..field_offset + 4]
+                            .copy_from_slice(&addend.to_le_bytes());
+                        relocs_rva.insert(reloc_rva, kind);
                     }
-                    let FunctionRelocationField::Within { .. } =
-                        symbols.relocation_field_in_function(fun_rva, reloc_rva)
-                    else {
-                        continue;
-                    };
-                    let encoded_va =
-                        bytemuck::pod_read_unaligned::<u32>(&coff_data[reloc_rva..reloc_rva + 4]);
-                    let Some(target_rva) =
-                        encoded_va.checked_sub(image_base).map(ToUsize::to_usize)
-                    else {
-                        continue;
-                    };
-                    let Some((kind, addend)) = classify_exact_pdb_target(
-                        symbols,
-                        data_manifest,
-                        reloc_aliases,
-                        observed_aliases,
-                        manifest_coverage,
-                        fun_rva,
-                        reloc_rva,
-                        target_rva,
-                    )?
-                    else {
-                        continue;
-                    };
-                    fun_bytes[field_offset..field_offset + 4]
-                        .copy_from_slice(&addend.to_le_bytes());
-                    relocs_rva.insert(reloc_rva, kind);
                 }
             }
-        }
 
-        let offset_in_fun = (ix.ip() - fun_va as u64) as usize + ix.len();
+            let offset_in_fun = (ix.ip() - fun_va as u64) as usize + ix.len();
 
-        match ix.flow_control() {
-            FlowControl::ConditionalBranch
-            | FlowControl::UnconditionalBranch
-            | FlowControl::Call => {}
-            _ => continue,
-        }
+            match ix.flow_control() {
+                FlowControl::ConditionalBranch
+                | FlowControl::UnconditionalBranch
+                | FlowControl::Call => {}
+                _ => continue,
+            }
 
-        let target_va = match ix.op0_kind() {
-            OpKind::NearBranch16 => ix.near_branch16() as u64,
-            OpKind::NearBranch32 => ix.near_branch32() as u64,
-            OpKind::NearBranch64 => unreachable!(),
-            _ => continue,
-        };
-
-        let linked_target_rva = target_va - u64::from(image_base);
-        let target_rva = symbols
-            .resolve_incremental_trampoline(linked_target_rva.to_usize())
-            .to_u64();
-
-        let internal_branch = linked_target_rva == target_rva
-            && (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
-        if internal_branch {
-            continue;
-        }
-
-        if ix.len() <= 4 {
-            // Read data as code. Which is jump tables stored inline.
-            continue;
-        }
-
-        let Some(overloads) = symbols.functions.get(&target_rva.to_usize()) else {
-            // Read data as code. Which is jump tables stored inline.
-            continue;
-        };
-
-        let overloads = overloads.as_slice();
-        let reloc_rva = fun_rva + offset_in_fun - 4;
-        let symbol = match symbols.relocation_field_in_function(fun_rva, reloc_rva) {
-            FunctionRelocationField::Within { .. } => reloc_aliases.resolve_function_alias(
-                fun_rva,
-                target_rva.to_usize(),
-                reloc_rva,
-                overloads,
-                observed_aliases,
-            )?,
-            FunctionRelocationField::MissingFunction
-            | FunctionRelocationField::UnknownExtent
-            | FunctionRelocationField::OutsideExtent
-            | FunctionRelocationField::FieldOverflow => None,
-        };
-
-        fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
-        let old_reloc = relocs_rva.insert(
-            reloc_rva,
-            RelocKind::Function {
-                overloads,
-                symbol,
-                encoding: RelocationEncoding::Relative,
-            },
-        );
-
-        if let Some(old_reloc) = old_reloc {
-            let RelocKind::Function {
-                overloads: old_overloads,
-                symbol: old_symbol,
-                ..
-            } = old_reloc
-            else {
-                unreachable!();
+            let target_va = match ix.op0_kind() {
+                OpKind::NearBranch16 => ix.near_branch16() as u64,
+                OpKind::NearBranch32 => ix.near_branch32() as u64,
+                OpKind::NearBranch64 => unreachable!(),
+                _ => continue,
             };
-            assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
-            assert_eq!(symbol, old_symbol);
+
+            let linked_target_rva = target_va - u64::from(image_base);
+            let target_rva = symbols
+                .resolve_incremental_trampoline(linked_target_rva.to_usize())
+                .to_u64();
+
+            let internal_branch = linked_target_rva == target_rva
+                && (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
+            if internal_branch {
+                continue;
+            }
+
+            if ix.len() <= 4 {
+                // Read data as code. Which is jump tables stored inline.
+                continue;
+            }
+
+            let Some(overloads) = symbols.functions.get(&target_rva.to_usize()) else {
+                // Read data as code. Which is jump tables stored inline.
+                continue;
+            };
+
+            let overloads = overloads.as_slice();
+            let reloc_rva = fun_rva + offset_in_fun - 4;
+            let symbol = match symbols.relocation_field_in_function(fun_rva, reloc_rva) {
+                FunctionRelocationField::Within { .. } => reloc_aliases.resolve_function_alias(
+                    fun_rva,
+                    target_rva.to_usize(),
+                    reloc_rva,
+                    overloads,
+                    observed_aliases,
+                )?,
+                FunctionRelocationField::MissingFunction
+                | FunctionRelocationField::UnknownExtent
+                | FunctionRelocationField::OutsideExtent
+                | FunctionRelocationField::FieldOverflow => None,
+            };
+
+            fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
+            let old_reloc = relocs_rva.insert(
+                reloc_rva,
+                RelocKind::Function {
+                    overloads,
+                    symbol,
+                    encoding: RelocationEncoding::Relative,
+                },
+            );
+
+            if let Some(old_reloc) = old_reloc {
+                let RelocKind::Function {
+                    overloads: old_overloads,
+                    symbol: old_symbol,
+                    ..
+                } = old_reloc
+                else {
+                    unreachable!();
+                };
+                assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+                assert_eq!(symbol, old_symbol);
+            }
         }
     }
 
     Ok(fun_bytes)
+}
+
+fn recover_pdb_text_data_relocations<'s>(
+    image_base: u32,
+    fun_rva: usize,
+    module: PdbModuleIndex,
+    symbols: &'s PdbSymbols,
+    coff_data: &[u8],
+    fun_bytes: &mut [u8],
+    relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    data_extents: &[std::ops::Range<usize>],
+) -> anyhow::Result<()> {
+    let Some(function_extent) = symbols.function_extent(fun_rva) else {
+        return Ok(());
+    };
+    let Some(overloads) = symbols.functions.get(&fun_rva).map(Vec::as_slice) else {
+        return Ok(());
+    };
+    for data_extent in data_extents {
+        for reloc_rva in (data_extent.start..data_extent.end).step_by(4) {
+            let Some(field_end) = reloc_rva.checked_add(4) else {
+                continue;
+            };
+            if field_end > data_extent.end || relocs_rva.contains_key(&reloc_rva) {
+                continue;
+            }
+            let encoded_va = bytemuck::pod_read_unaligned::<u32>(&coff_data[reloc_rva..field_end]);
+            let Some(target_rva) = encoded_va.checked_sub(image_base).map(ToUsize::to_usize) else {
+                continue;
+            };
+            if !function_extent.contains(&target_rva) {
+                continue;
+            }
+            let exact_symbols = symbols.text_symbols_at_rva(module, target_rva);
+            let symbol = match (target_rva == fun_rva, exact_symbols) {
+                (false, [symbol]) => Some(symbol.name),
+                (true, []) => None,
+                _ => continue,
+            };
+            let field_offset = reloc_rva - fun_rva;
+            fun_bytes[field_offset..field_offset + 4].copy_from_slice(&0_u32.to_le_bytes());
+            relocs_rva.insert(
+                reloc_rva,
+                RelocKind::Function {
+                    overloads,
+                    symbol,
+                    encoding: RelocationEncoding::Absolute,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 impl ObjectFile {
@@ -1225,6 +1335,7 @@ impl ObjectFile {
             SymbolReuse::ReuseExisting => self
                 .object
                 .symbol_id(name.as_bytes())
+                .or_else(|| self.text_symbols.get(name.as_bytes()).copied())
                 .or_else(|| self.undefined_symbols.get(name.as_bytes()).copied()),
         };
         let symbol = if let Some(symbol) = existing {
@@ -1346,6 +1457,57 @@ impl ObjectFile {
         }
 
         Ok(fun_offset_in_coff_text)
+    }
+
+    fn add_text_symbol(
+        &mut self,
+        name: RawString,
+        scope: PdbTextSymbolScope,
+        kind: PdbTextSymbolKind,
+        offset: ObjectOffset,
+    ) -> anyhow::Result<()> {
+        let kind = match kind {
+            PdbTextSymbolKind::Data => object::SymbolKind::Data,
+            PdbTextSymbolKind::Label => object::SymbolKind::Label,
+        };
+        if let Some(symbol_id) = self
+            .object
+            .symbol_id(name.as_bytes())
+            .or_else(|| self.text_symbols.get(name.as_bytes()).copied())
+        {
+            let symbol = self.object.symbol(symbol_id);
+            anyhow::ensure!(
+                symbol.value == offset.offset
+                    && symbol.size == 0
+                    && symbol.kind == kind
+                    && symbol.scope
+                        == match scope {
+                            PdbTextSymbolScope::Local => object::SymbolScope::Compilation,
+                            PdbTextSymbolScope::Global => object::SymbolScope::Linkage,
+                        }
+                    && !symbol.weak
+                    && symbol.section == object::write::SymbolSection::Section(offset.section_id)
+                    && matches!(symbol.flags, object::SymbolFlags::None),
+                "incompatible pre-existing text symbol {}",
+                String::from_utf8_lossy(name.as_bytes())
+            );
+            return Ok(());
+        }
+        let symbol = self.object.add_symbol(object::write::Symbol {
+            name: name.as_bytes().to_vec(),
+            value: offset.offset,
+            size: 0,
+            kind,
+            scope: match scope {
+                PdbTextSymbolScope::Local => object::SymbolScope::Compilation,
+                PdbTextSymbolScope::Global => object::SymbolScope::Linkage,
+            },
+            weak: false,
+            section: object::write::SymbolSection::Section(offset.section_id),
+            flags: object::SymbolFlags::None,
+        });
+        self.text_symbols.insert(name.as_bytes().to_vec(), symbol);
+        Ok(())
     }
 }
 
@@ -1596,6 +1758,7 @@ mod tests {
             image_base,
             function_rva,
             linked_function.len(),
+            PdbModuleIndex::new(0),
             &symbols,
             &coff_data,
             &mut retained_relocations,
@@ -1614,6 +1777,7 @@ mod tests {
             image_base,
             function_rva,
             linked_function.len(),
+            PdbModuleIndex::new(0),
             &symbols,
             &coff_data,
             &mut recovered_relocations,
@@ -1665,6 +1829,7 @@ mod tests {
             image_base,
             function_rva,
             linked_function.len(),
+            PdbModuleIndex::new(0),
             &symbols,
             &coff_data,
             &mut relocations,
@@ -1686,6 +1851,261 @@ mod tests {
             panic!("expected a relative function relocation");
         };
         assert_eq!(overloads[0].as_bytes(), b"body");
+    }
+
+    #[test]
+    fn stripped_mode_uses_exact_text_symbol_and_decodes_after_data() {
+        let image_base = 0x0040_0000;
+        let function_rva = 0x1000;
+        let external_rva = 0x2000;
+        let linked_function = [
+            0x90, 0x90, 0xc3, 0x90, 0x02, 0x10, 0x40, 0x00, 0xb8, 0x00, 0x20, 0x40, 0x00, 0xc3,
+        ];
+        let mut coff_data = vec![0; function_rva + linked_function.len()];
+        coff_data[function_rva..].copy_from_slice(&linked_function);
+
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(linked_function.len()),
+            )
+            .unwrap();
+        symbols
+            .add_function_at_rva(external_rva, RawString::from(&b"external"[..]), Some(1))
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                function_rva + 4,
+                RawString::from(&b"table"[..]),
+                Some(4),
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+        symbols.add_text_symbol_at_rva(
+            PdbModuleIndex::new(0),
+            function_rva + 2,
+            RawString::from(&b"exact_label"[..]),
+            PdbTextSymbolScope::Local,
+            PdbTextSymbolKind::Label,
+        );
+
+        let mut relocs = BTreeMap::new();
+        let recovered = resolve_code_relocations(
+            image_base,
+            function_rva,
+            linked_function.len(),
+            PdbModuleIndex::new(0),
+            &symbols,
+            &coff_data,
+            &mut relocs,
+            &RelocAliasManifest::default(),
+            &mut RelocAliasObservations::default(),
+            &DataManifest::default(),
+            ManifestCoverage::AllowPartial,
+            CodeRelocationRecovery::ExactPdbInstructionOperands,
+        )
+        .unwrap();
+
+        assert_eq!(&recovered[..4], &linked_function[..4]);
+        assert_eq!(&recovered[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&recovered[8..], &[0xb8, 0, 0, 0, 0, 0xc3]);
+        assert!(matches!(
+            relocs.get(&(function_rva + 4)),
+            Some(RelocKind::Function {
+                symbol: Some(symbol),
+                encoding: RelocationEncoding::Absolute,
+                ..
+            }) if symbol.as_bytes() == b"exact_label"
+        ));
+        assert!(matches!(
+            relocs.get(&(function_rva + 9)),
+            Some(RelocKind::Function {
+                overloads,
+                encoding: RelocationEncoding::Absolute,
+                ..
+            }) if overloads[0].as_bytes() == b"external"
+        ));
+    }
+
+    #[test]
+    fn stripped_mode_skips_ambiguous_text_target_but_accepts_procedure_entry() {
+        let image_base = 0x0040_0000;
+        let function_rva = 0x1000;
+        let linked_function = [
+            0xc3, 0x90, 0x90, 0x90, 0x02, 0x10, 0x40, 0x00, 0x00, 0x10, 0x40, 0x00,
+        ];
+        let mut coff_data = vec![0; function_rva + linked_function.len()];
+        coff_data[function_rva..].copy_from_slice(&linked_function);
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(linked_function.len()),
+            )
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                function_rva + 4,
+                RawString::from(&b"table"[..]),
+                Some(8),
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+        for name in [b"left".as_slice(), b"right".as_slice()] {
+            symbols.add_text_symbol_at_rva(
+                PdbModuleIndex::new(0),
+                function_rva + 2,
+                RawString::from(name),
+                PdbTextSymbolScope::Local,
+                PdbTextSymbolKind::Label,
+            );
+        }
+
+        let mut relocs = BTreeMap::new();
+        let recovered = resolve_code_relocations(
+            image_base,
+            function_rva,
+            linked_function.len(),
+            PdbModuleIndex::new(0),
+            &symbols,
+            &coff_data,
+            &mut relocs,
+            &RelocAliasManifest::default(),
+            &mut RelocAliasObservations::default(),
+            &DataManifest::default(),
+            ManifestCoverage::AllowPartial,
+            CodeRelocationRecovery::ExactPdbInstructionOperands,
+        )
+        .unwrap();
+
+        assert_eq!(&recovered[4..8], &linked_function[4..8]);
+        assert_eq!(&recovered[8..12], &[0, 0, 0, 0]);
+        assert!(!relocs.contains_key(&(function_rva + 4)));
+        assert!(matches!(
+            relocs.get(&(function_rva + 8)),
+            Some(RelocKind::Function {
+                symbol: None,
+                encoding: RelocationEncoding::Absolute,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn absent_mode_does_not_recover_inline_text_data_fields() {
+        let image_base = 0x0040_0000;
+        let function_rva = 0x1000;
+        let linked_function = [0xc3, 0x90, 0x90, 0x90, 0x00, 0x10, 0x40, 0x00];
+        let mut coff_data = vec![0; function_rva + linked_function.len()];
+        coff_data[function_rva..].copy_from_slice(&linked_function);
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(linked_function.len()),
+            )
+            .unwrap();
+        symbols
+            .add_text_data_at_rva(
+                PdbModuleIndex::new(0),
+                function_rva + 4,
+                RawString::from(&b"table"[..]),
+                None,
+                PdbTextSymbolScope::Local,
+            )
+            .unwrap();
+
+        let mut relocs = BTreeMap::new();
+        let recovered = resolve_code_relocations(
+            image_base,
+            function_rva,
+            linked_function.len(),
+            PdbModuleIndex::new(0),
+            &symbols,
+            &coff_data,
+            &mut relocs,
+            &RelocAliasManifest::default(),
+            &mut RelocAliasObservations::default(),
+            &DataManifest::default(),
+            ManifestCoverage::AllowPartial,
+            CodeRelocationRecovery::RetainedOnly,
+        )
+        .unwrap();
+        assert_eq!(recovered, linked_function);
+        assert!(relocs.is_empty());
+    }
+
+    #[test]
+    fn text_symbols_keep_exact_names_and_scopes() {
+        let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let function = output
+            .add_function(
+                RawString::from(&b"owner"[..]),
+                &[],
+                &[0x90, 0x90, 0xc3, 0x90, 0, 0, 0, 0],
+            )
+            .unwrap();
+        output
+            .add_text_symbol(
+                RawString::from(&b"$L123"[..]),
+                PdbTextSymbolScope::Local,
+                PdbTextSymbolKind::Label,
+                function + 1,
+            )
+            .unwrap();
+        output
+            .add_relocation(
+                RawString::from(&b"$L123"[..]),
+                ObjectLocation::Extern(object::SymbolKind::Text),
+                function + 4,
+                RelocationEncoding::Absolute,
+                SymbolReuse::ReuseExisting,
+            )
+            .unwrap();
+        output
+            .add_text_symbol(
+                RawString::from(&b"global_label"[..]),
+                PdbTextSymbolScope::Global,
+                PdbTextSymbolKind::Data,
+                function + 2,
+            )
+            .unwrap();
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let local = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("$L123"))
+            .unwrap();
+        assert_eq!(local.address(), 1);
+        assert_eq!(local.kind(), object::SymbolKind::Label);
+        assert!(local.is_local());
+        let global = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("global_label"))
+            .unwrap();
+        assert_eq!(global.address(), 2);
+        assert_eq!(global.kind(), object::SymbolKind::Data);
+        assert!(global.is_global());
+        let relocation = object
+            .section_by_name(".text")
+            .unwrap()
+            .relocations()
+            .next()
+            .unwrap();
+        let object::RelocationTarget::Symbol(target) = relocation.1.target() else {
+            panic!("text label relocation must target a symbol");
+        };
+        let target = object.symbol_by_index(target).unwrap();
+        assert_eq!(target.name(), Ok("$L123"));
+        assert!(target.section_index().is_some());
+        assert_eq!(target.address(), 1);
     }
 
     #[test]

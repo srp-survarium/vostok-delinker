@@ -86,6 +86,20 @@ manifest coverage retain their normal precedence. An `Absent` image receives no
 such recovery because it does not provide evidence that relocations were
 stripped.
 
+PDB module Data records in `.text` delimit inline data within a procedure. A
+CodeView type supplies the extent when its size is available; otherwise the
+extent ends at the next `.text` Data record or at the exact PDB procedure end.
+Instruction decoding skips those extents and resumes in any code that follows.
+For a `Stripped` image, Vostok recovers aligned four-byte fields in those extents
+only when their linked values point to one unambiguous, exact PDB text symbol or
+to the exact containing-procedure entry. Nearby interior addresses and ambiguous
+aliases are not inferred. Module Label records and `.text` Data symbols are
+kept within their PDB module and emitted with their original names and local or
+global scope; folded procedures at one RVA do not exchange local labels. MSVC
+compiler symbols named `$L...` retain COFF label storage rather than becoming
+data symbols merely because CodeView represents their inline-data extent with a
+Data record.
+
 ## Import address table
 
 Vostok recovers absolute references to imported functions and data without a
