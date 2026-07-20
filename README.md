@@ -2,8 +2,8 @@
 
 Vostok reconstructs per-translation-unit COFF object files from a linked PE
 executable and a matching PDB. The executable supplies the linked bytes and PE
-base relocations. The PDB supplies the symbol and module topology used to split
-those bytes into objects.
+base relocations retained in its data directory, when present. The PDB supplies
+the symbol and module topology used to split those bytes into objects.
 
 ## Synthetic PDB
 
@@ -52,6 +52,19 @@ cargo run --release -- \
 ```
 
 Run `vostok-delinker --help` for the complete option list.
+
+## PE base relocation input
+
+Vostok locates retained base relocations through
+`IMAGE_DIRECTORY_ENTRY_BASERELOC`, then reads exactly its RVA and size from one
+raw-backed PE section. The section name is irrelevant; `.reloc` is conventional
+but not required.
+
+When the directory is absent, Vostok distinguishes an image carrying
+`IMAGE_FILE_RELOCS_STRIPPED` from an image with no directory and no stripped
+flag. It reports `Stripped` and `Absent` separately, but conservatively retains
+no absolute relocations for either state. This layer does not infer relocation
+sites by scanning code, data, or exact PDB addresses.
 
 ## Import address table
 
