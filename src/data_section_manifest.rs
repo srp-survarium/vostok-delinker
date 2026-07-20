@@ -67,7 +67,7 @@ fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SectionStorage {
     Data,
     Rdata,
@@ -223,6 +223,65 @@ impl DataSectionManifest {
                     line_number
                 );
             }
+            if let Some(rva) = rva {
+                if rva & (alignment as usize - 1) != 0 || rva.checked_add(size).is_none() {
+                    anyhow::bail!(
+                        "{}:{}: data section RVA/extent violates alignment or overflows",
+                        path.display(),
+                        line_number
+                    );
+                }
+            }
+            let expected_alignment_bits = (alignment.trailing_zeros() + 1) << 20;
+            if alignment > 8192
+                || characteristics & object::pe::IMAGE_SCN_ALIGN_MASK != expected_alignment_bits
+            {
+                anyhow::bail!(
+                    "{}:{}: section alignment disagrees with its characteristics",
+                    path.display(),
+                    line_number
+                );
+            }
+            let comdat_flag = characteristics & object::pe::IMAGE_SCN_LNK_COMDAT != 0;
+            if comdat_flag != (comdat_selection != ComdatSelection::None) {
+                anyhow::bail!(
+                    "{}:{}: COMDAT characteristic/selection mismatch",
+                    path.display(),
+                    line_number
+                );
+            }
+            if let Some(storage) = storage {
+                let (expected_name, required, forbidden) = match storage {
+                    SectionStorage::Data => (
+                        b".data".as_slice(),
+                        object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+                            | object::pe::IMAGE_SCN_MEM_WRITE,
+                        object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA,
+                    ),
+                    SectionStorage::Rdata => (
+                        b".rdata".as_slice(),
+                        object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
+                        object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
+                            | object::pe::IMAGE_SCN_MEM_WRITE,
+                    ),
+                    SectionStorage::Bss => (
+                        b".bss".as_slice(),
+                        object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
+                            | object::pe::IMAGE_SCN_MEM_WRITE,
+                        object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
+                    ),
+                };
+                if row.name != expected_name
+                    || characteristics & required != required
+                    || characteristics & forbidden != 0
+                {
+                    anyhow::bail!(
+                        "{}:{}: storage does not match candidate section name/characteristics",
+                        path.display(),
+                        line_number
+                    );
+                }
+            }
             sections.push(DataSection {
                 object,
                 ordinal,
@@ -255,7 +314,10 @@ impl DataSectionManifest {
                     );
                 }
                 if let Some(leader) = section.associative_ordinal
-                    && (leader >= section.ordinal || !rows.iter().any(|row| row.ordinal == leader))
+                    && (leader >= section.ordinal
+                        || !rows.iter().any(|row| {
+                            row.ordinal == leader && row.comdat_selection != ComdatSelection::None
+                        }))
                 {
                     anyhow::bail!(
                         "{}: object {} has invalid associative section ordinal",
@@ -265,12 +327,59 @@ impl DataSectionManifest {
                 }
             }
         }
+        let mut placed = sections
+            .iter()
+            .filter(|section| section.rva.is_some())
+            .collect::<Vec<_>>();
+        placed.sort_by_key(|section| {
+            (
+                section.rva.unwrap(),
+                section.size,
+                section.object,
+                section.ordinal,
+            )
+        });
+        for pair in placed.windows(2) {
+            let first = pair[0];
+            let second = pair[1];
+            if first.rva.unwrap() + first.size > second.rva.unwrap()
+                && !compatible_folded_comdat_alias(first, second)
+            {
+                anyhow::bail!(
+                    "{}: overlapping assigned data sections {}:{} and {}:{}",
+                    path.display(),
+                    String::from_utf8_lossy(first.object),
+                    first.ordinal,
+                    String::from_utf8_lossy(second.object),
+                    second.ordinal,
+                );
+            }
+        }
         Ok(Self { sections })
     }
 
     pub fn sections(&self) -> &[DataSection] {
         &self.sections
     }
+}
+
+fn compatible_folded_comdat_alias(first: &DataSection, second: &DataSection) -> bool {
+    first.object != second.object
+        && first.rva == second.rva
+        && first.size == second.size
+        && first.name == second.name
+        && first.alignment == second.alignment
+        && first.characteristics == second.characteristics
+        && first.storage == second.storage
+        && first.comdat_selection == second.comdat_selection
+        && matches!(
+            first.comdat_selection,
+            ComdatSelection::Any
+                | ComdatSelection::SameSize
+                | ComdatSelection::ExactMatch
+                | ComdatSelection::Largest
+                | ComdatSelection::Newest
+        )
 }
 
 fn normalize_object(value: &[u8], path: &Path, line: usize) -> anyhow::Result<&'static [u8]> {
@@ -343,9 +452,46 @@ mod tests {
     }
 
     #[test]
+    fn rejects_misaligned_overlapping_and_storage_inconsistent_sections() {
+        assert!(parse("a.c\t1\t.data\t0x102\t4\t4\t0xc0300040\t0\t-\tdata\n").is_err());
+        assert!(parse("a.c\t1\t.data\t0x100\t4\t8\t0xc0300040\t0\t-\tdata\n").is_err());
+        assert!(
+            parse(
+                "a.c\t1\t.data\t0x100\t8\t4\t0xc0300040\t0\t-\tdata\n\
+                 b.c\t1\t.data\t0x104\t4\t4\t0xc0300040\t0\t-\tdata\n"
+            )
+            .is_err()
+        );
+        assert!(parse("a.c\t1\t.rdata\t0x100\t4\t4\t0xc0300040\t0\t-\trdata\n").is_err());
+        assert!(
+            parse(
+                "a.c\t1\t.text\t-\t4\t1\t0x00100020\t0\t-\t-\n\
+                 a.c\t2\t.debug$F\t-\t4\t1\t0x00101040\t5\t1\t-\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn permits_only_exact_compatible_folded_comdat_aliases() {
+        let alias = concat!(
+            "a.c\t1\t.rdata\t0x100\t4\t4\t0x40301040\t2\t-\trdata\n",
+            "b.c\t1\t.rdata\t0x100\t4\t4\t0x40301040\t2\t-\trdata\n",
+        );
+        assert!(parse(alias).is_ok());
+
+        let partial = alias.replace("b.c\t1\t.rdata\t0x100\t4", "b.c\t1\t.rdata\t0x102\t2");
+        assert!(parse(&partial).is_err());
+        let ordinary = alias.replace("0x40301040\t2", "0x40300040\t0");
+        assert!(parse(&ordinary).is_err());
+        let selection_mismatch = alias.replacen("0x40301040\t2", "0x40301040\t3", 1);
+        assert!(parse(&selection_mismatch).is_err());
+    }
+
+    #[test]
     fn accepts_crlf_and_missing_final_line_ending() {
         let text = format!(
-            "{}a.c\t1\t.data\t0x100\t4\t4\t0\t0\t-\tdata",
+            "{}a.c\t1\t.data\t0x100\t4\t4\t0xc0300040\t0\t-\tdata",
             HEADER_TEXT.replace('\n', "\r\n")
         );
         assert_eq!(
