@@ -38,6 +38,7 @@ struct EmittedTopologySection {
     id: object::write::SectionId,
     storage: Option<SectionStorage>,
     rva: Option<usize>,
+    size: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -130,17 +131,27 @@ impl ObjectFiles<'_> {
                 .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
             object_file.add_data_definition(*definition, coff_data)?;
         }
+        for object_file in this.objects.values_mut() {
+            object_file.add_topology_section_relocations(
+                matcher,
+                coff_data,
+                &relocs_rva,
+                data_manifest,
+            )?;
+        }
         for definition in &definitions {
-            this.objects
-                .get_mut(definition.object)
-                .unwrap()
-                .add_data_relocations(
-                    *definition,
-                    matcher,
-                    coff_data,
-                    &relocs_rva,
-                    data_manifest,
-                )?;
+            if definition.section_ordinal.is_none() {
+                this.objects
+                    .get_mut(definition.object)
+                    .unwrap()
+                    .add_data_relocations(
+                        *definition,
+                        matcher,
+                        coff_data,
+                        &relocs_rva,
+                        data_manifest,
+                    )?;
+            }
         }
 
         let mut modules = env.dbi.modules()?;
@@ -366,6 +377,7 @@ impl ObjectFile {
                 id,
                 storage: section.storage,
                 rva: section.rva,
+                size: section.size,
             });
 
             match section.storage {
@@ -739,7 +751,17 @@ impl ObjectFile {
                 anyhow::bail!("data definition storage disagrees with its candidate section");
             }
             let section_offset = definition.section_offset.unwrap();
-            let expected_rva = section.rva.unwrap().checked_add(section_offset).unwrap();
+            let section_local_end = section_offset
+                .checked_add(definition.size)
+                .ok_or_else(|| anyhow::anyhow!("reviewed data section-local extent overflows"))?;
+            if section_local_end > section.size {
+                anyhow::bail!("reviewed data definition exceeds its assigned section");
+            }
+            let expected_rva = section
+                .rva
+                .unwrap()
+                .checked_add(section_offset)
+                .ok_or_else(|| anyhow::anyhow!("reviewed data section placement overflows"))?;
             if definition.rva != expected_rva {
                 anyhow::bail!(
                     "data definition RVA disagrees with its candidate section: expected {expected_rva:#x}, got {:#x}",
@@ -856,6 +878,48 @@ impl ObjectFile {
                 symbol: leader,
                 sections: vec![pending.section],
             });
+        }
+        Ok(())
+    }
+
+    fn add_topology_section_relocations(
+        &mut self,
+        matcher: &SymbolMatcher,
+        coff_data: &[u8],
+        relocs_rva: &BTreeMap<usize, RelocKind>,
+        data_manifest: &DataManifest,
+    ) -> anyhow::Result<()> {
+        let sections = self
+            .topology_sections
+            .iter()
+            .copied()
+            .filter(|section| section.storage.is_some())
+            .collect::<Vec<_>>();
+        for section in sections {
+            let rva = section.rva.unwrap();
+            let end = rva
+                .checked_add(section.size)
+                .ok_or_else(|| anyhow::anyhow!("candidate data section extent overflows"))?;
+            let sites = relocs_rva.range(rva..end);
+            if section.storage == Some(SectionStorage::Bss) && sites.clone().next().is_some() {
+                anyhow::bail!("candidate BSS section contains a PE base relocation");
+            }
+            for (reloc_rva, reloc_kind) in sites {
+                let mut visited = HashSet::new();
+                self.add_relocation_at(
+                    *reloc_kind,
+                    ObjectOffset {
+                        offset: (*reloc_rva - rva).to_u64(),
+                        section_id: section.id,
+                    },
+                    matcher,
+                    coff_data,
+                    relocs_rva,
+                    &mut visited,
+                    data_manifest,
+                    TargetMaterialization::ReferenceOnly,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1318,5 +1382,156 @@ mod tests {
                 .unwrap(),
             "fold"
         );
+    }
+
+    #[test]
+    fn topology_replays_relocations_for_each_folded_data_section() {
+        let sections = [
+            DataSection {
+                object: b"fixture.c",
+                ordinal: 1,
+                name: b".data",
+                rva: Some(0x10),
+                size: 8,
+                alignment: 4,
+                characteristics: 0xc030_1040,
+                comdat_selection: ComdatSelection::Any,
+                associative_ordinal: None,
+                storage: Some(SectionStorage::Data),
+            },
+            DataSection {
+                object: b"fixture.c",
+                ordinal: 2,
+                name: b".data",
+                rva: Some(0x10),
+                size: 8,
+                alignment: 4,
+                characteristics: 0xc030_1040,
+                comdat_selection: ComdatSelection::Any,
+                associative_ordinal: None,
+                storage: Some(SectionStorage::Data),
+            },
+        ];
+        let image = [0_u8; 0x20];
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 2,
+            data: &[],
+        };
+        let data = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 3,
+            data: &image,
+        };
+        let mut output = ObjectFile::with_sections(&sections, empty, data, &image, false).unwrap();
+        for (name, ordinal) in [(b"leader_a".as_slice(), 1), (b"leader_b".as_slice(), 2)] {
+            output
+                .add_data_definition(
+                    DataDefinition {
+                        symbol_name: RawString::from(name),
+                        object: b"fixture.c",
+                        rva: 0x10,
+                        size: 4,
+                        storage: DataStorage::Data,
+                        alignment: 4,
+                        section_ordinal: Some(ordinal),
+                        section_offset: Some(0),
+                        scope: DataScope::External,
+                    },
+                    &image,
+                )
+                .unwrap();
+        }
+
+        let mut relocs = BTreeMap::new();
+        relocs.insert(
+            0x14,
+            RelocKind::Static {
+                symbol: RawString::from(&b"external"[..]),
+                target_rva: 0x18,
+            },
+        );
+        output
+            .add_topology_section_relocations(
+                &SymbolMatcher::off(),
+                &image,
+                &relocs,
+                &DataManifest::default(),
+            )
+            .unwrap();
+        output.finish_data_comdats().unwrap();
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let data_sections = object
+            .sections()
+            .filter(|section| section.name() == Ok(".data"))
+            .collect::<Vec<_>>();
+        assert_eq!(data_sections.len(), 2);
+        for section in data_sections {
+            let relocations = section.relocations().collect::<Vec<_>>();
+            assert_eq!(relocations.len(), 1);
+            assert_eq!(relocations[0].0, 4);
+            let object::RelocationTarget::Symbol(symbol) = relocations[0].1.target() else {
+                panic!("data relocation must target an external symbol");
+            };
+            assert_eq!(
+                object.symbol_by_index(symbol).unwrap().name(),
+                Ok("external")
+            );
+        }
+    }
+
+    #[test]
+    fn topology_rejects_definition_beyond_assigned_section() {
+        let sections = [DataSection {
+            object: b"fixture.c",
+            ordinal: 1,
+            name: b".data",
+            rva: Some(0x10),
+            size: 4,
+            alignment: 4,
+            characteristics: 0xc030_0040,
+            comdat_selection: ComdatSelection::None,
+            associative_ordinal: None,
+            storage: Some(SectionStorage::Data),
+        }];
+        let image = [0_u8; 0x20];
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 2,
+            data: &[],
+        };
+        let data = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 3,
+            data: &image,
+        };
+        let mut output = ObjectFile::with_sections(&sections, empty, data, &image, false).unwrap();
+        let error = output
+            .add_data_definition(
+                DataDefinition {
+                    symbol_name: RawString::from(&b"too_large"[..]),
+                    object: b"fixture.c",
+                    rva: 0x10,
+                    size: 5,
+                    storage: DataStorage::Data,
+                    alignment: 4,
+                    section_ordinal: Some(1),
+                    section_offset: Some(0),
+                    scope: DataScope::External,
+                },
+                &image,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds its assigned section"));
     }
 }

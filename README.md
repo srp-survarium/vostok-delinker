@@ -182,6 +182,15 @@ and non-associative data COMDAT groups. It also preserves the order, names, and
 characteristics of other section rows as empty section records. Recovering
 non-affine contents and associative groups requires additional reviewed input.
 
+Assigned data sections are checked before emission. RVA placement must satisfy
+the declared alignment; the numeric alignment must agree with the COFF
+characteristics; storage must agree with the section name and initialized,
+uninitialized, and writable flags; and COMDAT flags must agree with the
+selection value. Placed ranges cannot overlap unless two different objects
+describe the same foldable COMDAT range with identical topology. Every bound
+definition must fit inside its selected section and agree with its section-local
+RVA.
+
 ### What the manifest improves
 
 For each row Vostok copies the complete `.data` or `.rdata` payload, or allocates
@@ -198,6 +207,11 @@ manifest allocation ranges to existing PDB symbols, and serializes the recovered
 relationships as COFF relocations in the output objects. The final COFF records
 must be emitted because linking consumed the originals; the PE retains only the
 base-relocation sites and linked target addresses.
+
+When a candidate section has an assigned linked range, Vostok replays every PE
+base relocation in that complete range. This includes relocation sites in
+padding or in bytes not covered by an individual definition row, and repeats
+the relocation topology for each compatible folded COMDAT copy.
 
 Without a manifest row, Vostok may only materialize a small referenced fragment
 in the referring function's object. In a tested VC4.2 example, a 1,024-byte
