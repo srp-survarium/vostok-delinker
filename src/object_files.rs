@@ -4,6 +4,7 @@ use crate::data_section_manifest::{
     ComdatSelection, DataSection, DataSectionManifest, SectionStorage,
 };
 use crate::pdb_symbols::PdbSymbols;
+use crate::reloc_alias_manifest::RelocAliasManifest;
 use crate::relocs::{RelocKind, RelocationEncoding};
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
 use crate::utils::{ToU64, ToUsize, contains, leak};
@@ -72,6 +73,8 @@ impl ObjectFiles<'_> {
         matcher: &SymbolMatcher,
         data_manifest: &DataManifest,
         data_section_manifest: &DataSectionManifest,
+        reloc_aliases: &RelocAliasManifest,
+        observed_aliases: &mut BTreeMap<(usize, usize), usize>,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -180,6 +183,8 @@ impl ObjectFiles<'_> {
                     symbols,
                     coff_data,
                     &mut relocs_rva,
+                    reloc_aliases,
+                    observed_aliases,
                 )?;
 
                 let object_file = this
@@ -474,9 +479,14 @@ fn get_function_location(
 /// visited, so re-inserting one must yield the identical `Function` relocation —
 /// the same overload slice. Anything else means two different callees were mapped
 /// onto one site, i.e. a classification bug, so this asserts rather than returns.
-fn assert_reinserted_branch_is_identical(previous: RelocKind, overloads: &[RawString<'static>]) {
+fn assert_reinserted_branch_is_identical(
+    previous: RelocKind,
+    overloads: &[RawString<'static>],
+    symbol: Option<RawString<'static>>,
+) {
     let RelocKind::Function {
         overloads: previous_overloads,
+        symbol: previous_symbol,
         ..
     } = previous
     else {
@@ -486,6 +496,10 @@ fn assert_reinserted_branch_is_identical(previous: RelocKind, overloads: &[RawSt
         overloads.as_ptr(),
         previous_overloads.as_ptr(),
         "a relative branch site was reclassified to a different function",
+    );
+    assert_eq!(
+        symbol, previous_symbol,
+        "a relative branch site was reclassified to a different reviewed alias",
     );
 }
 
@@ -507,6 +521,8 @@ fn resolve_relative_text_relocations<'s>(
 
     coff_data: &[u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    reloc_aliases: &RelocAliasManifest,
+    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
 ) -> anyhow::Result<Vec<u8>> {
     let fun_va = env.image_base.to_usize() + fun_rva;
 
@@ -554,18 +570,25 @@ fn resolve_relative_text_relocations<'s>(
         };
 
         let overloads = overloads.as_slice();
+        let symbol = reloc_aliases.resolve_function_alias(
+            fun_rva,
+            target_rva.to_usize(),
+            overloads,
+            observed_aliases,
+        )?;
 
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(
             fun_rva + offset_in_fun - 4,
             RelocKind::Function {
                 overloads,
+                symbol,
                 encoding: RelocationEncoding::Relative,
             },
         );
 
         if let Some(old_reloc) = old_reloc {
-            assert_reinserted_branch_is_identical(old_reloc, overloads);
+            assert_reinserted_branch_is_identical(old_reloc, overloads, symbol);
         }
     }
 
@@ -595,6 +618,7 @@ impl ObjectFile {
             RelocKind::Function {
                 overloads: _,
                 encoding,
+                ..
             } => {
                 self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, encoding)?;
             }
@@ -1048,9 +1072,11 @@ enum Name<'a> {
 impl<'a> RelocKind<'a> {
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
-            Self::Function { overloads, .. } => {
-                Name::Borrowed(matcher.pick(overloads, canonical_name(overloads)))
-            }
+            Self::Function {
+                overloads, symbol, ..
+            } => Name::Borrowed(
+                symbol.unwrap_or_else(|| matcher.pick(overloads, canonical_name(overloads))),
+            ),
             Self::ConjuredString { symbol, data } => {
                 let reloc_name = get_constant_name(symbol, data);
                 Name::Owned(reloc_name)
