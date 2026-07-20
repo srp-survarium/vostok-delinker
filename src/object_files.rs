@@ -223,7 +223,7 @@ impl ObjectFiles<'_> {
                     _ => fun_name,
                 };
 
-                let fun_offset_in_coff_text = object_file.add_function(fun_name, &fun_bytes);
+                let fun_offset_in_coff_text = object_file.add_function(fun_name, &fun_bytes)?;
 
                 for (reloc_rva, reloc_kind) in relocs_rva.range(fun_rva..fun_rva + fun_size) {
                     let reloc_rva = *reloc_rva;
@@ -1121,11 +1121,37 @@ impl ObjectFile {
         Ok(())
     }
 
-    fn add_function(&mut self, name: RawString, body: &[u8]) -> ObjectOffset {
+    fn add_function(&mut self, name: RawString, body: &[u8]) -> anyhow::Result<ObjectOffset> {
+        let existing = self.object.symbol_id(name.as_bytes());
+        let undefined = self.undefined_symbols.get(name.as_bytes()).copied();
+        let existing_symbol = match (existing, undefined) {
+            (None, None) => None,
+            (indexed_id, Some(undefined_id))
+                if indexed_id.is_none() || indexed_id == Some(undefined_id) =>
+            {
+                let symbol = self.object.symbol(undefined_id);
+                anyhow::ensure!(
+                    symbol.value == 0
+                        && symbol.size == u64::MAX
+                        && symbol.kind == object::SymbolKind::Text
+                        && symbol.scope == object::SymbolScope::Linkage
+                        && !symbol.weak
+                        && symbol.section == object::write::SymbolSection::Undefined
+                        && matches!(symbol.flags, object::SymbolFlags::None),
+                    "incompatible undefined function symbol {}",
+                    String::from_utf8_lossy(name.as_bytes())
+                );
+                Some(undefined_id)
+            }
+            _ => anyhow::bail!(
+                "incompatible pre-existing function symbol {}",
+                String::from_utf8_lossy(name.as_bytes())
+            ),
+        };
+
         let text_section_id = self.text_section();
         let fun_offset_in_coff_text = self.append_section_data(text_section_id, body, 0x90);
-
-        self.object.add_symbol(object::write::Symbol {
+        let definition = object::write::Symbol {
             name: name.as_bytes().to_vec(),
             value: fun_offset_in_coff_text.offset,
             size: u64::MAX,
@@ -1134,9 +1160,16 @@ impl ObjectFile {
             weak: false,
             section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
             flags: object::SymbolFlags::None,
-        });
+        };
+        if let Some(symbol_id) = existing_symbol {
+            *self.object.symbol_mut(symbol_id) = definition;
+            let removed = self.undefined_symbols.remove(name.as_bytes());
+            debug_assert_eq!(removed, Some(symbol_id));
+        } else {
+            self.object.add_symbol(definition);
+        }
 
-        fun_offset_in_coff_text
+        Ok(fun_offset_in_coff_text)
     }
 }
 
@@ -1337,7 +1370,7 @@ mod tests {
         let name = RawString::from(&b"real_a"[..]);
         for _ in 0..2 {
             if claims.claim(b"SOURCE\\font.cpp", 0x401000, 1).unwrap() {
-                output.add_function(name, &[0xc3]);
+                output.add_function(name, &[0xc3]).unwrap();
             }
         }
 
@@ -1504,6 +1537,93 @@ mod tests {
     }
 
     #[test]
+    fn forward_function_definition_upgrades_relocation_symbol_in_place() {
+        let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let text_section_id = output.text_section();
+        let field = output.append_section_data(text_section_id, &[0; 4], 0x90);
+        let name = RawString::from(&b"later_function"[..]);
+        output
+            .add_relocation(
+                name,
+                ObjectLocation::Extern(object::SymbolKind::Text),
+                field,
+                RelocationEncoding::Relative,
+            )
+            .unwrap();
+
+        let undefined_id = output.undefined_symbols[b"later_function".as_slice()];
+        let definition = output.add_function(name, &[0xc3]).unwrap();
+        let symbol = output.object.symbol(undefined_id);
+        assert_eq!(symbol.value, definition.offset);
+        assert_eq!(symbol.kind, object::SymbolKind::Text);
+        assert_eq!(symbol.scope, object::SymbolScope::Linkage);
+        assert_eq!(
+            symbol.section,
+            object::write::SymbolSection::Section(definition.section_id)
+        );
+        assert!(
+            !output
+                .undefined_symbols
+                .contains_key(b"later_function".as_slice())
+        );
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let matching = object
+            .symbols()
+            .filter(|symbol| symbol.name() == Ok("later_function"))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert!(matching[0].is_definition());
+        let relocation = object
+            .section_by_name(".text")
+            .unwrap()
+            .relocations()
+            .next()
+            .unwrap();
+        let object::RelocationTarget::Symbol(symbol) = relocation.1.target() else {
+            panic!("function relocation must target a symbol");
+        };
+        let target = object.symbol_by_index(symbol).unwrap();
+        assert_eq!(target.name(), Ok("later_function"));
+        assert!(target.is_definition());
+        assert_eq!(target.address(), definition.offset);
+    }
+
+    #[test]
+    fn function_definition_rejects_pre_existing_defined_symbol() {
+        let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let data_section_id = output.data_section();
+        let name = RawString::from(&b"collision"[..]);
+        output.object.add_symbol(object::write::Symbol {
+            name: name.as_bytes().to_vec(),
+            value: 0,
+            size: 4,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Section(data_section_id),
+            flags: object::SymbolFlags::None,
+        });
+
+        let error = output
+            .add_function(name, &[0xc3])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("incompatible pre-existing function symbol collision"));
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let matching = object
+            .symbols()
+            .filter(|symbol| symbol.name() == Ok("collision"))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].kind(), object::SymbolKind::Data);
+    }
+
+    #[test]
     fn emits_distinct_data_sections() {
         let sections = [
             DataSection {
@@ -1614,7 +1734,9 @@ mod tests {
             data: &[],
         };
         let mut output = ObjectFile::with_sections(&sections, empty, empty, &[], false).unwrap();
-        output.add_function(RawString::from(&b"only_code"[..]), &[0xc3]);
+        output
+            .add_function(RawString::from(&b"only_code"[..]), &[0xc3])
+            .unwrap();
 
         let bytes = output.object.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
@@ -1650,7 +1772,9 @@ mod tests {
             data: &[],
         };
         let mut output = ObjectFile::with_sections(&sections, empty, empty, &[], false).unwrap();
-        output.add_function(RawString::from(&b"only_code"[..]), &[0xc3]);
+        output
+            .add_function(RawString::from(&b"only_code"[..]), &[0xc3])
+            .unwrap();
         let lazy_rdata = output.rdata_section();
         output
             .object
