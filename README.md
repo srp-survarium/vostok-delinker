@@ -53,6 +53,21 @@ cargo run --release -- \
 
 Run `vostok-delinker --help` for the complete option list.
 
+## Import address table
+
+Vostok recovers absolute references to imported functions and data without a
+project manifest. It locates the import address table from the PE data directory,
+so the table may use the conventional `.idata` section or be merged into a
+differently named section. An exact PDB symbol at the referenced IAT slot supplies
+the undefined COFF symbol name, such as `__imp__Function@4`; the linked slot
+address is replaced with a zero addend and an absolute relocation.
+
+Recovery requires a PE `HIGHLOW` base-relocation entry for the reference site.
+When such an entry targets the IAT, the supplied PDB must name that exact slot;
+Vostok reports an error instead of guessing a missing symbol identity. IAT
+references are separate from reviewed data definitions and are unaffected by
+`--strict`.
+
 ## Data manifest
 
 The data manifest is an independent, optional input. It is useful with both an

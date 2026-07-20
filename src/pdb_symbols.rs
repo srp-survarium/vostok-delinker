@@ -8,6 +8,7 @@ use crate::utils::{ToUsize, leak};
 #[derive(Default)]
 pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
+    pub imports: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
     pub constants: BTreeMap<usize, RawString<'static>>,
@@ -36,6 +37,7 @@ impl PdbSymbols {
         // But we also want unique symbols.
         let mut static_data_symbols = vec![];
         let mut constant_data_symbols = vec![];
+        let mut import_data_symbols = vec![];
 
         let mut symbols = env.symbol_table.iter();
         while let Some(symbol) = symbols.next()? {
@@ -48,14 +50,31 @@ impl PdbSymbols {
             };
             let name = *name;
 
-            let symbol_rva = match () {
-                () if offset.section == env.text.id => env.text.rva + offset.offset.to_usize(),
-                () if offset.section == env.rdata.id => env.rdata.rva + offset.offset.to_usize(),
-                () if offset.section == env.data.id => env.data.rva + offset.offset.to_usize(),
-                _ => continue,
+            let symbol_rva = match env.iat_rva(*offset) {
+                Some(rva) => rva,
+                None => match () {
+                    () if offset.section == env.text.id => env.text.rva + offset.offset.to_usize(),
+                    () if offset.section == env.rdata.id => {
+                        env.rdata.rva + offset.offset.to_usize()
+                    }
+                    () if offset.section == env.data.id => env.data.rva + offset.offset.to_usize(),
+                    _ => continue,
+                },
             };
 
             match symbol {
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
+                    if env.iat.is_some_and(|iat| iat.contains_rva(symbol_rva)) =>
+                {
+                    self.imports.entry(symbol_rva).or_insert(name);
+                }
+
+                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                    if env.iat.is_some_and(|iat| iat.contains_rva(symbol_rva)) =>
+                {
+                    import_data_symbols.push((symbol_rva, name));
+                }
+
                 // @NOTE: There are more symbols in `.text`, which are not functions.
                 // Seem to be useless though:
                 // 0x1cba96: __imp_load__CoInitialize@4
@@ -109,6 +128,9 @@ impl PdbSymbols {
                 _ => {}
             }
         }
+        for (symbol_rva, name) in import_data_symbols {
+            self.imports.entry(symbol_rva).or_insert(name);
+        }
         for (symbol_rva, name) in static_data_symbols {
             match self.statics.entry(symbol_rva) {
                 btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
@@ -155,6 +177,10 @@ impl PdbSymbols {
                     }
 
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
+                        if let Some(symbol_rva) = env.iat_rva(offset) {
+                            self.imports.entry(symbol_rva).or_insert(name);
+                            continue;
+                        }
                         let symbol_rva = match () {
                             () if offset.section == env.rdata.id => {
                                 env.rdata.rva + offset.offset.to_usize()
