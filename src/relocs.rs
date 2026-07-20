@@ -1,7 +1,7 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
 use crate::pdb_symbols;
-use crate::reloc_alias_manifest::RelocAliasManifest;
+use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::reloc_manifest::RelocManifest;
 use crate::utils::ToUsize;
 
@@ -61,21 +61,21 @@ pub enum ManifestCoverage {
 pub struct ResolvedRelocations<'a> {
     pub coff_data: Vec<u8>,
     pub by_rva: BTreeMap<usize, RelocKind<'a>>,
-    pub observed_aliases: BTreeMap<(usize, usize), usize>,
+    pub observed_aliases: RelocAliasObservations,
 }
 
 fn resolve_manifest_alias(
     aliases: &RelocAliasManifest,
     symbols: &BTreeMap<usize, RawString<'static>>,
     functions: &BTreeMap<usize, Vec<RawString<'static>>>,
-    observed: &mut BTreeMap<(usize, usize), usize>,
+    observed: &mut RelocAliasObservations,
     reloc_rva: usize,
     target_rva: usize,
 ) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
     let Some((function_rva, _)) = functions.range(..=reloc_rva).next_back() else {
         return Ok(None);
     };
-    let Some(alias) = aliases.get(*function_rva, target_rva) else {
+    let Some(alias) = aliases.resolve(*function_rva, target_rva, reloc_rva, observed) else {
         return Ok(None);
     };
 
@@ -98,7 +98,6 @@ fn resolve_manifest_alias(
         anyhow::bail!("relocation alias owner/addend does not resolve to target");
     }
 
-    *observed.entry((*function_rva, target_rva)).or_default() += 1;
     Ok(Some((alias.addend, alias.owner)))
 }
 
@@ -130,7 +129,7 @@ pub fn resolve_absolute_relocations<'s>(
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
-    let mut observed_aliases = BTreeMap::<(usize, usize), usize>::new();
+    let mut observed_aliases = RelocAliasObservations::default();
 
     // Absolute sites come from the `.reloc` directory, or -- for a stripped image
     // that has none -- from a reviewed reloc manifest and/or PDB rediscovery. A
@@ -213,7 +212,7 @@ fn resolve_reloc_directory<'s>(
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
-    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
+    observed_aliases: &mut RelocAliasObservations,
 ) -> anyhow::Result<()> {
     let mut pos = 0;
     while pos + HEADER_SIZE <= reloc_data.len() {
@@ -263,7 +262,7 @@ fn resolve_manifest_sites<'s>(
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
-    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
+    observed_aliases: &mut RelocAliasObservations,
 ) -> anyhow::Result<()> {
     for &site in reloc_manifest.sites() {
         if site + 4 > exe_data.len() {
@@ -298,7 +297,7 @@ fn rediscover_absolute_sites_from_pdb<'s>(
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
-    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
+    observed_aliases: &mut RelocAliasObservations,
     interior_bound: usize,
 ) -> anyhow::Result<()> {
     let image_base = env.image_base.to_usize();
@@ -358,7 +357,7 @@ fn resolve_absolute_site<'s>(
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
-    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
+    observed_aliases: &mut RelocAliasObservations,
     reloc_rva: usize,
 ) -> anyhow::Result<()> {
     let target_va = bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
@@ -390,6 +389,7 @@ fn resolve_absolute_site<'s>(
                 reloc_aliases.resolve_function_alias(
                     *owner_function_rva,
                     target_rva,
+                    reloc_rva,
                     function_overloads,
                     observed_aliases,
                 )?
