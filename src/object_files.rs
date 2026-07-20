@@ -12,6 +12,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 use pdb2::{FallibleIterator, RawString};
 
 use object::SectionKind;
+use object::write::SymbolId;
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -23,6 +24,7 @@ pub struct ObjectFile {
     pub rdata_section_id: object::write::SectionId,
     pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: object::write::SectionId,
+    undefined_symbols: HashMap<Vec<u8>, SymbolId>,
 }
 
 #[derive(Copy, Clone)]
@@ -43,10 +45,10 @@ enum TargetMaterialization {
     ReferenceOnly,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum SymbolReuse {
-    AlwaysCreate,
-    ReuseIfDefined,
+    CreateUnique,
+    ReuseExisting,
 }
 
 impl ObjectFiles<'_> {
@@ -237,6 +239,7 @@ impl ObjectFile {
             rdata_section_id,
             bss_section_id: None,
             text_section_id,
+            undefined_symbols: HashMap::new(),
         }
     }
 }
@@ -423,17 +426,12 @@ impl ObjectFile {
                 | RelocKind::Constant { .. }
                 | RelocKind::Static { .. } => RelocationEncoding::Absolute,
             };
-            let symbol_reuse = if target_is_manifest_definition {
-                SymbolReuse::ReuseIfDefined
-            } else {
-                SymbolReuse::AlwaysCreate
-            };
             self.add_relocation(
                 reloc_name,
                 ObjectLocation::Extern,
                 reloc_offset,
                 encoding,
-                symbol_reuse,
+                SymbolReuse::ReuseExisting,
             )?;
             return Ok(());
         }
@@ -448,7 +446,7 @@ impl ObjectFile {
                     ObjectLocation::Extern,
                     reloc_offset,
                     encoding,
-                    SymbolReuse::AlwaysCreate,
+                    SymbolReuse::ReuseExisting,
                 )?;
             }
 
@@ -461,7 +459,7 @@ impl ObjectFile {
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
+                    SymbolReuse::CreateUnique,
                 )?;
             }
 
@@ -478,7 +476,7 @@ impl ObjectFile {
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
+                    SymbolReuse::CreateUnique,
                 )?;
 
                 // Cycle guard for self-referential RVAs.
@@ -511,7 +509,7 @@ impl ObjectFile {
                     ObjectLocation::Offset(static_offset_in_coff_data),
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
+                    SymbolReuse::CreateUnique,
                 )?;
 
                 // Same cycle guard as the Constant arm above.
@@ -693,22 +691,17 @@ impl ObjectFile {
             }
         };
 
-        let symbol = match symbol_reuse {
-            SymbolReuse::ReuseIfDefined => {
-                self.object.symbol_id(name.as_bytes()).unwrap_or_else(|| {
-                    self.object.add_symbol(object::write::Symbol {
-                        name: name.as_bytes().to_vec(),
-                        value,
-                        size: u64::MAX,
-                        kind,
-                        scope: object::SymbolScope::Linkage,
-                        weak: false,
-                        section,
-                        flags: object::SymbolFlags::None,
-                    })
-                })
-            }
-            SymbolReuse::AlwaysCreate => self.object.add_symbol(object::write::Symbol {
+        let existing = match symbol_reuse {
+            SymbolReuse::CreateUnique => None,
+            SymbolReuse::ReuseExisting => self
+                .object
+                .symbol_id(name.as_bytes())
+                .or_else(|| self.undefined_symbols.get(name.as_bytes()).copied()),
+        };
+        let symbol = if let Some(symbol) = existing {
+            symbol
+        } else {
+            let symbol = self.object.add_symbol(object::write::Symbol {
                 name: name.as_bytes().to_vec(),
                 value,
                 size: u64::MAX,
@@ -717,7 +710,14 @@ impl ObjectFile {
                 weak: false,
                 section,
                 flags: object::SymbolFlags::None,
-            }),
+            });
+            if symbol_reuse == SymbolReuse::ReuseExisting
+                && section == object::write::SymbolSection::Undefined
+            {
+                self.undefined_symbols
+                    .insert(name.as_bytes().to_vec(), symbol);
+            }
+            symbol
         };
 
         let (kind, addend) = match encoding {
@@ -898,5 +898,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("expected section offset 0x4, emitted 0x0"));
+    }
+
+    #[test]
+    fn repeated_external_relocations_reuse_one_undefined_symbol() {
+        let mut object = ObjectFile::empty(false);
+        let offset = object.append_section_data(object.text_section_id, &[0; 8], 0x90);
+        let name = RawString::from(&b"external"[..]);
+
+        object
+            .add_relocation(
+                name,
+                ObjectLocation::Extern,
+                offset,
+                RelocationEncoding::Absolute,
+                SymbolReuse::ReuseExisting,
+            )
+            .unwrap();
+        object
+            .add_relocation(
+                name,
+                ObjectLocation::Extern,
+                offset + 4,
+                RelocationEncoding::Absolute,
+                SymbolReuse::ReuseExisting,
+            )
+            .unwrap();
+
+        assert_eq!(object.undefined_symbols.len(), 1);
+        assert!(
+            object
+                .undefined_symbols
+                .contains_key(b"external".as_slice())
+        );
     }
 }
