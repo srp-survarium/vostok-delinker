@@ -1,6 +1,6 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
-use crate::pdb_symbols;
+use crate::pdb_symbols::{self, PdbDataSymbol};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::reloc_manifest::RelocManifest;
 use crate::utils::ToUsize;
@@ -65,6 +65,12 @@ pub enum ManifestCoverage {
     RequireComplete,
 }
 
+#[derive(Default)]
+struct SkippedSizedRelocations {
+    constants: usize,
+    statics: usize,
+}
+
 pub struct ResolvedRelocations<'a> {
     pub coff_data: Vec<u8>,
     pub by_rva: BTreeMap<usize, RelocKind<'a>>,
@@ -73,7 +79,7 @@ pub struct ResolvedRelocations<'a> {
 
 fn resolve_manifest_alias(
     aliases: &RelocAliasManifest,
-    symbols: &BTreeMap<usize, RawString<'static>>,
+    symbols: &BTreeMap<usize, PdbDataSymbol>,
     functions: &BTreeMap<usize, Vec<RawString<'static>>>,
     observed: &mut RelocAliasObservations,
     reloc_rva: usize,
@@ -88,7 +94,7 @@ fn resolve_manifest_alias(
 
     let mut owners = symbols
         .iter()
-        .filter(|(_, symbol_name)| **symbol_name == alias.owner);
+        .filter(|(_, symbol)| symbol.name == alias.owner);
     let Some((owner_rva, _)) = owners.next() else {
         anyhow::bail!(
             "relocation alias owner is absent from the PDB: {}",
@@ -137,6 +143,7 @@ pub fn resolve_absolute_relocations<'s>(
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
     let mut observed_aliases = RelocAliasObservations::default();
+    let mut skipped_sized = SkippedSizedRelocations::default();
 
     // Absolute sites come from the `.reloc` directory, or -- for a stripped image
     // that has none -- from a reviewed reloc manifest and/or PDB rediscovery. A
@@ -156,6 +163,7 @@ pub fn resolve_absolute_relocations<'s>(
                 &mut coff_data,
                 &mut relocs_rva,
                 &mut observed_aliases,
+                &mut skipped_sized,
             )?;
         }
         (None, true) => {
@@ -172,6 +180,7 @@ pub fn resolve_absolute_relocations<'s>(
                     &mut coff_data,
                     &mut relocs_rva,
                     &mut observed_aliases,
+                    &mut skipped_sized,
                 )?;
             }
             if rediscover_from_pdb {
@@ -185,6 +194,7 @@ pub fn resolve_absolute_relocations<'s>(
                     &mut coff_data,
                     &mut relocs_rva,
                     &mut observed_aliases,
+                    &mut skipped_sized,
                     rediscovery_interior_bound,
                 )?;
             }
@@ -199,6 +209,13 @@ pub fn resolve_absolute_relocations<'s>(
              and/or --rediscover-relocations-from-pdb to recover its absolute relocations"
         ),
     };
+
+    if skipped_sized.constants != 0 || skipped_sized.statics != 0 {
+        eprintln!(
+            "[relocs] skipped {} .rdata and {} .data relocations outside known PDB symbol sizes",
+            skipped_sized.constants, skipped_sized.statics
+        );
+    }
 
     Ok(ResolvedRelocations {
         coff_data,
@@ -220,6 +237,7 @@ fn resolve_reloc_directory<'s>(
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
     observed_aliases: &mut RelocAliasObservations,
+    skipped_sized: &mut SkippedSizedRelocations,
 ) -> anyhow::Result<()> {
     let mut pos = 0;
     while pos + HEADER_SIZE <= reloc_data.len() {
@@ -250,6 +268,7 @@ fn resolve_reloc_directory<'s>(
                 coff_data,
                 relocs_rva,
                 observed_aliases,
+                skipped_sized,
                 reloc_rva,
             )?;
         }
@@ -270,6 +289,7 @@ fn resolve_manifest_sites<'s>(
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
     observed_aliases: &mut RelocAliasObservations,
+    skipped_sized: &mut SkippedSizedRelocations,
 ) -> anyhow::Result<()> {
     for &site in reloc_manifest.sites() {
         if site + 4 > exe_data.len() {
@@ -285,6 +305,7 @@ fn resolve_manifest_sites<'s>(
             coff_data,
             relocs_rva,
             observed_aliases,
+            skipped_sized,
             site,
         )?;
     }
@@ -305,6 +326,7 @@ fn rediscover_absolute_sites_from_pdb<'s>(
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
     observed_aliases: &mut RelocAliasObservations,
+    skipped_sized: &mut SkippedSizedRelocations,
     interior_bound: usize,
 ) -> anyhow::Result<()> {
     let image_base = env.image_base.to_usize();
@@ -342,6 +364,7 @@ fn rediscover_absolute_sites_from_pdb<'s>(
                     coff_data,
                     relocs_rva,
                     observed_aliases,
+                    skipped_sized,
                     site,
                 )?;
             }
@@ -365,6 +388,7 @@ fn resolve_absolute_site<'s>(
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
     observed_aliases: &mut RelocAliasObservations,
+    skipped_sized: &mut SkippedSizedRelocations,
     reloc_rva: usize,
 ) -> anyhow::Result<()> {
     let target_va = bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
@@ -485,22 +509,23 @@ fn resolve_absolute_site<'s>(
                         }
 
                         Some(_) | None => {
-                            let Some((constant_rva, constant_name)) =
+                            let Some((constant_rva, constant)) =
                                 symbols.constants.range(..=target_rva).next_back()
                             else {
                                 unreachable!("All constants must be named");
                             };
 
-                            // @TODO: Many relocations (~2k) have very huge diffs,
-                            // meaning they do not actually belong to a found symbol.
-                            // This needs to be investigated (if this will affect objdiff matching)
+                            if !constant.contains(*constant_rva, target_rva) {
+                                skipped_sized.constants += 1;
+                                return Ok(());
+                            }
                             let diff = u32::try_from(target_rva - *constant_rva)?;
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                             relocs_rva.insert(
                                 reloc_rva,
                                 RelocKind::ConjuredConstant {
-                                    symbol: *constant_name,
+                                    symbol: constant.name,
                                     target_rva,
                                 },
                             );
@@ -549,7 +574,7 @@ fn resolve_absolute_site<'s>(
                     );
                 }
                 (ManifestCoverage::AllowPartial, None) => {
-                    let Some((static_rva, static_name)) =
+                    let Some((static_rva, static_symbol)) =
                         symbols.statics.range(..=target_rva).next_back()
                     else {
                         let _reloc_va = reloc_rva + env.image_base.to_usize();
@@ -558,16 +583,17 @@ fn resolve_absolute_site<'s>(
                         return Ok(());
                     };
 
-                    // @TODO: Many relocations (~10k) have very huge diffs,
-                    // meaning they do not actually belong to a found symbol.
-                    // This needs to be investigated (if this will affect objdiff matching)
+                    if !static_symbol.contains(*static_rva, target_rva) {
+                        skipped_sized.statics += 1;
+                        return Ok(());
+                    }
                     let diff = u32::try_from(target_rva - *static_rva)?;
                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                     relocs_rva.insert(
                         reloc_rva,
                         RelocKind::ConjuredStatic {
-                            symbol: *static_name,
+                            symbol: static_symbol.name,
                             target_rva,
                         },
                     );
