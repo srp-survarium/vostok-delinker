@@ -179,7 +179,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
     let reloc_alias_manifest =
         reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
-    reloc_alias_manifest.validate_site_membership(&pdb_symbols.functions)?;
+    reloc_alias_manifest.validate_site_membership(&pdb_symbols)?;
     let relocs::ResolvedRelocations {
         coff_data,
         by_rva: relocs_rva,

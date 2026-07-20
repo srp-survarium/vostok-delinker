@@ -8,11 +8,21 @@ use crate::utils::{ToUsize, leak};
 #[derive(Default)]
 pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
+    function_extents: BTreeMap<usize, usize>,
     pub imports: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
     pub constants: BTreeMap<usize, PdbDataSymbol>,
     pub statics: BTreeMap<usize, PdbDataSymbol>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FunctionRelocationField {
+    Within { function_rva: usize },
+    MissingFunction,
+    UnknownExtent,
+    OutsideExtent,
+    FieldOverflow,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -109,7 +119,7 @@ impl PdbSymbols {
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { function, .. }) if function => {
                     assert_eq!(offset.section, env.text.id);
 
-                    Self::push_function_name(self.functions.entry(symbol_rva).or_default(), name);
+                    self.add_function_at_rva(symbol_rva, name, None)?;
                 }
 
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
@@ -208,11 +218,14 @@ impl PdbSymbols {
             while let Some(symbol) = iter.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
-                        name, offset, ..
-                    })) => self.add_function_symbol(env, name, offset),
-                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol { name, offset, .. })) => {
-                        self.add_function_symbol(env, name, offset)
-                    }
+                        name,
+                        offset,
+                        len,
+                        ..
+                    })) => self.add_function_symbol(env, name, offset, len.to_usize())?,
+                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
+                        name, offset, len, ..
+                    })) => self.add_function_symbol(env, name, offset, len.to_usize())?,
 
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol {
                         offset,
@@ -272,13 +285,66 @@ impl PdbSymbols {
 
         name: RawString<'static>,
         offset: pdb2::PdbInternalSectionOffset,
-    ) {
+        size: usize,
+    ) -> anyhow::Result<()> {
         let symbol_rva = env.text.rva + offset.offset.to_usize();
-        self.add_function_at_rva(symbol_rva, name);
+        self.add_function_at_rva(symbol_rva, name, Some(size))
     }
 
-    fn add_function_at_rva(&mut self, symbol_rva: usize, name: RawString<'static>) {
+    pub(crate) fn add_function_at_rva(
+        &mut self,
+        symbol_rva: usize,
+        name: RawString<'static>,
+        size: Option<usize>,
+    ) -> anyhow::Result<()> {
+        if let Some(size) = size {
+            symbol_rva
+                .checked_add(size)
+                .ok_or_else(|| anyhow::anyhow!("PDB function extent overflows RVA"))?;
+            match self.function_extents.entry(symbol_rva) {
+                btree_map::Entry::Vacant(entry) => {
+                    entry.insert(size);
+                }
+                btree_map::Entry::Occupied(entry) if *entry.get() == size => {}
+                btree_map::Entry::Occupied(entry) => anyhow::bail!(
+                    "PDB function records at RVA {symbol_rva:#x} disagree on size: {} and {size}",
+                    entry.get()
+                ),
+            }
+        }
         Self::push_function_name(self.functions.entry(symbol_rva).or_default(), name);
+        Ok(())
+    }
+
+    pub fn relocation_field_in_function(
+        &self,
+        function_rva: usize,
+        site_rva: usize,
+    ) -> FunctionRelocationField {
+        if !self.functions.contains_key(&function_rva) {
+            return FunctionRelocationField::MissingFunction;
+        }
+        let Some(size) = self.function_extents.get(&function_rva).copied() else {
+            return FunctionRelocationField::UnknownExtent;
+        };
+        let Some(site_end) = site_rva.checked_add(std::mem::size_of::<u32>()) else {
+            return FunctionRelocationField::FieldOverflow;
+        };
+        let Some(function_end) = function_rva.checked_add(size) else {
+            return FunctionRelocationField::FieldOverflow;
+        };
+        if function_rva <= site_rva && site_end <= function_end {
+            FunctionRelocationField::Within { function_rva }
+        } else {
+            FunctionRelocationField::OutsideExtent
+        }
+    }
+
+    pub fn relocation_field_owner(&self, site_rva: usize) -> FunctionRelocationField {
+        let Some((function_rva, _)) = self.functions.range(..=site_rva).next_back() else {
+            return FunctionRelocationField::MissingFunction;
+        };
+        self.relocation_field_in_function(*function_rva, site_rva)
     }
 
     fn push_function_name(names: &mut Vec<RawString<'static>>, name: RawString<'static>) {
@@ -431,14 +497,72 @@ mod tests {
     #[test]
     fn retains_distinct_pdb_names_at_one_function_rva() {
         let mut symbols = PdbSymbols::default();
-        symbols.add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]));
-        symbols.add_function_at_rva(0x1000, RawString::from(&b"real_b"[..]));
-        symbols.add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]));
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]), Some(0x20))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"real_b"[..]), Some(0x20))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]), Some(0x20))
+            .unwrap();
 
         let names = &symbols.functions[&0x1000];
         assert_eq!(names.len(), 2);
         assert_eq!(names[0].as_bytes(), b"real_a");
         assert_eq!(names[1].as_bytes(), b"real_b");
+    }
+
+    #[test]
+    fn duplicate_function_records_must_agree_on_extent() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]), Some(0x20))
+            .unwrap();
+        let error = symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"real_b"[..]), Some(0x24))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RVA 0x1000 disagree on size: 32 and 36"));
+        assert_eq!(symbols.functions[&0x1000].len(), 1);
+    }
+
+    #[test]
+    fn relocation_field_requires_a_known_complete_function_extent() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"known"[..]), Some(0x10))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"public_only"[..]), None)
+            .unwrap();
+
+        assert_eq!(
+            symbols.relocation_field_owner(0x100c),
+            FunctionRelocationField::Within {
+                function_rva: 0x1000
+            }
+        );
+        assert_eq!(
+            symbols.relocation_field_owner(0x100d),
+            FunctionRelocationField::OutsideExtent
+        );
+        assert_eq!(
+            symbols.relocation_field_owner(0x1010),
+            FunctionRelocationField::OutsideExtent
+        );
+        assert_eq!(
+            symbols.relocation_field_owner(0x2000),
+            FunctionRelocationField::UnknownExtent
+        );
+        assert_eq!(
+            symbols.relocation_field_in_function(0x3000, 0x3000),
+            FunctionRelocationField::MissingFunction
+        );
+        assert_eq!(
+            symbols.relocation_field_in_function(0x1000, usize::MAX - 2),
+            FunctionRelocationField::FieldOverflow
+        );
     }
 
     #[test]
