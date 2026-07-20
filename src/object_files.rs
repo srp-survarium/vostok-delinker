@@ -322,7 +322,6 @@ fn resolve_relative_relocations<'s>(
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(
             fun_rva + offset_in_fun - 4,
-            // A decoded call/jmp/jcc target -> PC-relative branch.
             RelocKind::Function { overloads, relative: true },
         );
 
@@ -454,7 +453,6 @@ impl ObjectFile {
         name: RawString,
         location: ObjectLocation,
         offset: ObjectOffset,
-        // PC-relative branch (call/jmp/jcc) vs absolute address operand.
         relative: bool,
     ) -> anyhow::Result<()> {
         let (value, kind, section) = match location {
@@ -488,11 +486,6 @@ impl ObjectFile {
             flags: object::SymbolFlags::None,
         });
 
-        // A relative branch's operand is the displacement from the END of the
-        // 4-byte field, so it carries addend -4; an absolute operand (DIR32)
-        // holds the symbol address directly (addend 0). cl.exe emits DIR32 for
-        // every non-branch reference, so emitting REL32 there made objdiff flag
-        // an arg mismatch even when the target symbol name matched.
         let (kind, addend) = if relative {
             (object::RelocationKind::Relative, -4)
         } else {
