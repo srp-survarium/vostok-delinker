@@ -1,6 +1,6 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
-use crate::pdb_symbols;
+use crate::pdb_symbols::{self, PdbDataSymbol};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::utils::ToUsize;
 
@@ -61,7 +61,7 @@ pub struct ResolvedRelocations<'a> {
 
 fn resolve_manifest_alias(
     aliases: &RelocAliasManifest,
-    symbols: &BTreeMap<usize, RawString<'static>>,
+    symbols: &BTreeMap<usize, PdbDataSymbol>,
     functions: &BTreeMap<usize, Vec<RawString<'static>>>,
     observed: &mut RelocAliasObservations,
     reloc_rva: usize,
@@ -76,7 +76,7 @@ fn resolve_manifest_alias(
 
     let mut owners = symbols
         .iter()
-        .filter(|(_, symbol_name)| **symbol_name == alias.owner);
+        .filter(|(_, symbol)| symbol.name == alias.owner);
     let Some((owner_rva, _)) = owners.next() else {
         anyhow::bail!(
             "relocation alias owner is absent from the PDB: {}",
@@ -126,6 +126,8 @@ pub fn resolve_absolute_relocations<'s>(
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
     let mut observed_aliases = RelocAliasObservations::default();
+    let mut skipped_sized_constants = 0usize;
+    let mut skipped_sized_statics = 0usize;
 
     let mut pos = 0;
     let reloc_data = reloc_sec.data()?;
@@ -283,22 +285,24 @@ pub fn resolve_absolute_relocations<'s>(
                                 }
 
                                 Some(_) | None => {
-                                    let Some((constant_rva, constant_name)) =
+                                    let Some((constant_rva, constant)) =
                                         symbols.constants.range(..=target_rva).next_back()
                                     else {
                                         unreachable!("All constants must be named");
                                     };
 
-                                    // @TODO: Many relocations (~2k) have very huge diffs,
-                                    // meaning they do not actually belong to a found symbol.
-                                    // This needs to be investigated (if this will affect objdiff matching)
+                                    if !constant.contains(*constant_rva, target_rva) {
+                                        skipped_sized_constants += 1;
+                                        continue;
+                                    }
+
                                     let diff = u32::try_from(target_rva - *constant_rva)?;
                                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                                     relocs_rva.insert(
                                         reloc_rva,
                                         RelocKind::Constant {
-                                            symbol: *constant_name,
+                                            symbol: constant.name,
                                             target_rva,
                                         },
                                     );
@@ -348,7 +352,7 @@ pub fn resolve_absolute_relocations<'s>(
                             );
                         }
                         (ManifestCoverage::AllowPartial, None) => {
-                            let Some((static_rva, static_name)) =
+                            let Some((static_rva, static_symbol)) =
                                 symbols.statics.range(..=target_rva).next_back()
                             else {
                                 let _reloc_va = reloc_rva + env.image_base.to_usize();
@@ -357,16 +361,18 @@ pub fn resolve_absolute_relocations<'s>(
                                 continue;
                             };
 
-                            // @TODO: Many relocations (~10k) have very huge diffs,
-                            // meaning they do not actually belong to a found symbol.
-                            // This needs to be investigated (if this will affect objdiff matching)
+                            if !static_symbol.contains(*static_rva, target_rva) {
+                                skipped_sized_statics += 1;
+                                continue;
+                            }
+
                             let diff = u32::try_from(target_rva - *static_rva)?;
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                             relocs_rva.insert(
                                 reloc_rva,
                                 RelocKind::Static {
-                                    symbol: *static_name,
+                                    symbol: static_symbol.name,
                                     target_rva,
                                 },
                             );
@@ -376,6 +382,13 @@ pub fn resolve_absolute_relocations<'s>(
                 () => (),
             }
         }
+    }
+
+    if skipped_sized_constants != 0 || skipped_sized_statics != 0 {
+        eprintln!(
+            "[relocs] skipped {} .rdata and {} .data relocations outside known PDB symbol sizes",
+            skipped_sized_constants, skipped_sized_statics
+        );
     }
 
     Ok(ResolvedRelocations {
