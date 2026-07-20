@@ -18,6 +18,7 @@ pub enum RelocKind<'a> {
     // reference to that function.
     Function {
         overloads: &'a [RawString<'static>],
+        symbol: Option<RawString<'static>>,
         encoding: RelocationEncoding,
     },
 
@@ -55,6 +56,12 @@ pub enum RelocationEncoding {
 pub enum ManifestCoverage {
     AllowPartial,
     RequireComplete,
+}
+
+pub struct ResolvedRelocations<'a> {
+    pub coff_data: Vec<u8>,
+    pub by_rva: BTreeMap<usize, RelocKind<'a>>,
+    pub observed_aliases: BTreeMap<(usize, usize), usize>,
 }
 
 fn resolve_manifest_alias(
@@ -119,7 +126,7 @@ pub fn resolve_absolute_relocations<'s>(
     reloc_manifest: Option<&RelocManifest>,
     rediscover_from_pdb: bool,
     rediscovery_interior_bound: usize,
-) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
+) -> anyhow::Result<ResolvedRelocations<'s>> {
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
@@ -187,8 +194,11 @@ pub fn resolve_absolute_relocations<'s>(
         ),
     };
 
-    reloc_aliases.validate_occurrences(&observed_aliases)?;
-    Ok((coff_data, relocs_rva))
+    Ok(ResolvedRelocations {
+        coff_data,
+        by_rva: relocs_rva,
+        observed_aliases,
+    })
 }
 
 /// Resolve every HIGHLOW site in the PE base-relocation directory (`.reloc`).
@@ -367,10 +377,31 @@ fn resolve_absolute_site<'s>(
             let diff = u32::try_from(target_rva - *function_rva)?;
             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
+            let symbol = if diff == 0
+                && (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
+            {
+                let Some((owner_function_rva, _)) =
+                    symbols.functions.range(..=reloc_rva).next_back()
+                else {
+                    anyhow::bail!(
+                        "function relocation site {reloc_rva:#x} has no containing function"
+                    );
+                };
+                reloc_aliases.resolve_function_alias(
+                    *owner_function_rva,
+                    target_rva,
+                    function_overloads,
+                    observed_aliases,
+                )?
+            } else {
+                None
+            };
+
             relocs_rva.insert(
                 reloc_rva,
                 RelocKind::Function {
                     overloads: function_overloads,
+                    symbol,
                     encoding: RelocationEncoding::Absolute,
                 },
             );
