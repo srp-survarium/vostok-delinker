@@ -153,7 +153,7 @@ independently of symbol identity. Its first non-comment line must be this exact
 header:
 
 ```text
-object	ordinal	name	rva	size	alignment	characteristics	comdat_selection	associative_ordinal	storage
+object	ordinal	name	rva	size	alignment	characteristics	checksum	comdat_selection	associative_ordinal	storage
 ```
 
 Each object's ordinals must be unique, contiguous, and start at one. The fields
@@ -168,6 +168,7 @@ have these meanings:
 | `size` | Original section extent in bytes. |
 | `alignment` | Original non-zero, power-of-two section alignment. |
 | `characteristics` | Complete COFF section characteristics in decimal or `0x` hexadecimal notation. |
+| `checksum` | Exact checksum from the COFF section-definition auxiliary record. |
 | `comdat_selection` | COFF selection value: `0` none, `1` no duplicates, `2` any, `3` same size, `4` exact match, `5` associative, `6` largest, or `7` newest. |
 | `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section. |
 | `storage` | `data`, `rdata`, or `bss` for a data-bearing candidate section, otherwise `-`. `data` accepts `.data` and linker-sorted `.CRT$*` subsections. An RVA requires storage, while storage may be present without an affine RVA. |
@@ -181,6 +182,8 @@ When this manifest is supplied, its section table is exact: Vostok does not add
 unused `.data`, `.rdata`, or `.text` sections that are absent from its rows. A
 section needed by emitted content is created only when that content is actually
 encountered. Without the manifest, Vostok synthesizes its default section set.
+Exact-topology output replaces the object writer's generated section-definition
+checksums only for manifest-declared sections, using each row's reviewed value.
 
 Vostok materializes affine `.data`, `.rdata`, and `.bss` ranges directly from
 the linked image. For a storage-assigned section without an affine RVA, it
