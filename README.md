@@ -253,13 +253,14 @@ cargo run --release -- \
 Its first non-comment line must be this exact header:
 
 ```text
-function_rva	target_rva	owner	addend	occurrences
+function_rva	target_rva	site_rva	owner	addend	occurrences
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `function_rva` | Exact start RVA of the PDB function containing the relocation sites. |
 | `target_rva` | Exact linked RVA encoded at those retained PE relocation sites. |
+| `site_rva` | Exact RVA of one four-byte relocation field, or `*` for every matching site not covered by an exact row. |
 | `owner` | Existing PDB data symbol or function alias that the candidate COFF relocations should reference. |
 | `addend` | Unsigned 32-bit COFF addend bits, including two's-complement encodings such as `0xfffffff8`. |
 | `occurrences` | Exact number of matching relocation sites expected in that function. |
@@ -267,8 +268,9 @@ function_rva	target_rva	owner	addend	occurrences
 Example:
 
 ```text
-function_rva	target_rva	owner	addend	occurrences
-0x126d	0xec094	?SmackOptions@@3PAUSSmackOptions@@A	0x24	3
+function_rva	target_rva	site_rva	owner	addend	occurrences
+0xd3910	0x134de0	*	?hSequence@@3PAPAU_SEQUENCE@@A	0	5
+0xd3910	0x134de0	0xd3aa5	?pMIDIWrap@@3PAPAVMIDIWrap@@A	0xf0	1
 ```
 
 Data aliases apply only to existing `HIGHLOW` relocation sites inside `.text`.
@@ -278,5 +280,7 @@ also apply to decoded external `call`, `jmp`, and conditional-branch targets,
 and to exact absolute function references retained by `HIGHLOW`; their owner
 must be one of the PDB aliases at the target RVA and their addend must be zero.
 Every manifest row must be observed exactly `occurrences` times; a stale or
-overly broad row stops the delink. The manifest neither invents sites nor
-names.
+overly broad row stops the delink. An exact site row takes precedence over a
+wildcard row with the same function and target and must declare one occurrence.
+Its four-byte relocation field must lie entirely within the declared PDB
+function. The manifest neither invents sites nor names.
