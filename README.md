@@ -229,3 +229,50 @@ in the owner object and matched the definition at `100.0%`.
 The data manifest restores reviewed definitions and their position within each
 emitted storage section. The data section manifest separately restores reviewed
 same-name sections and COMDAT topology.
+
+## Relocation alias manifest
+
+A retained PE base relocation identifies its site and final linked target
+address, but linking consumed the original COFF symbol/addend spelling. When
+multiple PDB data symbols can describe that address, nearest-symbol selection
+may choose an interior or anonymous symbol even though the source object used a
+different existing owner symbol plus an addend.
+
+The optional relocation alias manifest records reviewed spellings for absolute
+data references in PDB functions:
+
+```sh
+cargo run --release -- \
+  --pdb-path build/game.pdb \
+  --exe-path build/game.exe \
+  --output-path build/delink \
+  --engine-path 'c:\project\sources' \
+  --reloc-alias-manifest build/reloc-aliases.tsv
+```
+
+Its first non-comment line must be this exact header:
+
+```text
+function_rva	target_rva	owner	addend	occurrences
+```
+
+| Field | Meaning |
+| --- | --- |
+| `function_rva` | Exact start RVA of the PDB function containing the relocation sites. |
+| `target_rva` | Exact linked RVA encoded at those retained PE relocation sites. |
+| `owner` | Existing PDB data symbol that the candidate COFF relocations should reference. |
+| `addend` | Unsigned 32-bit COFF addend bits, including two's-complement encodings such as `0xfffffff8`. |
+| `occurrences` | Exact number of matching relocation sites expected in that function. |
+
+Example:
+
+```text
+function_rva	target_rva	owner	addend	occurrences
+0x126d	0xec094	?SmackOptions@@3PAUSSmackOptions@@A	0x24	3
+```
+
+Aliases apply only to existing `HIGHLOW` relocation sites inside `.text`. The
+owner must occur exactly once in the applicable PDB data-symbol table, and
+`owner RVA + addend` must wrap to the declared target RVA. Every manifest row
+must be observed exactly `occurrences` times; a stale or overly broad row stops
+the delink. The manifest neither creates relocation sites nor invents names.
