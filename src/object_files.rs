@@ -75,6 +75,28 @@ enum SymbolReuse {
     ReuseExisting,
 }
 
+#[derive(Default)]
+struct FunctionClaims<'a> {
+    sizes: HashMap<(&'a [u8], usize), usize>,
+}
+
+impl<'a> FunctionClaims<'a> {
+    fn claim(&mut self, owner: &'a [u8], rva: usize, size: usize) -> anyhow::Result<bool> {
+        match self.sizes.entry((owner, rva)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(size);
+                Ok(true)
+            }
+            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == size => Ok(false),
+            std::collections::hash_map::Entry::Occupied(entry) => anyhow::bail!(
+                "function records disagree on size for {} at RVA {rva:#x}: {} and {size}",
+                String::from_utf8_lossy(owner),
+                entry.get()
+            ),
+        }
+    }
+}
+
 impl ObjectFiles<'_> {
     pub fn parse<'s, S>(
         env: &Env,
@@ -159,6 +181,7 @@ impl ObjectFiles<'_> {
             }
         }
 
+        let mut function_claims = FunctionClaims::default();
         let mut modules = env.dbi.modules()?;
         while let Some(module) = modules.next()? {
             let Some(module_info) = pdb.module_info(&module)? else {
@@ -195,6 +218,9 @@ impl ObjectFiles<'_> {
                 };
 
                 let fun_rva = env.text.rva + fun_offset.offset.to_usize();
+                if !function_claims.claim(filename, fun_rva, fun_size)? {
+                    continue;
+                }
                 let fun_bytes = resolve_relative_relocations(
                     env,
                     fun_rva,
@@ -1363,6 +1389,56 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use object::{Object as _, ObjectComdat as _, ObjectSection as _, ObjectSymbol as _};
+
+    #[test]
+    fn identical_function_records_are_claimed_once_per_owner_and_rva() {
+        let mut claims = FunctionClaims::default();
+        assert!(claims.claim(b"SOURCE\\font.cpp", 0x401000, 0x30).unwrap());
+        assert!(!claims.claim(b"SOURCE\\font.cpp", 0x401000, 0x30).unwrap());
+        assert!(claims.claim(b"SOURCE\\other.cpp", 0x401000, 0x30).unwrap());
+        assert!(claims.claim(b"SOURCE\\font.cpp", 0x402000, 0x30).unwrap());
+    }
+
+    #[test]
+    fn identical_function_records_emit_one_body_and_alias_set() {
+        let mut claims = FunctionClaims::default();
+        let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let primary = RawString::from(&b"real_a"[..]);
+        let aliases = [primary, RawString::from(&b"real_b"[..])];
+        for _ in 0..2 {
+            if claims.claim(b"SOURCE\\font.cpp", 0x401000, 1).unwrap() {
+                output.add_function(primary, &aliases, &[0xc3]);
+            }
+        }
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(
+            object.section_by_name(".text").unwrap().data(),
+            Ok(&[0xc3, 0x90, 0x90, 0x90][..])
+        );
+        for name in ["real_a", "real_b"] {
+            assert_eq!(
+                object
+                    .symbols()
+                    .filter(|symbol| symbol.is_definition() && symbol.name() == Ok(name))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn function_records_with_different_sizes_are_rejected() {
+        let mut claims = FunctionClaims::default();
+        assert!(claims.claim(b"SOURCE\\font.cpp", 0x401000, 0x30).unwrap());
+        let error = claims
+            .claim(b"SOURCE\\font.cpp", 0x401000, 0x34)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("SOURCE\\font.cpp at RVA 0x401000: 48 and 52"));
+    }
 
     fn section_definition_checksums(bytes: &[u8]) -> Vec<u32> {
         use object::endian::LittleEndian;
