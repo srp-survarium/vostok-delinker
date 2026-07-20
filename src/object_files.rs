@@ -643,6 +643,15 @@ impl ObjectFile {
         // `Conjured*` target is materialized as a private per-TU copy, unless the
         // caller only wants a reference.
         match reloc_kind {
+            RelocKind::Import { .. } => {
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern(reloc_kind.external_symbol_kind()),
+                    reloc_offset,
+                    RelocationEncoding::Absolute,
+                )?;
+            }
+
             RelocKind::Function {
                 overloads: _,
                 encoding,
@@ -1116,7 +1125,8 @@ impl<'a> RelocKind<'a> {
     fn external_symbol_kind(self) -> object::SymbolKind {
         match self {
             Self::Function { .. } => object::SymbolKind::Text,
-            Self::ReviewedData { .. }
+            Self::Import { .. }
+            | Self::ReviewedData { .. }
             | Self::ConjuredString { .. }
             | Self::ConjuredConstant { .. }
             | Self::ConjuredStatic { .. } => object::SymbolKind::Unknown,
@@ -1125,6 +1135,7 @@ impl<'a> RelocKind<'a> {
 
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
+            Self::Import { symbol } => Name::Borrowed(symbol),
             Self::Function {
                 overloads, symbol, ..
             } => Name::Borrowed(
