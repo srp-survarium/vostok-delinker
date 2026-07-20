@@ -223,6 +223,9 @@ impl ObjectFiles<'_> {
                 };
 
                 let fun_rva = env.text.rva + fun_offset.offset.to_usize();
+                if symbols.is_incremental_trampoline(fun_rva) {
+                    continue;
+                }
                 if !function_claims.claim(filename, fun_rva, fun_size)? {
                     continue;
                 }
@@ -683,9 +686,13 @@ fn resolve_code_relocations<'s>(
             _ => continue,
         };
 
-        let target_rva = target_va - u64::from(image_base);
+        let linked_target_rva = target_va - u64::from(image_base);
+        let target_rva = symbols
+            .resolve_incremental_trampoline(linked_target_rva.to_usize())
+            .to_u64();
 
-        let internal_branch = (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
+        let internal_branch = linked_target_rva == target_rva
+            && (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
         if internal_branch {
             continue;
         }
@@ -1626,6 +1633,59 @@ mod tests {
                 ..
             }) if *overloads == [RawString::from(&b"target"[..])]
         ));
+    }
+
+    #[test]
+    fn relative_call_through_incremental_trampoline_targets_the_body() {
+        let image_base = 0x0040_0000;
+        let function_rva = 0x1000;
+        let trampoline_rva = 0x2000;
+        let target_rva = 0x3000;
+        let linked_function = [0xe8, 0xfb, 0x0f, 0x00, 0x00, 0xc3];
+        let mut coff_data = vec![0; function_rva + linked_function.len()];
+        coff_data[function_rva..].copy_from_slice(&linked_function);
+
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(linked_function.len()),
+            )
+            .unwrap();
+        symbols
+            .add_function_at_rva(target_rva, RawString::from(&b"body"[..]), Some(1))
+            .unwrap();
+        symbols
+            .add_incremental_trampoline_at_rva(trampoline_rva, target_rva, 5)
+            .unwrap();
+
+        let mut relocations = BTreeMap::new();
+        let resolved = resolve_code_relocations(
+            image_base,
+            function_rva,
+            linked_function.len(),
+            &symbols,
+            &coff_data,
+            &mut relocations,
+            &RelocAliasManifest::default(),
+            &mut RelocAliasObservations::default(),
+            &DataManifest::default(),
+            ManifestCoverage::AllowPartial,
+            CodeRelocationRecovery::RetainedOnly,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, [0xe8, 0, 0, 0, 0, 0xc3]);
+        let RelocKind::Function {
+            overloads,
+            encoding: RelocationEncoding::Relative,
+            ..
+        } = relocations[&(function_rva + 1)]
+        else {
+            panic!("expected a relative function relocation");
+        };
+        assert_eq!(overloads[0].as_bytes(), b"body");
     }
 
     #[test]

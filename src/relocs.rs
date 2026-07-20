@@ -145,6 +145,7 @@ pub(crate) fn classify_exact_pdb_target<'s>(
     reloc_rva: usize,
     target_rva: usize,
 ) -> anyhow::Result<Option<(RelocKind<'s>, u32)>> {
+    let target_rva = symbols.resolve_incremental_trampoline(target_rva);
     if let Some(symbol) = symbols.imports.get(&target_rva) {
         return Ok(Some((RelocKind::Import { symbol: *symbol }, 0)));
     }
@@ -420,7 +421,8 @@ pub fn resolve_absolute_relocations<'s>(
 
             let target_va =
                 bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
-            let target_rva = (target_va - env.image_base).to_usize();
+            let linked_target_rva = (target_va - env.image_base).to_usize();
+            let target_rva = symbols.resolve_incremental_trampoline(linked_target_rva);
 
             let coff_data_reloc = &mut coff_data[reloc_rva..reloc_rva + 4];
 
@@ -724,6 +726,9 @@ mod tests {
             .add_function_at_rva(0x2000, RawString::from(&b"exact"[..]), None)
             .unwrap();
         symbols
+            .add_incremental_trampoline_at_rva(0x1800, 0x2000, 5)
+            .unwrap();
+        symbols
             .imports
             .insert(0x3000, RawString::from(&b"__imp_exact"[..]));
         let manifest = DataManifest::default();
@@ -742,6 +747,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(function, Some((RelocKind::Function { .. }, 0))));
+        let trampoline = classify_exact_pdb_target(
+            &symbols,
+            &manifest,
+            &aliases,
+            &mut observed,
+            ManifestCoverage::AllowPartial,
+            0x1000,
+            0x1012,
+            0x1800,
+        )
+        .unwrap();
+        assert!(matches!(
+            trampoline,
+            Some((RelocKind::Function { overloads, .. }, 0))
+                if overloads[0].as_bytes() == b"exact"
+        ));
         let import = classify_exact_pdb_target(
             &symbols,
             &manifest,
