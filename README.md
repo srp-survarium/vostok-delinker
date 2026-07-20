@@ -170,7 +170,7 @@ have these meanings:
 | `characteristics` | Complete COFF section characteristics in decimal or `0x` hexadecimal notation. |
 | `comdat_selection` | COFF selection value: `0` none, `1` no duplicates, `2` any, `3` same size, `4` exact match, `5` associative, `6` largest, or `7` newest. |
 | `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section. |
-| `storage` | `data`, `rdata`, or `bss` for a data-bearing candidate section, otherwise `-`. An RVA requires storage, while storage may be present without an affine RVA. |
+| `storage` | `data`, `rdata`, or `bss` for a data-bearing candidate section, otherwise `-`. `data` accepts `.data` and linker-sorted `.CRT$*` subsections. An RVA requires storage, while storage may be present without an affine RVA. |
 
 The manifest owns section order, names, characteristics, alignment, linked data
 ranges, and COMDAT relationships. The PDB still owns symbol names. Data-manifest
