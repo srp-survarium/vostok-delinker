@@ -4,6 +4,7 @@ use crate::data_section_manifest::{
     ComdatSelection, DataSection, DataSectionManifest, SectionStorage,
 };
 use crate::pdb_symbols::PdbSymbols;
+use crate::reloc_alias_manifest::RelocAliasManifest;
 use crate::relocs::{RelocKind, RelocationEncoding};
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
 use crate::utils::{ToU64, ToUsize, contains, leak};
@@ -87,6 +88,8 @@ impl ObjectFiles<'_> {
         matcher: &SymbolMatcher,
         data_manifest: &DataManifest,
         data_section_manifest: &DataSectionManifest,
+        reloc_aliases: &RelocAliasManifest,
+        observed_aliases: &mut BTreeMap<(usize, usize), usize>,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -196,6 +199,8 @@ impl ObjectFiles<'_> {
                     symbols,
                     coff_data,
                     &mut relocs_rva,
+                    reloc_aliases,
+                    observed_aliases,
                 )?;
 
                 let object_file = this
@@ -514,6 +519,8 @@ fn resolve_relative_relocations<'s>(
 
     coff_data: &[u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    reloc_aliases: &RelocAliasManifest,
+    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
 ) -> anyhow::Result<Vec<u8>> {
     let fun_va = env.image_base.to_usize() + fun_rva;
 
@@ -561,12 +568,19 @@ fn resolve_relative_relocations<'s>(
         };
 
         let overloads = overloads.as_slice();
+        let symbol = reloc_aliases.resolve_function_alias(
+            fun_rva,
+            target_rva.to_usize(),
+            overloads,
+            observed_aliases,
+        )?;
 
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(
             fun_rva + offset_in_fun - 4,
             RelocKind::Function {
                 overloads,
+                symbol,
                 encoding: RelocationEncoding::Relative,
             },
         );
@@ -574,12 +588,14 @@ fn resolve_relative_relocations<'s>(
         if let Some(old_reloc) = old_reloc {
             let RelocKind::Function {
                 overloads: old_overloads,
+                symbol: old_symbol,
                 ..
             } = old_reloc
             else {
                 unreachable!();
             };
             assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+            assert_eq!(symbol, old_symbol);
         }
     }
 
@@ -632,6 +648,7 @@ impl ObjectFile {
             RelocKind::Function {
                 overloads: _,
                 encoding,
+                ..
             } => {
                 self.add_relocation(
                     reloc_name,
@@ -1132,9 +1149,11 @@ enum Name<'a> {
 impl<'a> RelocKind<'a> {
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
-            Self::Function { overloads, .. } => {
-                Name::Borrowed(matcher.pick(overloads, canonical_name(overloads)))
-            }
+            Self::Function {
+                overloads, symbol, ..
+            } => Name::Borrowed(
+                symbol.unwrap_or_else(|| matcher.pick(overloads, canonical_name(overloads))),
+            ),
             Self::ConstantString { symbol, data } => {
                 let reloc_name = get_constant_name(symbol, data);
                 Name::Owned(reloc_name)
