@@ -62,9 +62,14 @@ but not required.
 
 When the directory is absent, Vostok distinguishes an image carrying
 `IMAGE_FILE_RELOCS_STRIPPED` from an image with no directory and no stripped
-flag. It reports `Stripped` and `Absent` separately, but conservatively retains
-no absolute relocations for either state. This layer does not infer relocation
-sites by scanning code, data, or exact PDB addresses.
+flag. For a `Stripped` image, Vostok can recover an absolute code relocation only
+when a decoded x86 instruction has a four-byte operand whose linked value is the
+exact address of a known PDB function, data symbol, string, or import slot. It
+does not scan arbitrary address-sized words, and it does not treat a nearby PDB
+address as a target. Relocation aliases, data-manifest ownership, and strict
+manifest coverage retain their normal precedence. An `Absent` image receives no
+such recovery because it does not provide evidence that relocations were
+stripped.
 
 ## Import address table
 
@@ -125,10 +130,11 @@ cargo run --release -- \
   --data-section-manifest build/data-sections.tsv
 ```
 
-Add `--strict` to require every PE base relocation whose target is in `.data`
-or `.rdata` to be covered by a manifest definition. Function targets continue
-to use PDB procedure symbols. `--strict` requires `--data-manifest` and reports
-both the relocation-site RVA and uncovered target RVA on failure.
+Add `--strict` to require every retained or recovered absolute relocation whose
+target is in `.data` or `.rdata` to be covered by a manifest definition.
+Function targets continue to use PDB procedure symbols. `--strict` requires
+`--data-manifest` and reports both the relocation-site RVA and uncovered target
+RVA on failure.
 
 ### Manifest format
 
@@ -245,11 +251,13 @@ different offset. A reference to an interior address is represented as that PDB
 symbol plus its in-place COFF addend.
 
 Relocation sites are not invented by the manifest. Vostok starts from existing
-PE `HIGHLOW` base-relocation entries, resolves their data targets through the
-manifest allocation ranges to existing PDB symbols, and serializes the recovered
-relationships as COFF relocations in the output objects. The final COFF records
-must be emitted because linking consumed the originals; the PE retains only the
-base-relocation sites and linked target addresses.
+PE `HIGHLOW` base-relocation entries or, for a `Stripped` image, from the
+evidence-gated instruction operands described above. It resolves their data
+targets through the manifest allocation ranges to existing PDB symbols and
+serializes the recovered relationships as COFF relocations in the output
+objects. The final COFF records must be emitted because linking consumed the
+originals; a retained PE base-relocation entry preserves only its site and
+linked target address.
 
 When a candidate section has an assigned linked range, Vostok replays every PE
 base relocation in that complete range. This includes relocation sites in
@@ -268,11 +276,11 @@ same-name sections and COMDAT topology.
 
 ## Relocation alias manifest
 
-A retained PE base relocation identifies its site and final linked target
-address, but linking consumed the original COFF symbol/addend spelling. When
-multiple PDB data symbols can describe that address, nearest-symbol selection
-may choose an interior or anonymous symbol even though the source object used a
-different existing owner symbol plus an addend.
+An absolute relocation identifies its site and final linked target address, but
+linking consumed the original COFF symbol/addend spelling. When multiple PDB
+data symbols can describe that address, nearest-symbol selection may choose an
+interior or anonymous symbol even though the source object used a different
+existing owner symbol plus an addend.
 
 The optional relocation alias manifest records reviewed spellings for data and
 function references in PDB functions:

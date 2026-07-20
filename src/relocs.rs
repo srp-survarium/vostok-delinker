@@ -60,6 +60,21 @@ pub enum BaseRelocationSource {
     Absent,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CodeRelocationRecovery {
+    RetainedOnly,
+    ExactPdbInstructionOperands,
+}
+
+impl BaseRelocationSource {
+    pub fn code_relocation_recovery(self) -> CodeRelocationRecovery {
+        match self {
+            Self::Stripped => CodeRelocationRecovery::ExactPdbInstructionOperands,
+            Self::Directory { .. } | Self::Absent => CodeRelocationRecovery::RetainedOnly,
+        }
+    }
+}
+
 pub struct ResolvedRelocations<'a> {
     pub coff_data: Vec<u8>,
     pub by_rva: BTreeMap<usize, RelocKind<'a>>,
@@ -104,6 +119,131 @@ fn resolve_manifest_alias(
     }
 
     Ok(Some((alias.addend, alias.owner)))
+}
+
+#[derive(Copy, Clone)]
+enum ExactPdbDataTarget<'a> {
+    ConstantString {
+        symbol: RawString<'static>,
+        data: &'a [u8],
+    },
+    Constant {
+        symbol: RawString<'static>,
+    },
+    Static {
+        symbol: RawString<'static>,
+    },
+}
+
+pub(crate) fn classify_exact_pdb_target<'s>(
+    symbols: &'s pdb_symbols::PdbSymbols,
+    data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
+    observed_aliases: &mut RelocAliasObservations,
+    manifest_coverage: ManifestCoverage,
+    owner_function_rva: usize,
+    reloc_rva: usize,
+    target_rva: usize,
+) -> anyhow::Result<Option<(RelocKind<'s>, u32)>> {
+    if let Some(symbol) = symbols.imports.get(&target_rva) {
+        return Ok(Some((RelocKind::Import { symbol: *symbol }, 0)));
+    }
+    if let Some(overloads) = symbols.functions.get(&target_rva) {
+        let symbol = reloc_aliases.resolve_function_alias(
+            owner_function_rva,
+            target_rva,
+            reloc_rva,
+            overloads,
+            observed_aliases,
+        )?;
+        return Ok(Some((
+            RelocKind::Function {
+                overloads,
+                symbol,
+                encoding: RelocationEncoding::Absolute,
+            },
+            0,
+        )));
+    }
+
+    let exact = if let Some((symbol, data)) = symbols.strings.get(&target_rva) {
+        Some(ExactPdbDataTarget::ConstantString {
+            symbol: *symbol,
+            data,
+        })
+    } else if let Some(symbol) = symbols.constants.get(&target_rva) {
+        Some(ExactPdbDataTarget::Constant {
+            symbol: symbol.name,
+        })
+    } else {
+        symbols
+            .statics
+            .get(&target_rva)
+            .map(|symbol| ExactPdbDataTarget::Static {
+                symbol: symbol.name,
+            })
+    };
+    let Some(exact) = exact else {
+        return Ok(None);
+    };
+
+    let (owners, is_static) = match exact {
+        ExactPdbDataTarget::ConstantString { .. } | ExactPdbDataTarget::Constant { .. } => {
+            (&symbols.constants, false)
+        }
+        ExactPdbDataTarget::Static { .. } => (&symbols.statics, true),
+    };
+    if let Some((addend, owner)) = resolve_manifest_alias(
+        reloc_aliases,
+        owners,
+        symbols,
+        observed_aliases,
+        reloc_rva,
+        target_rva,
+    )? {
+        let kind = if is_static {
+            RelocKind::Static {
+                symbol: owner,
+                target_rva,
+            }
+        } else {
+            RelocKind::Constant {
+                symbol: owner,
+                target_rva,
+            }
+        };
+        return Ok(Some((kind, addend)));
+    }
+
+    if let Some((owner, addend)) = data_manifest.owner_and_addend_for_rva(target_rva) {
+        let addend = u32::try_from(addend)?;
+        let kind = if is_static {
+            RelocKind::Static {
+                symbol: owner.symbol_name,
+                target_rva,
+            }
+        } else {
+            RelocKind::Constant {
+                symbol: owner.symbol_name,
+                target_rva,
+            }
+        };
+        return Ok(Some((kind, addend)));
+    }
+
+    if manifest_coverage == ManifestCoverage::RequireComplete {
+        anyhow::bail!(
+            "--strict: recovered instruction relocation at RVA {reloc_rva:#x} targets data RVA {target_rva:#x}, which is not covered by the data manifest"
+        );
+    }
+
+    Ok(Some(match exact {
+        ExactPdbDataTarget::ConstantString { symbol, data } => {
+            (RelocKind::ConstantString { symbol, data }, 0)
+        }
+        ExactPdbDataTarget::Constant { symbol } => (RelocKind::Constant { symbol, target_rva }, 0),
+        ExactPdbDataTarget::Static { symbol } => (RelocKind::Static { symbol, target_rva }, 0),
+    }))
 }
 
 #[repr(C)]
@@ -550,21 +690,109 @@ mod tests {
 
     #[test]
     fn relocation_source_distinguishes_directory_stripped_and_absent() {
+        let directory = classify_base_relocation_source(Some((0x3000, 0x80)), 0);
+        let stripped =
+            classify_base_relocation_source(None, object::pe::IMAGE_FILE_RELOCS_STRIPPED);
+        let absent = classify_base_relocation_source(None, 0);
         assert_eq!(
-            classify_base_relocation_source(Some((0x3000, 0x80)), 0),
+            directory,
             BaseRelocationSource::Directory {
                 rva: 0x3000,
                 size: 0x80
             }
         );
+        assert_eq!(stripped, BaseRelocationSource::Stripped);
+        assert_eq!(absent, BaseRelocationSource::Absent);
         assert_eq!(
-            classify_base_relocation_source(None, object::pe::IMAGE_FILE_RELOCS_STRIPPED),
-            BaseRelocationSource::Stripped
+            directory.code_relocation_recovery(),
+            CodeRelocationRecovery::RetainedOnly
         );
         assert_eq!(
-            classify_base_relocation_source(None, 0),
-            BaseRelocationSource::Absent
+            stripped.code_relocation_recovery(),
+            CodeRelocationRecovery::ExactPdbInstructionOperands
         );
+        assert_eq!(
+            absent.code_relocation_recovery(),
+            CodeRelocationRecovery::RetainedOnly
+        );
+    }
+
+    #[test]
+    fn exact_pdb_target_classifier_rejects_nearby_addresses() {
+        let mut symbols = pdb_symbols::PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"exact"[..]), None)
+            .unwrap();
+        symbols
+            .imports
+            .insert(0x3000, RawString::from(&b"__imp_exact"[..]));
+        let manifest = DataManifest::default();
+        let aliases = RelocAliasManifest::default();
+        let mut observed = RelocAliasObservations::default();
+
+        let function = classify_exact_pdb_target(
+            &symbols,
+            &manifest,
+            &aliases,
+            &mut observed,
+            ManifestCoverage::AllowPartial,
+            0x1000,
+            0x1010,
+            0x2000,
+        )
+        .unwrap();
+        assert!(matches!(function, Some((RelocKind::Function { .. }, 0))));
+        let import = classify_exact_pdb_target(
+            &symbols,
+            &manifest,
+            &aliases,
+            &mut observed,
+            ManifestCoverage::AllowPartial,
+            0x1000,
+            0x1014,
+            0x3000,
+        )
+        .unwrap();
+        assert!(matches!(import, Some((RelocKind::Import { .. }, 0))));
+        assert!(
+            classify_exact_pdb_target(
+                &symbols,
+                &manifest,
+                &aliases,
+                &mut observed,
+                ManifestCoverage::AllowPartial,
+                0x1000,
+                0x1018,
+                0x2001,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn strict_manifest_precedes_exact_pdb_data_fallback() {
+        let mut symbols = pdb_symbols::PdbSymbols::default();
+        symbols.statics.insert(
+            0x4000,
+            PdbDataSymbol::new(RawString::from(&b"exact_data"[..]), Some(4)),
+        );
+        let error = classify_exact_pdb_target(
+            &symbols,
+            &DataManifest::default(),
+            &RelocAliasManifest::default(),
+            &mut RelocAliasObservations::default(),
+            ManifestCoverage::RequireComplete,
+            0x1000,
+            0x1010,
+            0x4000,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("--strict"));
+        assert!(error.contains("0x1010"));
+        assert!(error.contains("0x4000"));
     }
 
     #[test]
