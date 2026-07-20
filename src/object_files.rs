@@ -152,12 +152,15 @@ impl ObjectFiles<'_> {
                     .entry(filename)
                     .or_insert_with(|| ObjectFile::empty(pad_empty_rdata));
 
-                let fun_name = match symbols.functions.get(&fun_rva) {
-                    Some(overloads) => matcher.pick(overloads, canonical_name(overloads)),
-                    _ => fun_name,
-                };
+                let overloads = symbols
+                    .functions
+                    .get(&fun_rva)
+                    .map(Vec::as_slice)
+                    .unwrap_or_else(|| std::slice::from_ref(&fun_name));
+                let fun_name = matcher.pick(overloads, canonical_name(overloads));
 
-                let fun_offset_in_coff_text = object_file.add_function(fun_name, &fun_bytes);
+                let fun_offset_in_coff_text =
+                    object_file.add_function(fun_name, overloads, &fun_bytes);
 
                 for (reloc_rva, reloc_kind) in relocs_rva.range(fun_rva..fun_rva + fun_size) {
                     let reloc_rva = *reloc_rva;
@@ -742,19 +745,35 @@ impl ObjectFile {
         Ok(())
     }
 
-    fn add_function(&mut self, name: RawString, body: &[u8]) -> ObjectOffset {
+    fn add_function(
+        &mut self,
+        name: RawString,
+        aliases: &[RawString],
+        body: &[u8],
+    ) -> ObjectOffset {
         let fun_offset_in_coff_text = self.append_section_data(self.text_section_id, body, 0x90);
 
-        self.object.add_symbol(object::write::Symbol {
-            name: name.as_bytes().to_vec(),
-            value: fun_offset_in_coff_text.offset,
-            size: u64::MAX,
-            kind: object::SymbolKind::Text,
-            scope: object::SymbolScope::Linkage,
-            weak: false,
-            section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
-            flags: object::SymbolFlags::None,
-        });
+        let mut names = vec![name];
+        for alias in aliases {
+            if !names
+                .iter()
+                .any(|existing| existing.as_bytes() == alias.as_bytes())
+            {
+                names.push(*alias);
+            }
+        }
+        for name in names {
+            self.object.add_symbol(object::write::Symbol {
+                name: name.as_bytes().to_vec(),
+                value: fun_offset_in_coff_text.offset,
+                size: u64::MAX,
+                kind: object::SymbolKind::Text,
+                scope: object::SymbolScope::Linkage,
+                weak: false,
+                section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
+                flags: object::SymbolFlags::None,
+            });
+        }
 
         fun_offset_in_coff_text
     }
@@ -863,6 +882,7 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object::{Object as _, ObjectSymbol as _};
 
     fn definition(scope: DataScope, section_offset: usize) -> DataDefinition {
         DataDefinition {
@@ -931,5 +951,27 @@ mod tests {
                 .undefined_symbols
                 .contains_key(b"external".as_slice())
         );
+    }
+
+    #[test]
+    fn folded_function_emits_all_pdb_aliases_at_one_offset() {
+        let mut output = ObjectFile::empty(false);
+        let primary = RawString::from(&b"real_a"[..]);
+        let aliases = [primary, RawString::from(&b"real_b"[..])];
+        output.add_function(primary, &aliases, &[0xc3]);
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let mut definitions = object
+            .symbols()
+            .filter(|symbol| {
+                symbol.is_definition()
+                    && symbol.kind() == object::SymbolKind::Text
+                    && symbol.address() == 0
+            })
+            .map(|symbol| symbol.name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        definitions.sort_unstable();
+        assert_eq!(definitions, ["real_a", "real_b"]);
     }
 }

@@ -63,7 +63,7 @@ impl PdbSymbols {
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { function, .. }) if function => {
                     assert_eq!(offset.section, env.text.id);
 
-                    self.functions.entry(symbol_rva).or_default().push(name);
+                    Self::push_function_name(self.functions.entry(symbol_rva).or_default(), name);
                 }
 
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
@@ -148,14 +148,11 @@ impl PdbSymbols {
             while let Some(symbol) = iter.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
-                        name,
-                        offset,
-                        len,
-                        ..
-                    })) => self.add_function_symbol(env, name, offset, len),
-                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
-                        name, offset, len, ..
-                    })) => self.add_function_symbol(env, name, offset, u32::from(len)),
+                        name, offset, ..
+                    })) => self.add_function_symbol(env, name, offset),
+                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol { name, offset, .. })) => {
+                        self.add_function_symbol(env, name, offset)
+                    }
 
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
                         let symbol_rva = match () {
@@ -200,34 +197,39 @@ impl PdbSymbols {
 
         name: RawString<'static>,
         offset: pdb2::PdbInternalSectionOffset,
-        size: u32,
     ) {
         let symbol_rva = env.text.rva + offset.offset.to_usize();
+        self.add_function_at_rva(symbol_rva, name);
+    }
 
-        let fun_offset_in_text = offset.offset.to_usize();
-        let fun_body = &env.text.data[fun_offset_in_text..fun_offset_in_text + size.to_usize()];
+    fn add_function_at_rva(&mut self, symbol_rva: usize, name: RawString<'static>) {
+        Self::push_function_name(self.functions.entry(symbol_rva).or_default(), name);
+    }
 
-        #[rustfmt::skip]
-        const COMMON_FUNCTION_RENAMES: &[(&[u8], &[u8])] = &[
-            (b"empty_stub", &[0xC3]),
-            (b"identity",   &[0x8B, 0x44, 0x24, 0x04, 0xC3]),
-            (b"vec_begin",  &[0x8B, 0x0, 0xC3]),
-            (b"vec_size",   &[0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3]),
-        ];
-
-        let fun_rename = COMMON_FUNCTION_RENAMES
+    fn push_function_name(names: &mut Vec<RawString<'static>>, name: RawString<'static>) {
+        if !names
             .iter()
-            .find(|(_, code)| *code == fun_body)
-            .map(|(name, _)| (*name).into());
-
-        match self.functions.entry(symbol_rva) {
-            btree_map::Entry::Vacant(entry) => {
-                entry.insert(vec![fun_rename.unwrap_or(name)]);
-            }
-            btree_map::Entry::Occupied(mut entry) => match fun_rename {
-                Some(fun_rename) => *entry.get_mut() = vec![fun_rename],
-                None => (),
-            },
+            .any(|existing| existing.as_bytes() == name.as_bytes())
+        {
+            names.push(name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retains_distinct_pdb_names_at_one_function_rva() {
+        let mut symbols = PdbSymbols::default();
+        symbols.add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]));
+        symbols.add_function_at_rva(0x1000, RawString::from(&b"real_b"[..]));
+        symbols.add_function_at_rva(0x1000, RawString::from(&b"real_a"[..]));
+
+        let names = &symbols.functions[&0x1000];
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].as_bytes(), b"real_a");
+        assert_eq!(names[1].as_bytes(), b"real_b");
     }
 }
