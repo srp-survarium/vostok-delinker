@@ -53,6 +53,21 @@ cargo run --release -- \
 
 Run `vostok-delinker --help` for the complete option list.
 
+## Incremental-link trampolines
+
+An incremental linker may redirect calls, jumps, and stored function addresses
+through linker-created trampolines. CodeView represents these with
+`S_TRAMPOLINE` records containing the exact trampoline and target offsets.
+Vostok validates every incremental trampoline record against the corresponding
+five-byte `JMP rel32` in the PE, requires an exact PDB procedure at its target,
+and then reconstructs both relative and absolute references against that target
+procedure. The linker-generated entry is not emitted as an object function.
+
+Named `S_THUNK32` records remain ordinary object code. A synthetic PDB should
+therefore describe incremental-link entries with `S_TRAMPOLINE`, rather than as
+procedures or named thunks. Vostok does not infer a trampoline table by scanning
+for address-looking jump instructions.
+
 ## PE base relocation input
 
 Vostok locates retained base relocations through

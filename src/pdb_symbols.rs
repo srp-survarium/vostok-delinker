@@ -9,11 +9,18 @@ use crate::utils::{ToUsize, leak};
 pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
     function_extents: BTreeMap<usize, usize>,
+    incremental_trampolines: BTreeMap<usize, PdbIncrementalTrampoline>,
     pub imports: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
     pub constants: BTreeMap<usize, PdbDataSymbol>,
     pub statics: BTreeMap<usize, PdbDataSymbol>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PdbIncrementalTrampoline {
+    target_rva: usize,
+    size: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -57,6 +64,7 @@ impl PdbSymbols {
 
         this.iterate_symbol_table(env, &mut type_sizes)?;
         this.iterate_modules(env, pdb, &mut type_sizes)?;
+        this.validate_incremental_trampolines(env)?;
 
         Ok(this)
     }
@@ -227,6 +235,13 @@ impl PdbSymbols {
                         name, offset, len, ..
                     })) => self.add_function_symbol(env, name, offset, len.to_usize())?,
 
+                    Ok(pdb2::SymbolData::Trampoline(pdb2::TrampolineSymbol {
+                        tramp_type: pdb2::TrampolineType::Incremental,
+                        size,
+                        thunk,
+                        target,
+                    })) => self.add_incremental_trampoline(env, thunk, target, size.into())?,
+
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol {
                         offset,
                         name,
@@ -314,6 +329,119 @@ impl PdbSymbols {
         }
         Self::push_function_name(self.functions.entry(symbol_rva).or_default(), name);
         Ok(())
+    }
+
+    fn add_incremental_trampoline(
+        &mut self,
+        env: &Env,
+        thunk: pdb2::PdbInternalSectionOffset,
+        target: pdb2::PdbInternalSectionOffset,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        if thunk.section != env.text.id || target.section != env.text.id {
+            anyhow::bail!("PDB incremental trampoline is not contained in .text");
+        }
+        let thunk_rva = env
+            .text
+            .rva
+            .checked_add(thunk.offset.to_usize())
+            .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline RVA overflows"))?;
+        let target_rva = env
+            .text
+            .rva
+            .checked_add(target.offset.to_usize())
+            .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline target RVA overflows"))?;
+        self.add_incremental_trampoline_at_rva(thunk_rva, target_rva, size)
+    }
+
+    pub(crate) fn add_incremental_trampoline_at_rva(
+        &mut self,
+        thunk_rva: usize,
+        target_rva: usize,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let trampoline = PdbIncrementalTrampoline { target_rva, size };
+        match self.incremental_trampolines.entry(thunk_rva) {
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(trampoline);
+            }
+            btree_map::Entry::Occupied(entry) if *entry.get() == trampoline => {}
+            btree_map::Entry::Occupied(_) => {
+                anyhow::bail!("PDB incremental trampoline records at RVA {thunk_rva:#x} disagree")
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_incremental_trampolines(&mut self, env: &Env) -> anyhow::Result<()> {
+        self.validate_incremental_trampolines_in_text(env.text.rva, env.text.data)
+    }
+
+    pub(crate) fn validate_incremental_trampolines_in_text(
+        &mut self,
+        text_rva: usize,
+        text_data: &[u8],
+    ) -> anyhow::Result<()> {
+        const JMP_REL32: u8 = 0xe9;
+        const JMP_REL32_SIZE: usize = 5;
+
+        for (&thunk_rva, trampoline) in &self.incremental_trampolines {
+            if trampoline.size != JMP_REL32_SIZE {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} has unsupported size {}",
+                    trampoline.size
+                );
+            }
+            if self
+                .incremental_trampolines
+                .contains_key(&trampoline.target_rva)
+            {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} targets another trampoline"
+                );
+            }
+            if !self.function_extents.contains_key(&trampoline.target_rva) {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} has no exact target procedure"
+                );
+            }
+            let offset = thunk_rva
+                .checked_sub(text_rva)
+                .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline precedes .text"))?;
+            let bytes = text_data
+                .get(offset..offset + JMP_REL32_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline exceeds .text"))?;
+            if bytes[0] != JMP_REL32 {
+                anyhow::bail!("PDB incremental trampoline at RVA {thunk_rva:#x} is not JMP rel32");
+            }
+            let displacement = i32::from_le_bytes(bytes[1..].try_into()?);
+            let decoded_target = i64::try_from(thunk_rva)?
+                .checked_add(i64::try_from(JMP_REL32_SIZE)?)
+                .and_then(|next| next.checked_add(i64::from(displacement)))
+                .and_then(|target| usize::try_from(target).ok())
+                .ok_or_else(|| anyhow::anyhow!("incremental trampoline target overflows RVA"))?;
+            if decoded_target != trampoline.target_rva {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} disagrees with PE target"
+                );
+            }
+        }
+
+        for thunk_rva in self.incremental_trampolines.keys() {
+            self.functions.remove(thunk_rva);
+            self.function_extents.remove(thunk_rva);
+        }
+        Ok(())
+    }
+
+    pub fn resolve_incremental_trampoline(&self, target_rva: usize) -> usize {
+        self.incremental_trampolines
+            .get(&target_rva)
+            .map_or(target_rva, |trampoline| trampoline.target_rva)
+    }
+
+    pub fn is_incremental_trampoline(&self, rva: usize) -> bool {
+        self.incremental_trampolines.contains_key(&rva)
     }
 
     pub fn relocation_field_in_function(
@@ -493,6 +621,83 @@ fn primitive_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_incremental_trampoline_bytes_and_removes_linker_function() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1005, RawString::from(&b"linker-thunk"[..]), Some(5))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x1100, RawString::from(&b"body"[..]), Some(1))
+            .unwrap();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+
+        let mut text = vec![0; 0x101];
+        text[5..10].copy_from_slice(&[0xe9, 0xf6, 0x00, 0x00, 0x00]);
+        symbols
+            .validate_incremental_trampolines_in_text(0x1000, &text)
+            .unwrap();
+
+        assert_eq!(symbols.resolve_incremental_trampoline(0x1005), 0x1100);
+        assert_eq!(symbols.resolve_incremental_trampoline(0x1006), 0x1006);
+        assert!(!symbols.functions.contains_key(&0x1005));
+        assert!(!symbols.function_extents.contains_key(&0x1005));
+        assert!(symbols.functions.contains_key(&0x1100));
+    }
+
+    #[test]
+    fn rejects_incremental_trampoline_metadata_that_disagrees_with_the_image() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1100, RawString::from(&b"body"[..]), Some(1))
+            .unwrap();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let text = vec![0; 0x101];
+        assert!(
+            symbols
+                .validate_incremental_trampolines_in_text(0x1000, &text)
+                .unwrap_err()
+                .to_string()
+                .contains("is not JMP rel32")
+        );
+    }
+
+    #[test]
+    fn rejects_incremental_trampoline_to_public_symbol_without_procedure() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1100, RawString::from(&b"public-only"[..]), None)
+            .unwrap();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let mut text = vec![0; 0x101];
+        text[5..10].copy_from_slice(&[0xe9, 0xf6, 0x00, 0x00, 0x00]);
+
+        let error = symbols
+            .validate_incremental_trampolines_in_text(0x1000, &text)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no exact target procedure"));
+    }
+
+    #[test]
+    fn rejects_conflicting_incremental_trampoline_records() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let error = symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1200, 5)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records at RVA 0x1005 disagree"));
+    }
 
     #[test]
     fn retains_distinct_pdb_names_at_one_function_rva() {
