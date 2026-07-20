@@ -5,13 +5,16 @@ use crate::data_section_manifest::{
 };
 use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
-use crate::relocs::{RelocKind, RelocationEncoding};
+use crate::relocs::{
+    CodeRelocationRecovery, ManifestCoverage, RelocKind, RelocationEncoding,
+    classify_exact_pdb_target,
+};
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
 use crate::utils::{ToU64, ToUsize, contains, leak};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
 
 use pdb2::{FallibleIterator, RawString};
 
@@ -113,6 +116,8 @@ impl ObjectFiles<'_> {
         data_section_manifest: &DataSectionManifest,
         reloc_aliases: &RelocAliasManifest,
         observed_aliases: &mut RelocAliasObservations,
+        manifest_coverage: ManifestCoverage,
+        code_relocation_recovery: CodeRelocationRecovery,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -221,8 +226,8 @@ impl ObjectFiles<'_> {
                 if !function_claims.claim(filename, fun_rva, fun_size)? {
                     continue;
                 }
-                let fun_bytes = resolve_relative_relocations(
-                    env,
+                let fun_bytes = resolve_code_relocations(
+                    env.image_base,
                     fun_rva,
                     fun_size,
                     symbols,
@@ -230,6 +235,9 @@ impl ObjectFiles<'_> {
                     &mut relocs_rva,
                     reloc_aliases,
                     observed_aliases,
+                    data_manifest,
+                    manifest_coverage,
+                    code_relocation_recovery,
                 )?;
 
                 let object_file = this.objects.entry(filename).or_insert_with(empty_object);
@@ -552,7 +560,7 @@ fn get_function_location(
     Ok(Some(location))
 }
 
-/// Resolve external relative jumps in the function as relocations.
+/// Resolve relocations in the function.
 ///
 /// And return the final resolved function assembly.
 // @NOTE: There is no reason to grow `relocs_rva`, since these allocations
@@ -560,8 +568,34 @@ fn get_function_location(
 // the function is processed.
 //
 // At the same time `relocs_rva` sorts automatically!
-fn resolve_relative_relocations<'s>(
-    env: &Env,
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct DecodedAbsoluteOperandField {
+    offset: usize,
+}
+
+fn decoded_absolute_operand_fields(
+    decoder: &Decoder<'_>,
+    instruction: &Instruction,
+) -> [Option<DecodedAbsoluteOperandField>; 3] {
+    let offsets = decoder.get_constant_offsets(instruction);
+    let field = |offset: usize, size: usize| {
+        (size == std::mem::size_of::<u32>()).then_some(DecodedAbsoluteOperandField { offset })
+    };
+    let immediate = match instruction.op0_kind() {
+        OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64 => [None, None],
+        _ => [
+            field(offsets.immediate_offset(), offsets.immediate_size()),
+            field(offsets.immediate_offset2(), offsets.immediate_size2()),
+        ],
+    };
+    let displacement = (instruction.memory_base() == Register::None)
+        .then(|| field(offsets.displacement_offset(), offsets.displacement_size()))
+        .flatten();
+    [displacement, immediate[0], immediate[1]]
+}
+
+fn resolve_code_relocations<'s>(
+    image_base: u32,
 
     fun_rva: usize,
     fun_size: usize,
@@ -572,8 +606,11 @@ fn resolve_relative_relocations<'s>(
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
     reloc_aliases: &RelocAliasManifest,
     observed_aliases: &mut RelocAliasObservations,
+    data_manifest: &DataManifest,
+    manifest_coverage: ManifestCoverage,
+    code_relocation_recovery: CodeRelocationRecovery,
 ) -> anyhow::Result<Vec<u8>> {
-    let fun_va = env.image_base.to_usize() + fun_rva;
+    let fun_va = image_base.to_usize() + fun_rva;
 
     // @NOTE: Requires a new allocation, since capstone cannot borrow function code mutably.
     let mut fun_bytes = coff_data[fun_rva..fun_rva + fun_size].to_vec();
@@ -584,6 +621,51 @@ fn resolve_relative_relocations<'s>(
 
     while decoder.can_decode() {
         decoder.decode_out(&mut ix);
+
+        match code_relocation_recovery {
+            CodeRelocationRecovery::RetainedOnly => {}
+            CodeRelocationRecovery::ExactPdbInstructionOperands => {
+                let instruction_offset = (ix.ip() - fun_va as u64) as usize;
+                for field in decoded_absolute_operand_fields(&decoder, &ix)
+                    .into_iter()
+                    .flatten()
+                {
+                    let field_offset = instruction_offset + field.offset;
+                    let reloc_rva = fun_rva + field_offset;
+                    if relocs_rva.contains_key(&reloc_rva) {
+                        continue;
+                    }
+                    let FunctionRelocationField::Within { .. } =
+                        symbols.relocation_field_in_function(fun_rva, reloc_rva)
+                    else {
+                        continue;
+                    };
+                    let encoded_va =
+                        bytemuck::pod_read_unaligned::<u32>(&coff_data[reloc_rva..reloc_rva + 4]);
+                    let Some(target_rva) =
+                        encoded_va.checked_sub(image_base).map(ToUsize::to_usize)
+                    else {
+                        continue;
+                    };
+                    let Some((kind, addend)) = classify_exact_pdb_target(
+                        symbols,
+                        data_manifest,
+                        reloc_aliases,
+                        observed_aliases,
+                        manifest_coverage,
+                        fun_rva,
+                        reloc_rva,
+                        target_rva,
+                    )?
+                    else {
+                        continue;
+                    };
+                    fun_bytes[field_offset..field_offset + 4]
+                        .copy_from_slice(&addend.to_le_bytes());
+                    relocs_rva.insert(reloc_rva, kind);
+                }
+            }
+        }
 
         let offset_in_fun = (ix.ip() - fun_va as u64) as usize + ix.len();
 
@@ -601,7 +683,7 @@ fn resolve_relative_relocations<'s>(
             _ => continue,
         };
 
-        let target_rva = target_va - u64::from(env.image_base);
+        let target_rva = target_va - u64::from(image_base);
 
         let internal_branch = (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
         if internal_branch {
@@ -1438,6 +1520,113 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use object::{Object as _, ObjectComdat as _, ObjectSection as _, ObjectSymbol as _};
+
+    fn decoded_absolute_fields(code: &[u8]) -> Vec<(usize, u32)> {
+        let mut decoder = Decoder::new(32, code, DecoderOptions::NONE);
+        let mut instruction = Instruction::default();
+        let mut fields = Vec::new();
+
+        while decoder.can_decode() {
+            decoder.decode_out(&mut instruction);
+            let instruction_offset = instruction.ip() as usize;
+            for field in decoded_absolute_operand_fields(&decoder, &instruction)
+                .into_iter()
+                .flatten()
+            {
+                let offset = instruction_offset + field.offset;
+                let value = bytemuck::pod_read_unaligned::<u32>(&code[offset..offset + 4]);
+                fields.push((offset, value));
+            }
+        }
+
+        fields
+    }
+
+    #[test]
+    fn absolute_recovery_uses_only_decoded_operand_fields() {
+        assert_eq!(
+            decoded_absolute_fields(&[0xb8, 0x00, 0x20, 0x40, 0x00]),
+            vec![(1, 0x0040_2000)]
+        );
+        assert_eq!(
+            decoded_absolute_fields(&[0xa1, 0x00, 0x30, 0x40, 0x00]),
+            vec![(1, 0x0040_3000)]
+        );
+    }
+
+    #[test]
+    fn absolute_recovery_excludes_branches_and_raw_address_words() {
+        assert!(decoded_absolute_fields(&[0xe8, 0x00, 0x20, 0x40, 0x00]).is_empty());
+        assert!(decoded_absolute_fields(&[0x90, 0x00, 0x20, 0x40, 0x00]).is_empty());
+        assert!(decoded_absolute_fields(&[0x8b, 0x80, 0x00, 0x20, 0x40, 0x00]).is_empty());
+    }
+
+    #[test]
+    fn stripped_mode_recovers_an_exact_operand_while_absent_mode_does_not() {
+        let image_base = 0x0040_0000;
+        let function_rva = 0x1000;
+        let target_rva = 0x2000;
+        let linked_function = [0xb8, 0x00, 0x20, 0x40, 0x00, 0xc3];
+        let mut coff_data = vec![0; function_rva + linked_function.len()];
+        coff_data[function_rva..].copy_from_slice(&linked_function);
+
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(linked_function.len()),
+            )
+            .unwrap();
+        symbols
+            .add_function_at_rva(target_rva, RawString::from(&b"target"[..]), Some(1))
+            .unwrap();
+        let aliases = RelocAliasManifest::default();
+        let data_manifest = DataManifest::default();
+
+        let mut retained_relocations = BTreeMap::new();
+        let retained = resolve_code_relocations(
+            image_base,
+            function_rva,
+            linked_function.len(),
+            &symbols,
+            &coff_data,
+            &mut retained_relocations,
+            &aliases,
+            &mut RelocAliasObservations::default(),
+            &data_manifest,
+            ManifestCoverage::AllowPartial,
+            crate::relocs::BaseRelocationSource::Absent.code_relocation_recovery(),
+        )
+        .unwrap();
+        assert_eq!(retained, linked_function);
+        assert!(retained_relocations.is_empty());
+
+        let mut recovered_relocations = BTreeMap::new();
+        let recovered = resolve_code_relocations(
+            image_base,
+            function_rva,
+            linked_function.len(),
+            &symbols,
+            &coff_data,
+            &mut recovered_relocations,
+            &aliases,
+            &mut RelocAliasObservations::default(),
+            &data_manifest,
+            ManifestCoverage::AllowPartial,
+            crate::relocs::BaseRelocationSource::Stripped.code_relocation_recovery(),
+        )
+        .unwrap();
+        assert_eq!(recovered, [0xb8, 0, 0, 0, 0, 0xc3]);
+        assert!(matches!(
+            recovered_relocations.get(&(function_rva + 1)),
+            Some(RelocKind::Function {
+                overloads,
+                encoding: RelocationEncoding::Absolute,
+                ..
+            }) if *overloads == [RawString::from(&b"target"[..])]
+        ));
+    }
 
     #[test]
     fn identical_function_records_are_claimed_once_per_owner_and_rva() {
