@@ -31,6 +31,7 @@ pub struct ObjectFile {
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
     topology_sections: Vec<EmittedTopologySection>,
     definition_ranges: Vec<Vec<(usize, usize)>>,
+    reviewed_section_checksums: Vec<([u8; 8], u32)>,
     pending_data_comdats: Vec<PendingDataComdat>,
     comdat_leaders: HashMap<usize, SymbolId>,
 }
@@ -94,10 +95,10 @@ impl ObjectFiles<'_> {
     where
         S: pdb2::Source<'static> + 'static,
     {
+        let topology = data_section_manifest.topology();
         let mut this = Self {
             objects: HashMap::new(),
         };
-        let topology = data_section_manifest.topology();
         let empty_object = || ObjectFile::empty_with_topology(pad_empty_rdata, topology);
 
         let mut sections_by_object = HashMap::<&[u8], Vec<DataSection>>::new();
@@ -246,7 +247,6 @@ impl ObjectFiles<'_> {
     pub fn write(self, base: &std::path::Path) -> anyhow::Result<()> {
         let base_len = base.as_os_str().as_encoded_bytes().len();
         let mut path = base.to_path_buf();
-
         for (prefix, mut object_file) in self.objects {
             path.as_mut_os_string().truncate(base_len);
 
@@ -263,7 +263,9 @@ impl ObjectFiles<'_> {
 
             std::fs::create_dir_all(path.parent().unwrap())?;
             object_file.finish_data_comdats()?;
-            std::fs::write(&path, object_file.object.write()?)?;
+            let mut bytes = object_file.object.write()?;
+            apply_reviewed_section_checksums(&mut bytes, &object_file.reviewed_section_checksums)?;
+            std::fs::write(&path, bytes)?;
         }
         Ok(())
     }
@@ -326,6 +328,7 @@ impl ObjectFile {
             undefined_symbols: HashMap::new(),
             topology_sections: Vec::new(),
             definition_ranges: Vec::new(),
+            reviewed_section_checksums: Vec::new(),
             pending_data_comdats: Vec::new(),
             comdat_leaders: HashMap::new(),
         }
@@ -351,6 +354,7 @@ impl ObjectFile {
         let mut rdata_section_id = None;
         let mut bss_section_id = None;
         let mut text_section_id = None;
+        let mut reviewed_section_checksums = Vec::with_capacity(sections.len());
 
         for section in sections {
             let kind = match section.storage {
@@ -410,6 +414,9 @@ impl ObjectFile {
                 (None, Some(_)) => unreachable!("section manifest validates assigned RVAs"),
             }
             object.section_symbol(id);
+            let mut section_name = [0; 8];
+            section_name[..section.name.len()].copy_from_slice(section.name);
+            reviewed_section_checksums.push((section_name, section.checksum));
             topology_sections.push(EmittedTopologySection {
                 id,
                 storage: section.storage,
@@ -452,6 +459,7 @@ impl ObjectFile {
             undefined_symbols: HashMap::new(),
             topology_sections,
             definition_ranges: vec![Vec::new(); sections.len()],
+            reviewed_section_checksums,
             pending_data_comdats,
             comdat_leaders: HashMap::new(),
         })
@@ -1245,6 +1253,67 @@ fn append_with_padding(
     offset
 }
 
+fn apply_reviewed_section_checksums(
+    bytes: &mut [u8],
+    reviewed: &[([u8; 8], u32)],
+) -> anyhow::Result<usize> {
+    use object::endian::LittleEndian;
+    use object::read::SectionIndex;
+
+    let coff = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(bytes)?;
+    let symbol_table_offset = coff.coff_header().pointer_to_symbol_table.get(LittleEndian) as usize;
+    let sections = coff.coff_section_table();
+    let symbols = coff.coff_symbol_table();
+    let checksum_in_aux = std::mem::offset_of!(object::pe::ImageAuxSymbolSection, check_sum);
+    let mut seen = vec![false; reviewed.len()];
+    let mut writes = Vec::with_capacity(reviewed.len());
+
+    for (index, symbol) in symbols.iter() {
+        let section_number = symbol.section_number.get(LittleEndian) as usize;
+        if section_number > reviewed.len()
+            || symbol.storage_class != object::pe::IMAGE_SYM_CLASS_STATIC
+            || symbol.number_of_aux_symbols != 1
+            || symbol.value.get(LittleEndian) != 0
+            || symbol.typ.get(LittleEndian) != object::pe::IMAGE_SYM_TYPE_NULL
+            || section_number == 0
+            || section_number > sections.len()
+        {
+            continue;
+        }
+        let section = sections.section(SectionIndex(section_number))?;
+        if symbol.name != section.name {
+            continue;
+        }
+        let (expected_name, checksum) = reviewed[section_number - 1];
+        if section.name != expected_name {
+            anyhow::bail!("reviewed section checksum order/name mismatch");
+        }
+        if std::mem::replace(&mut seen[section_number - 1], true) {
+            anyhow::bail!("duplicate COFF section-definition symbol");
+        }
+        symbols.aux_section(index)?;
+        let offset = symbol_table_offset
+            .checked_add(
+                (index.0 + 1)
+                    .checked_mul(object::pe::IMAGE_SIZEOF_SYMBOL)
+                    .ok_or_else(|| anyhow::anyhow!("COFF auxiliary symbol offset overflows"))?,
+            )
+            .and_then(|offset| offset.checked_add(checksum_in_aux))
+            .ok_or_else(|| anyhow::anyhow!("COFF section checksum offset overflows"))?;
+        bytes
+            .get(offset..offset + std::mem::size_of::<u32>())
+            .ok_or_else(|| anyhow::anyhow!("COFF section checksum is outside the symbol table"))?;
+        writes.push((offset, checksum));
+    }
+    if seen.iter().any(|seen| !seen) {
+        anyhow::bail!("reviewed COFF section has no section-definition symbol");
+    }
+    for (offset, checksum) in writes {
+        bytes[offset..offset + std::mem::size_of::<u32>()].copy_from_slice(&checksum.to_le_bytes());
+    }
+    Ok(seen.len())
+}
+
 //
 //
 //
@@ -1274,6 +1343,30 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use object::{Object as _, ObjectComdat as _, ObjectSection as _, ObjectSymbol as _};
+
+    fn section_definition_checksums(bytes: &[u8]) -> Vec<u32> {
+        use object::endian::LittleEndian;
+
+        let coff = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(bytes)
+            .unwrap();
+        coff.coff_symbol_table()
+            .iter()
+            .filter(|(_, symbol)| {
+                symbol.storage_class == object::pe::IMAGE_SYM_CLASS_STATIC
+                    && symbol.number_of_aux_symbols == 1
+                    && symbol.value.get(LittleEndian) == 0
+                    && symbol.typ.get(LittleEndian) == object::pe::IMAGE_SYM_TYPE_NULL
+                    && symbol.section_number.get(LittleEndian) > 0
+            })
+            .map(|(index, _)| {
+                coff.coff_symbol_table()
+                    .aux_section(index)
+                    .unwrap()
+                    .check_sum
+                    .get(LittleEndian)
+            })
+            .collect()
+    }
 
     fn definition(scope: DataScope, section_offset: usize) -> DataDefinition {
         DataDefinition {
@@ -1379,6 +1472,7 @@ mod tests {
                 size: 0,
                 alignment: 1,
                 characteristics: 0x0010_0a00,
+                checksum: 0,
                 comdat_selection: ComdatSelection::None,
                 associative_ordinal: None,
                 storage: None,
@@ -1391,6 +1485,7 @@ mod tests {
                 size: 4,
                 alignment: 4,
                 characteristics: 0xc030_0040,
+                checksum: 0,
                 comdat_selection: ComdatSelection::None,
                 associative_ordinal: None,
                 storage: Some(SectionStorage::Data),
@@ -1403,6 +1498,7 @@ mod tests {
                 size: 4,
                 alignment: 4,
                 characteristics: 0xc030_1040,
+                checksum: 0,
                 comdat_selection: ComdatSelection::Any,
                 associative_ordinal: None,
                 storage: Some(SectionStorage::Data),
@@ -1475,6 +1571,7 @@ mod tests {
             size: 0,
             alignment: 16,
             characteristics: 0x6050_0020,
+            checksum: 0,
             comdat_selection: ComdatSelection::None,
             associative_ordinal: None,
             storage: None,
@@ -1501,6 +1598,52 @@ mod tests {
     }
 
     #[test]
+    fn overrides_only_manifest_declared_section_definition_checksums() {
+        let sections = [DataSection {
+            object: b"SOURCE\\only_code.c",
+            ordinal: 1,
+            name: b".text",
+            rva: None,
+            size: 1,
+            alignment: 1,
+            characteristics: 0x6010_0020,
+            checksum: 0x1234_5678,
+            comdat_selection: ComdatSelection::None,
+            associative_ordinal: None,
+            storage: None,
+        }];
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 0,
+            data: &[],
+        };
+        let mut output = ObjectFile::with_sections(&sections, empty, empty, &[], false).unwrap();
+        output.add_function(RawString::from(&b"only_code"[..]), &[], &[0xc3]);
+        let lazy_rdata = output.rdata_section();
+        output
+            .object
+            .append_section_data(lazy_rdata, &[1, 2, 3, 4], 4);
+        output.object.section_symbol(lazy_rdata);
+
+        let reviewed = output.reviewed_section_checksums.clone();
+        let mut bytes = output.object.write().unwrap();
+        let generated = section_definition_checksums(&bytes);
+        assert_eq!(generated.len(), 2);
+        assert_ne!(generated[0], 0x1234_5678);
+        let lazy_generated = generated[1];
+        assert_eq!(
+            apply_reviewed_section_checksums(&mut bytes, &reviewed).unwrap(),
+            1
+        );
+        assert_eq!(
+            section_definition_checksums(&bytes),
+            [0x1234_5678, lazy_generated]
+        );
+    }
+
+    #[test]
     fn non_affine_topology_copies_reviewed_payloads_and_definition_relocations() {
         let sections = [DataSection {
             object: b"fixture.c",
@@ -1510,6 +1653,7 @@ mod tests {
             size: 0x10,
             alignment: 8,
             characteristics: 0xc040_0040,
+            checksum: 0,
             comdat_selection: ComdatSelection::None,
             associative_ordinal: None,
             storage: Some(SectionStorage::Data),
@@ -1615,6 +1759,7 @@ mod tests {
             size: 8,
             alignment: 4,
             characteristics: 0xc030_0040,
+            checksum: 0,
             comdat_selection: ComdatSelection::None,
             associative_ordinal: None,
             storage: Some(SectionStorage::Data),
@@ -1666,6 +1811,7 @@ mod tests {
                 size: 8,
                 alignment: 4,
                 characteristics: 0xc030_1040,
+                checksum: 0,
                 comdat_selection: ComdatSelection::Any,
                 associative_ordinal: None,
                 storage: Some(SectionStorage::Data),
@@ -1678,6 +1824,7 @@ mod tests {
                 size: 8,
                 alignment: 4,
                 characteristics: 0xc030_1040,
+                checksum: 0,
                 comdat_selection: ComdatSelection::Any,
                 associative_ordinal: None,
                 storage: Some(SectionStorage::Data),
@@ -1767,6 +1914,7 @@ mod tests {
             size: 4,
             alignment: 4,
             characteristics: 0xc030_0040,
+            checksum: 0,
             comdat_selection: ComdatSelection::None,
             associative_ordinal: None,
             storage: Some(SectionStorage::Data),

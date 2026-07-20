@@ -8,7 +8,7 @@ use nom::{IResult, Parser};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-const HEADER: &[u8] = b"object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tcomdat_selection\tassociative_ordinal\tstorage";
+const HEADER: &[u8] = b"object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tchecksum\tcomdat_selection\tassociative_ordinal\tstorage";
 
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
@@ -19,6 +19,7 @@ struct ManifestRow<'a> {
     size: &'a [u8],
     alignment: &'a [u8],
     characteristics: &'a [u8],
+    checksum: &'a [u8],
     comdat_selection: &'a [u8],
     associative_ordinal: &'a [u8],
     storage: &'a [u8],
@@ -47,6 +48,7 @@ fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
         terminated(field, tag(&b"\t"[..])),
         terminated(field, tag(&b"\t"[..])),
         terminated(field, tag(&b"\t"[..])),
+        terminated(field, tag(&b"\t"[..])),
         field,
     )
         .parse(input)?;
@@ -60,9 +62,10 @@ fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
             size: fields.4,
             alignment: fields.5,
             characteristics: fields.6,
-            comdat_selection: fields.7,
-            associative_ordinal: fields.8,
-            storage: fields.9,
+            checksum: fields.7,
+            comdat_selection: fields.8,
+            associative_ordinal: fields.9,
+            storage: fields.10,
         },
     ))
 }
@@ -95,6 +98,7 @@ pub struct DataSection {
     pub size: usize,
     pub alignment: u64,
     pub characteristics: u32,
+    pub checksum: u32,
     pub comdat_selection: ComdatSelection,
     pub associative_ordinal: Option<usize>,
     pub storage: Option<SectionStorage>,
@@ -154,7 +158,7 @@ impl DataSectionManifest {
             }
             let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
                 anyhow::anyhow!(
-                    "{}:{}: expected exactly ten tab-separated columns",
+                    "{}:{}: expected exactly eleven tab-separated columns",
                     path.display(),
                     line_number
                 )
@@ -189,6 +193,7 @@ impl DataSectionManifest {
                 );
             }
             let characteristics = u32::try_from(parse_number(row.characteristics)?)?;
+            let checksum = u32::try_from(parse_number(row.checksum)?)?;
             let comdat_selection = match parse_number(row.comdat_selection)? {
                 0 => ComdatSelection::None,
                 1 => ComdatSelection::NoDuplicates,
@@ -298,6 +303,7 @@ impl DataSectionManifest {
                 size,
                 alignment,
                 characteristics,
+                checksum,
                 comdat_selection,
                 associative_ordinal,
                 storage,
@@ -436,7 +442,7 @@ fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
 
-    const HEADER_TEXT: &str = "object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tcomdat_selection\tassociative_ordinal\tstorage\n";
+    const HEADER_TEXT: &str = "object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tchecksum\tcomdat_selection\tassociative_ordinal\tstorage\n";
 
     fn parse(rows: &str) -> anyhow::Result<DataSectionManifest> {
         DataSectionManifest::parse(
@@ -448,11 +454,12 @@ mod tests {
     #[test]
     fn preserves_duplicate_data_sections_and_comdat_metadata() {
         let manifest = parse(
-            "BASE/Midi.c\t1\t.data\t0x100\t0x48\t8\t0xc0400040\t0\t-\tdata\n\
-             BASE/Midi.c\t2\t.data\t0x148\t0x11\t4\t0xc0301040\t2\t-\tdata\n",
+            "BASE/Midi.c\t1\t.data\t0x100\t0x48\t8\t0xc0400040\t0\t0\t-\tdata\n\
+             BASE/Midi.c\t2\t.data\t0x148\t0x11\t4\t0xc0301040\t0\t2\t-\tdata\n",
         )
         .unwrap();
         assert_eq!(manifest.sections().len(), 2);
+        assert_eq!(manifest.sections()[1].checksum, 0);
         assert_eq!(
             manifest.sections()[1].comdat_selection,
             ComdatSelection::Any
@@ -471,39 +478,39 @@ mod tests {
 
     #[test]
     fn validates_contiguous_and_associative_ordinals() {
-        assert!(parse("a.c\t2\t.data\t0x100\t4\t4\t0\t0\t-\tdata\n").is_err());
-        assert!(parse("a.c\t1\t.debug$F\t-\t4\t1\t0\t5\t2\t-\n").is_err());
+        assert!(parse("a.c\t2\t.data\t0x100\t4\t4\t0\t0\t0\t-\tdata\n").is_err());
+        assert!(parse("a.c\t1\t.debug$F\t-\t4\t1\t0\t0\t5\t2\t-\n").is_err());
     }
 
     #[test]
     fn permits_storage_assigned_sections_without_an_affine_retail_rva() {
-        let manifest = parse("a.c\t1\t.data\t-\t0x10\t8\t0xc0400040\t0\t-\tdata\n").unwrap();
+        let manifest = parse("a.c\t1\t.data\t-\t0x10\t8\t0xc0400040\t0\t0\t-\tdata\n").unwrap();
         assert_eq!(manifest.sections()[0].rva, None);
         assert_eq!(manifest.sections()[0].storage, Some(SectionStorage::Data));
     }
 
     #[test]
     fn accepts_linker_sorted_initialized_writable_sections() {
-        let manifest = parse("a.c\t1\t.CRT$XCU\t0x100\t4\t4\t0xc0300040\t0\t-\tdata\n").unwrap();
+        let manifest = parse("a.c\t1\t.CRT$XCU\t0x100\t4\t4\t0xc0300040\t0\t0\t-\tdata\n").unwrap();
         assert_eq!(manifest.sections()[0].storage, Some(SectionStorage::Data));
     }
 
     #[test]
     fn rejects_misaligned_overlapping_and_storage_inconsistent_sections() {
-        assert!(parse("a.c\t1\t.data\t0x102\t4\t4\t0xc0300040\t0\t-\tdata\n").is_err());
-        assert!(parse("a.c\t1\t.data\t0x100\t4\t8\t0xc0300040\t0\t-\tdata\n").is_err());
+        assert!(parse("a.c\t1\t.data\t0x102\t4\t4\t0xc0300040\t0\t0\t-\tdata\n").is_err());
+        assert!(parse("a.c\t1\t.data\t0x100\t4\t8\t0xc0300040\t0\t0\t-\tdata\n").is_err());
         assert!(
             parse(
-                "a.c\t1\t.data\t0x100\t8\t4\t0xc0300040\t0\t-\tdata\n\
-                 b.c\t1\t.data\t0x104\t4\t4\t0xc0300040\t0\t-\tdata\n"
+                "a.c\t1\t.data\t0x100\t8\t4\t0xc0300040\t0\t0\t-\tdata\n\
+                 b.c\t1\t.data\t0x104\t4\t4\t0xc0300040\t0\t0\t-\tdata\n"
             )
             .is_err()
         );
-        assert!(parse("a.c\t1\t.rdata\t0x100\t4\t4\t0xc0300040\t0\t-\trdata\n").is_err());
+        assert!(parse("a.c\t1\t.rdata\t0x100\t4\t4\t0xc0300040\t0\t0\t-\trdata\n").is_err());
         assert!(
             parse(
-                "a.c\t1\t.text\t-\t4\t1\t0x00100020\t0\t-\t-\n\
-                 a.c\t2\t.debug$F\t-\t4\t1\t0x00101040\t5\t1\t-\n"
+                "a.c\t1\t.text\t-\t4\t1\t0x00100020\t0\t0\t-\t-\n\
+                 a.c\t2\t.debug$F\t-\t4\t1\t0x00101040\t0\t5\t1\t-\n"
             )
             .is_err()
         );
@@ -512,23 +519,23 @@ mod tests {
     #[test]
     fn permits_only_exact_compatible_folded_comdat_aliases() {
         let alias = concat!(
-            "a.c\t1\t.rdata\t0x100\t4\t4\t0x40301040\t2\t-\trdata\n",
-            "b.c\t1\t.rdata\t0x100\t4\t4\t0x40301040\t2\t-\trdata\n",
+            "a.c\t1\t.rdata\t0x100\t4\t4\t0x40301040\t0\t2\t-\trdata\n",
+            "b.c\t1\t.rdata\t0x100\t4\t4\t0x40301040\t0\t2\t-\trdata\n",
         );
         assert!(parse(alias).is_ok());
 
         let partial = alias.replace("b.c\t1\t.rdata\t0x100\t4", "b.c\t1\t.rdata\t0x102\t2");
         assert!(parse(&partial).is_err());
-        let ordinary = alias.replace("0x40301040\t2", "0x40300040\t0");
+        let ordinary = alias.replace("0x40301040\t0\t2", "0x40300040\t0\t0");
         assert!(parse(&ordinary).is_err());
-        let selection_mismatch = alias.replacen("0x40301040\t2", "0x40301040\t3", 1);
+        let selection_mismatch = alias.replacen("0x40301040\t0\t2", "0x40301040\t0\t3", 1);
         assert!(parse(&selection_mismatch).is_err());
     }
 
     #[test]
     fn accepts_crlf_and_missing_final_line_ending() {
         let text = format!(
-            "{}a.c\t1\t.data\t0x100\t4\t4\t0xc0300040\t0\t-\tdata",
+            "{}a.c\t1\t.data\t0x100\t4\t4\t0xc0300040\t0\t0\t-\tdata",
             HEADER_TEXT.replace('\n', "\r\n")
         );
         assert_eq!(
