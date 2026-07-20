@@ -93,7 +93,8 @@ cargo run --release -- \
   --exe-path build/game.exe \
   --output-path build/delink \
   --engine-path 'c:\project\sources' \
-  --data-manifest build/data-manifest.tsv
+  --data-manifest build/data-manifest.tsv \
+  --data-section-manifest build/data-sections.tsv
 ```
 
 Add `--strict` to require every PE base relocation whose target is in `.data`
@@ -108,11 +109,11 @@ lines beginning with `#` are ignored. The first non-comment line must be this
 exact ASCII header:
 
 ```text
-object	rva	size	storage	alignment	section_offset	scope
+object	rva	size	storage	alignment	section_ordinal	section_offset	scope
 ```
 
 Vostok parses the complete byte input with a `nom` grammar for LF/CRLF line
-boundaries and the exact seven-field row shape. It then applies semantic checks
+boundaries and the exact eight-field row shape. It then applies semantic checks
 for paths, numbers, storage, extents, uniqueness, and overlap.
 
 Each subsequent line defines one complete allocation:
@@ -124,7 +125,8 @@ Each subsequent line defines one complete allocation:
 | `size` | Complete allocation extent in bytes, in decimal or `0x` hexadecimal notation. |
 | `storage` | `data`, `rdata`, or `bss`. |
 | `alignment` | Required byte alignment; it must be a non-zero power of two. |
-| `section_offset` | Expected byte offset in the candidate object's storage section, or `-` when that topology has not been reviewed. Numeric offsets control emission order and are verified against the emitted COFF object. |
+| `section_ordinal` | One-based ordinal from the data section manifest, or `-` to use the object's default storage section. A numeric ordinal requires a numeric section offset. |
+| `section_offset` | Expected byte offset in the selected candidate section, or `-` when that topology has not been reviewed. Numeric offsets control emission order and are verified against the emitted COFF object. |
 | `scope` | `external` for a linkage-visible COFF symbol or `local` for a compilation-local symbol. |
 
 Start RVAs must be unique. Extents must be non-zero, non-overlapping,
@@ -135,24 +137,60 @@ PE base relocation.
 Example:
 
 ```text
-object	rva	size	storage	alignment	section_offset	scope
-vendor\zlib\infutil.c	0x00123450	0x44	data	0x4	0x20	local
+object	rva	size	storage	alignment	section_ordinal	section_offset	scope
+vendor\zlib\infutil.c	0x00123450	0x44	data	0x4	3	0x20	local
 ```
 
 This says that the existing PDB data symbol at RVA `0x00123450` is a 68-byte
 initialized definition, aligned to four bytes, compilation-local, located at
-offset `0x20` in its candidate `.data` section, and owned by
+offset `0x20` in candidate section 3, and owned by
 `vendor\zlib\infutil.c.obj`. The manifest does not supply or invent its name.
+
+### Data section manifest
+
+The optional data section manifest records the candidate COFF section table
+independently of symbol identity. Its first non-comment line must be this exact
+header:
+
+```text
+object	ordinal	name	rva	size	alignment	characteristics	comdat_selection	associative_ordinal	storage
+```
+
+Each object's ordinals must be unique, contiguous, and start at one. The fields
+have these meanings:
+
+| Field | Meaning |
+| --- | --- |
+| `object` | Relative output object path, normalized by the same rules as the data manifest. |
+| `ordinal` | One-based position in the original COFF section table. |
+| `name` | Original one-to-eight-byte COFF section name. |
+| `rva` | Start RVA of an affine linked data range, or `-` when the section has no directly recoverable linked range. |
+| `size` | Original section extent in bytes. |
+| `alignment` | Original non-zero, power-of-two section alignment. |
+| `characteristics` | Complete COFF section characteristics in decimal or `0x` hexadecimal notation. |
+| `comdat_selection` | COFF selection value: `0` none, `1` no duplicates, `2` any, `3` same size, `4` exact match, `5` associative, `6` largest, or `7` newest. |
+| `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section. |
+| `storage` | `data`, `rdata`, or `bss` for an affine linked range, otherwise `-`. Storage and RVA must either both be present or both be absent. |
+
+The manifest owns section order, names, characteristics, alignment, linked data
+ranges, and COMDAT relationships. The PDB still owns symbol names. Data-manifest
+rows bind definitions to these sections by ordinal and offset; the section
+manifest never creates or renames a definition.
+
+This implementation materializes affine `.data`, `.rdata`, and `.bss` ranges
+and non-associative data COMDAT groups. It also preserves the order, names, and
+characteristics of other section rows as empty section records. Recovering
+non-affine contents and associative groups requires additional reviewed input.
 
 ### What the manifest improves
 
 For each row Vostok copies the complete `.data` or `.rdata` payload, or allocates
 the complete `.bss` extent, in the named object. It defines the existing PDB
 symbol at that location with the reviewed size, alignment, and scope and keeps
-references from other objects external. Numeric candidate offsets order definitions
-within each object's storage section and reject a layout that emits a different
-offset. A reference to an interior address is represented as that PDB symbol plus
-its in-place COFF addend.
+references from other objects external. Numeric candidate offsets order
+definitions within each selected section and reject a layout that emits a
+different offset. A reference to an interior address is represented as that PDB
+symbol plus its in-place COFF addend.
 
 Relocation sites are not invented by the manifest. Vostok starts from existing
 PE `HIGHLOW` base-relocation entries, resolves their data targets through the
@@ -167,6 +205,6 @@ table was emitted as a four-byte fragment and matched its compiler definition at
 `0.7782101%`. Supplying its single reviewed manifest row emitted all 1,024 bytes
 in the owner object and matched the definition at `100.0%`.
 
-The manifest restores reviewed definitions and their order within each emitted
-storage section. It does not by itself reconstruct multiple same-name original
-sections or COMDAT grouping. Those are separate pieces of COFF topology.
+The data manifest restores reviewed definitions and their position within each
+emitted storage section. The data section manifest separately restores reviewed
+same-name sections and COMDAT topology.

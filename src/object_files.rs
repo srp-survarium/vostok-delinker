@@ -1,5 +1,8 @@
 use crate::Env;
 use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
+use crate::data_section_manifest::{
+    ComdatSelection, DataSection, DataSectionManifest, SectionStorage,
+};
 use crate::pdb_symbols::PdbSymbols;
 use crate::relocs::{RelocKind, RelocationEncoding};
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
@@ -11,8 +14,8 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
 use pdb2::{FallibleIterator, RawString};
 
-use object::SectionKind;
 use object::write::SymbolId;
+use object::{ComdatKind, SectionFlags, SectionKind};
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -25,6 +28,23 @@ pub struct ObjectFile {
     pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: object::write::SectionId,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
+    topology_sections: Vec<EmittedTopologySection>,
+    pending_data_comdats: Vec<PendingDataComdat>,
+    comdat_leaders: HashMap<usize, SymbolId>,
+}
+
+#[derive(Clone, Copy)]
+struct EmittedTopologySection {
+    id: object::write::SectionId,
+    storage: Option<SectionStorage>,
+    rva: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDataComdat {
+    ordinal: usize,
+    section: object::write::SectionId,
+    selection: ComdatSelection,
 }
 
 #[derive(Copy, Clone)]
@@ -64,6 +84,7 @@ impl ObjectFiles<'_> {
         pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
         data_manifest: &DataManifest,
+        data_section_manifest: &DataSectionManifest,
     ) -> anyhow::Result<Self>
     where
         S: pdb2::Source<'static> + 'static,
@@ -71,6 +92,26 @@ impl ObjectFiles<'_> {
         let mut this = Self {
             objects: HashMap::new(),
         };
+
+        let mut sections_by_object = HashMap::<&[u8], Vec<DataSection>>::new();
+        for section in data_section_manifest.sections() {
+            sections_by_object
+                .entry(section.object)
+                .or_default()
+                .push(*section);
+        }
+        for (object, sections) in sections_by_object {
+            this.objects.insert(
+                object,
+                ObjectFile::with_sections(
+                    &sections,
+                    env.rdata,
+                    env.data,
+                    coff_data,
+                    pad_empty_rdata,
+                )?,
+            );
+        }
 
         let definitions = data_manifest.definitions_in_emission_order();
 
@@ -192,7 +233,7 @@ impl ObjectFiles<'_> {
         let base_len = base.as_os_str().as_encoded_bytes().len();
         let mut path = base.to_path_buf();
 
-        for (prefix, object_file) in self.objects {
+        for (prefix, mut object_file) in self.objects {
             path.as_mut_os_string().truncate(base_len);
 
             let prefix = prefix
@@ -207,6 +248,7 @@ impl ObjectFiles<'_> {
             path.as_mut_os_string().push(".obj");
 
             std::fs::create_dir_all(path.parent().unwrap())?;
+            object_file.finish_data_comdats()?;
             std::fs::write(&path, object_file.object.write()?)?;
         }
         Ok(())
@@ -243,7 +285,133 @@ impl ObjectFile {
             bss_section_id: None,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            topology_sections: Vec::new(),
+            pending_data_comdats: Vec::new(),
+            comdat_leaders: HashMap::new(),
         }
+    }
+
+    fn with_sections(
+        sections: &[DataSection],
+        rdata: crate::SecInfo,
+        data: crate::SecInfo,
+        coff_data: &[u8],
+        pad_rdata: bool,
+    ) -> anyhow::Result<Self> {
+        let mut object = object::write::Object::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::I386,
+            object::Endianness::Little,
+        );
+        object.set_mangling(object::write::Mangling::None);
+
+        let mut topology_sections = Vec::with_capacity(sections.len());
+        let mut pending_data_comdats = Vec::new();
+        let mut data_section_id = None;
+        let mut rdata_section_id = None;
+        let mut bss_section_id = None;
+        let mut text_section_id = None;
+
+        for section in sections {
+            let kind = match section.storage {
+                Some(SectionStorage::Data) => SectionKind::Data,
+                Some(SectionStorage::Rdata) => SectionKind::ReadOnlyData,
+                Some(SectionStorage::Bss) => SectionKind::UninitializedData,
+                None if section.name == b".text" => SectionKind::Text,
+                None => SectionKind::Other,
+            };
+            let id = object.add_section(Vec::new(), section.name.to_vec(), kind);
+            object.section_mut(id).flags = SectionFlags::Coff {
+                characteristics: section.characteristics
+                    & !(object::pe::IMAGE_SCN_ALIGN_MASK | object::pe::IMAGE_SCN_LNK_COMDAT),
+            };
+
+            if let (Some(storage), Some(rva)) = (section.storage, section.rva) {
+                let end = rva
+                    .checked_add(section.size)
+                    .ok_or_else(|| anyhow::anyhow!("candidate data section extent overflows"))?;
+                let pe_section = match storage {
+                    SectionStorage::Rdata => rdata,
+                    SectionStorage::Data | SectionStorage::Bss => data,
+                };
+                if rva < pe_section.rva || end > pe_section.rva + pe_section.size {
+                    anyhow::bail!(
+                        "candidate data section {} storage does not match the PE section",
+                        section.ordinal
+                    );
+                }
+                match storage {
+                    SectionStorage::Bss => {
+                        object.append_section_bss(id, section.size.to_u64(), section.alignment);
+                    }
+                    SectionStorage::Data | SectionStorage::Rdata => {
+                        if end > coff_data.len() {
+                            anyhow::bail!(
+                                "candidate data section {} is outside mapped PE image",
+                                section.ordinal
+                            );
+                        }
+                        object.set_section_data(
+                            id,
+                            coff_data[rva..end].to_vec(),
+                            section.alignment,
+                        );
+                    }
+                }
+            } else {
+                object.set_section_data(id, Vec::new(), section.alignment);
+            }
+            object.section_symbol(id);
+            topology_sections.push(EmittedTopologySection {
+                id,
+                storage: section.storage,
+                rva: section.rva,
+            });
+
+            match section.storage {
+                Some(SectionStorage::Data) if data_section_id.is_none() => {
+                    data_section_id = Some(id)
+                }
+                Some(SectionStorage::Rdata) if rdata_section_id.is_none() => {
+                    rdata_section_id = Some(id)
+                }
+                Some(SectionStorage::Bss) if bss_section_id.is_none() => bss_section_id = Some(id),
+                None if section.name == b".text" && text_section_id.is_none() => {
+                    text_section_id = Some(id)
+                }
+                _ => {}
+            }
+            if section.storage.is_some() && section.comdat_selection != ComdatSelection::None {
+                pending_data_comdats.push(PendingDataComdat {
+                    ordinal: section.ordinal,
+                    section: id,
+                    selection: section.comdat_selection,
+                });
+            }
+        }
+
+        let data_section_id = data_section_id
+            .unwrap_or_else(|| object.add_section(Vec::new(), b".data".into(), SectionKind::Data));
+        let rdata_section_id = rdata_section_id.unwrap_or_else(|| {
+            object.add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData)
+        });
+        let text_section_id = text_section_id
+            .unwrap_or_else(|| object.add_section(Vec::new(), b".text".into(), SectionKind::Text));
+        if pad_rdata {
+            object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
+        }
+
+        Ok(Self {
+            object,
+            data_section_id,
+            rdata_section_id,
+            bss_section_id,
+            text_section_id,
+            undefined_symbols: HashMap::new(),
+            topology_sections,
+            pending_data_comdats,
+            comdat_leaders: HashMap::new(),
+        })
     }
 }
 
@@ -548,34 +716,73 @@ impl ObjectFile {
         if definition_end > coff_data.len() {
             anyhow::bail!("reviewed data definition is outside mapped PE image");
         }
-        let offset = match definition.storage {
-            DataStorage::Data => ObjectOffset {
-                offset: self.object.append_section_data(
-                    self.data_section_id,
-                    &coff_data[definition.rva..definition_end],
-                    definition.alignment,
-                ),
-                section_id: self.data_section_id,
-            },
-            DataStorage::Rdata => ObjectOffset {
-                offset: self.object.append_section_data(
-                    self.rdata_section_id,
-                    &coff_data[definition.rva..definition_end],
-                    definition.alignment,
-                ),
-                section_id: self.rdata_section_id,
-            },
-            DataStorage::Bss => {
-                let section_id = *self.bss_section_id.get_or_insert_with(|| {
-                    self.object
-                        .add_section(vec![], b".bss".into(), SectionKind::UninitializedData)
-                });
-                let offset = self.object.append_section_bss(
-                    section_id,
-                    definition.size.to_u64(),
-                    definition.alignment,
+        let topology_section = definition
+            .section_ordinal
+            .map(|ordinal| {
+                self.topology_sections
+                    .get(ordinal - 1)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "reviewed data definition references absent section ordinal {ordinal}"
+                        )
+                    })
+            })
+            .transpose()?;
+        let expected_storage = match definition.storage {
+            DataStorage::Data => SectionStorage::Data,
+            DataStorage::Rdata => SectionStorage::Rdata,
+            DataStorage::Bss => SectionStorage::Bss,
+        };
+        let offset = if let Some(section) = topology_section {
+            if section.storage != Some(expected_storage) {
+                anyhow::bail!("data definition storage disagrees with its candidate section");
+            }
+            let section_offset = definition.section_offset.unwrap();
+            let expected_rva = section.rva.unwrap().checked_add(section_offset).unwrap();
+            if definition.rva != expected_rva {
+                anyhow::bail!(
+                    "data definition RVA disagrees with its candidate section: expected {expected_rva:#x}, got {:#x}",
+                    definition.rva
                 );
-                ObjectOffset { offset, section_id }
+            }
+            ObjectOffset {
+                offset: section_offset.to_u64(),
+                section_id: section.id,
+            }
+        } else {
+            match definition.storage {
+                DataStorage::Data => ObjectOffset {
+                    offset: self.object.append_section_data(
+                        self.data_section_id,
+                        &coff_data[definition.rva..definition_end],
+                        definition.alignment,
+                    ),
+                    section_id: self.data_section_id,
+                },
+                DataStorage::Rdata => ObjectOffset {
+                    offset: self.object.append_section_data(
+                        self.rdata_section_id,
+                        &coff_data[definition.rva..definition_end],
+                        definition.alignment,
+                    ),
+                    section_id: self.rdata_section_id,
+                },
+                DataStorage::Bss => {
+                    let section_id = *self.bss_section_id.get_or_insert_with(|| {
+                        self.object.add_section(
+                            Vec::new(),
+                            b".bss".into(),
+                            SectionKind::UninitializedData,
+                        )
+                    });
+                    let offset = self.object.append_section_bss(
+                        section_id,
+                        definition.size.to_u64(),
+                        definition.alignment,
+                    );
+                    ObjectOffset { offset, section_id }
+                }
             }
         };
         if let Some(expected) = definition.section_offset
@@ -597,7 +804,7 @@ impl ObjectFile {
                 definition.symbol_name
             );
         }
-        self.object.add_symbol(object::write::Symbol {
+        let symbol = self.object.add_symbol(object::write::Symbol {
             name: definition.symbol_name.as_bytes().to_vec(),
             value: offset.offset,
             size: definition.size.to_u64(),
@@ -610,6 +817,46 @@ impl ObjectFile {
             section: object::write::SymbolSection::Section(offset.section_id),
             flags: object::SymbolFlags::None,
         });
+        if let Some(ordinal) = definition.section_ordinal
+            && definition.section_offset == Some(0)
+            && definition.scope == DataScope::External
+        {
+            self.comdat_leaders.entry(ordinal).or_insert(symbol);
+        }
+        Ok(())
+    }
+
+    fn finish_data_comdats(&mut self) -> anyhow::Result<()> {
+        for pending in self.pending_data_comdats.clone() {
+            let leader = self
+                .comdat_leaders
+                .get(&pending.ordinal)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "candidate data COMDAT section {} has no external offset-zero leader",
+                        pending.ordinal
+                    )
+                })?;
+            let kind = match pending.selection {
+                ComdatSelection::NoDuplicates => ComdatKind::NoDuplicates,
+                ComdatSelection::Any => ComdatKind::Any,
+                ComdatSelection::SameSize => ComdatKind::SameSize,
+                ComdatSelection::ExactMatch => ComdatKind::ExactMatch,
+                ComdatSelection::Largest => ComdatKind::Largest,
+                ComdatSelection::Newest => ComdatKind::Newest,
+                ComdatSelection::Associative => anyhow::bail!(
+                    "associative data COMDAT section {} requires a leader group",
+                    pending.ordinal
+                ),
+                ComdatSelection::None => unreachable!(),
+            };
+            self.object.add_comdat(object::write::Comdat {
+                kind,
+                symbol: leader,
+                sections: vec![pending.section],
+            });
+        }
         Ok(())
     }
 
@@ -882,7 +1129,7 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object::{Object as _, ObjectSymbol as _};
+    use object::{Object as _, ObjectComdat as _, ObjectSection as _, ObjectSymbol as _};
 
     fn definition(scope: DataScope, section_offset: usize) -> DataDefinition {
         DataDefinition {
@@ -892,6 +1139,7 @@ mod tests {
             size: 4,
             storage: DataStorage::Data,
             alignment: 4,
+            section_ordinal: None,
             section_offset: Some(section_offset),
             scope,
         }
@@ -973,5 +1221,102 @@ mod tests {
             .collect::<Vec<_>>();
         definitions.sort_unstable();
         assert_eq!(definitions, ["real_a", "real_b"]);
+    }
+
+    #[test]
+    fn emits_distinct_data_sections_and_comdat_group() {
+        let sections = [
+            DataSection {
+                object: b"fixture.c",
+                ordinal: 1,
+                name: b".drectve",
+                rva: None,
+                size: 0,
+                alignment: 1,
+                characteristics: 0x0010_0a00,
+                comdat_selection: ComdatSelection::None,
+                associative_ordinal: None,
+                storage: None,
+            },
+            DataSection {
+                object: b"fixture.c",
+                ordinal: 2,
+                name: b".data",
+                rva: Some(0x10),
+                size: 4,
+                alignment: 4,
+                characteristics: 0xc030_0040,
+                comdat_selection: ComdatSelection::None,
+                associative_ordinal: None,
+                storage: Some(SectionStorage::Data),
+            },
+            DataSection {
+                object: b"fixture.c",
+                ordinal: 3,
+                name: b".data",
+                rva: Some(0x20),
+                size: 4,
+                alignment: 4,
+                characteristics: 0xc030_1040,
+                comdat_selection: ComdatSelection::Any,
+                associative_ordinal: None,
+                storage: Some(SectionStorage::Data),
+            },
+        ];
+        let mut image = vec![0_u8; 0x30];
+        image[0x10..0x14].copy_from_slice(b"main");
+        image[0x20..0x24].copy_from_slice(b"fold");
+        let rdata = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 2,
+            data: &[],
+        };
+        let data = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 3,
+            data: &image,
+        };
+        let mut output = ObjectFile::with_sections(&sections, rdata, data, &image, false).unwrap();
+        for (name, rva, ordinal) in [(b"main".as_slice(), 0x10, 2), (b"fold".as_slice(), 0x20, 3)] {
+            output
+                .add_data_definition(
+                    DataDefinition {
+                        symbol_name: RawString::from(name),
+                        object: b"fixture.c",
+                        rva,
+                        size: 4,
+                        storage: DataStorage::Data,
+                        alignment: 4,
+                        section_ordinal: Some(ordinal),
+                        section_offset: Some(0),
+                        scope: DataScope::External,
+                    },
+                    &image,
+                )
+                .unwrap();
+        }
+        output.finish_data_comdats().unwrap();
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let parsed_sections = object.sections().collect::<Vec<_>>();
+        assert_eq!(parsed_sections[0].name().unwrap(), ".drectve");
+        assert_eq!(parsed_sections[1].data().unwrap(), b"main");
+        assert_eq!(parsed_sections[2].data().unwrap(), b"fold");
+        let comdats = object.comdats().collect::<Vec<_>>();
+        assert_eq!(comdats.len(), 1);
+        assert_eq!(comdats[0].kind(), ComdatKind::Any);
+        assert_eq!(
+            object
+                .symbol_by_index(comdats[0].symbol())
+                .unwrap()
+                .name()
+                .unwrap(),
+            "fold"
+        );
     }
 }
