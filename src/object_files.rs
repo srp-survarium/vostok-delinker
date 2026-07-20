@@ -650,14 +650,17 @@ impl ObjectFile {
             RelocKind::Constant { target_rva, .. } | RelocKind::Static { target_rva, .. } => {
                 data_manifest.owner_and_addend_for_rva(target_rva).is_some()
             }
-            RelocKind::Function { .. } | RelocKind::ConstantString { .. } => false,
+            RelocKind::Import { .. }
+            | RelocKind::Function { .. }
+            | RelocKind::ConstantString { .. } => false,
         };
         if target_materialization == TargetMaterialization::ReferenceOnly
             || target_is_manifest_definition
         {
             let encoding = match reloc_kind {
                 RelocKind::Function { encoding, .. } => encoding,
-                RelocKind::ConstantString { .. }
+                RelocKind::Import { .. }
+                | RelocKind::ConstantString { .. }
                 | RelocKind::Constant { .. }
                 | RelocKind::Static { .. } => RelocationEncoding::Absolute,
             };
@@ -672,6 +675,16 @@ impl ObjectFile {
         }
 
         match reloc_kind {
+            RelocKind::Import { .. } => {
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern(object::SymbolKind::Unknown),
+                    reloc_offset,
+                    RelocationEncoding::Absolute,
+                    SymbolReuse::ReuseExisting,
+                )?;
+            }
+
             RelocKind::Function {
                 overloads: _,
                 encoding,
@@ -1183,14 +1196,16 @@ impl<'a> RelocKind<'a> {
     fn external_symbol_kind(self) -> object::SymbolKind {
         match self {
             Self::Function { .. } => object::SymbolKind::Text,
-            Self::ConstantString { .. } | Self::Constant { .. } | Self::Static { .. } => {
-                object::SymbolKind::Unknown
-            }
+            Self::Import { .. }
+            | Self::ConstantString { .. }
+            | Self::Constant { .. }
+            | Self::Static { .. } => object::SymbolKind::Unknown,
         }
     }
 
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
+            Self::Import { symbol } => Name::Borrowed(symbol),
             Self::Function {
                 overloads, symbol, ..
             } => Name::Borrowed(

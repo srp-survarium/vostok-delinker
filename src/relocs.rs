@@ -13,6 +13,10 @@ use std::collections::BTreeMap;
 
 #[derive(Copy, Clone, Debug)]
 pub enum RelocKind<'a> {
+    Import {
+        symbol: RawString<'static>,
+    },
+
     // .text
     Function {
         overloads: &'a [RawString<'static>],
@@ -166,6 +170,21 @@ pub fn resolve_absolute_relocations<'s>(
             let coff_data_reloc = &mut coff_data[reloc_rva..reloc_rva + 4];
 
             match () {
+                () if env.iat.is_some_and(|iat| iat.contains_rva(target_rva)) => {
+                    let Some(import_name) = symbols.imports.get(&target_rva) else {
+                        anyhow::bail!(
+                            "PE base relocation at RVA {reloc_rva:#x} targets IAT slot RVA \
+                             {target_rva:#x}, which has no PDB symbol"
+                        );
+                    };
+                    coff_data_reloc.copy_from_slice(&0_u32.to_le_bytes());
+                    relocs_rva.insert(
+                        reloc_rva,
+                        RelocKind::Import {
+                            symbol: *import_name,
+                        },
+                    );
+                }
                 () if (env.text.rva..env.text.rva + env.text.size).contains(&target_rva) => {
                     let (function_rva, function_overloads) = symbols
                         .functions

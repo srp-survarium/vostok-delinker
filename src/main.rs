@@ -81,6 +81,27 @@ pub struct SecInfo<'a> {
     pub data: &'a [u8],
 }
 
+#[derive(Clone, Debug, Copy)]
+pub struct IatInfo<'a> {
+    pub rva: usize,
+    pub size: usize,
+    pub section: SecInfo<'a>,
+}
+
+impl IatInfo<'_> {
+    pub fn contains_rva(self, rva: usize) -> bool {
+        (self.rva..self.rva + self.size).contains(&rva)
+    }
+
+    pub fn rva_for_offset(self, offset: pdb2::PdbInternalSectionOffset) -> Option<usize> {
+        if offset.section != self.section.id {
+            return None;
+        }
+        let rva = self.section.rva.checked_add(offset.offset.to_usize())?;
+        self.contains_rva(rva).then_some(rva)
+    }
+}
+
 // # Notes
 //
 // 1. Figure out how to not leak memory excessively with `pdb2` crate.
@@ -230,6 +251,7 @@ pub struct Env<'a> {
     pub text: SecInfo<'a>,
     pub rdata: SecInfo<'a>,
     pub data: SecInfo<'a>,
+    pub iat: Option<IatInfo<'a>>,
 
     pub dbi: &'static pdb2::DebugInformation<'static>,
     pub string_table: &'static pdb2::StringTable<'static>,
@@ -280,15 +302,102 @@ impl Env<'_> {
         let rdata = build_sec_info(rdata_sec)?;
         let data = build_sec_info(data_sec)?;
 
+        let iat = exe
+            .data_directory(object::pe::IMAGE_DIRECTORY_ENTRY_IAT)
+            .map(|directory| {
+                let rva = directory.virtual_address.get(LittleEndian).to_usize();
+                let size = directory.size.get(LittleEndian).to_usize();
+                let end = rva
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow::anyhow!("IAT extent overflows"))?;
+                let section = exe
+                    .sections()
+                    .find(|section| {
+                        let section_rva = section.address().to_usize() - image_base.to_usize();
+                        let Some(section_end) = section_rva.checked_add(section.size().to_usize())
+                        else {
+                            return false;
+                        };
+                        section_rva <= rva && end <= section_end
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("IAT is not contained in one PE section"))?;
+
+                Ok::<_, anyhow::Error>(IatInfo {
+                    rva,
+                    size,
+                    section: build_sec_info(section)?,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             image_base,
             text,
             rdata,
             data,
+            iat,
 
             dbi,
             string_table,
             symbol_table,
         })
+    }
+
+    pub fn iat_rva(&self, offset: pdb2::PdbInternalSectionOffset) -> Option<usize> {
+        self.iat?.rva_for_offset(offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IatInfo, SecInfo};
+
+    fn iat() -> IatInfo<'static> {
+        IatInfo {
+            rva: 0x2200,
+            size: 0x20,
+            section: SecInfo {
+                rva: 0x2000,
+                va: 0x402000,
+                size: 0x1000,
+                id: 4,
+                data: &[],
+            },
+        }
+    }
+
+    #[test]
+    fn iat_range_is_half_open() {
+        let iat = iat();
+        assert!(iat.contains_rva(0x2200));
+        assert!(iat.contains_rva(0x221f));
+        assert!(!iat.contains_rva(0x21ff));
+        assert!(!iat.contains_rva(0x2220));
+    }
+
+    #[test]
+    fn pdb_offset_must_resolve_inside_iat_range() {
+        let iat = iat();
+        assert_eq!(
+            iat.rva_for_offset(pdb2::PdbInternalSectionOffset {
+                section: 4,
+                offset: 0x210,
+            }),
+            Some(0x2210)
+        );
+        assert_eq!(
+            iat.rva_for_offset(pdb2::PdbInternalSectionOffset {
+                section: 3,
+                offset: 0x210,
+            }),
+            None
+        );
+        assert_eq!(
+            iat.rva_for_offset(pdb2::PdbInternalSectionOffset {
+                section: 4,
+                offset: 0x220,
+            }),
+            None
+        );
     }
 }
