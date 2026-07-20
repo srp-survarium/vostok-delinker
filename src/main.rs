@@ -59,8 +59,8 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_section_manifest: Option<std::path::PathBuf>,
 
-    /// Reviewed function/target pairs whose retained absolute relocations use
-    /// a specific existing PDB owner symbol and addend.
+    /// Reviewed function/target pairs whose data or function relocations use a
+    /// specific existing PDB owner symbol and addend.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub reloc_alias_manifest: Option<std::path::PathBuf>,
 
@@ -158,7 +158,11 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
     let reloc_alias_manifest =
         reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
-    let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
+    let relocs::ResolvedRelocations {
+        coff_data,
+        by_rva: relocs_rva,
+        mut observed_aliases,
+    } = relocs::resolve_absolute_relocations(
         &env,
         exe,
         &pdb_symbols,
@@ -192,7 +196,10 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &matcher,
         &data_manifest,
         &data_section_manifest,
+        &reloc_alias_manifest,
+        &mut observed_aliases,
     )?;
+    reloc_alias_manifest.validate_occurrences(&observed_aliases)?;
     object_files.write(output_path)?;
 
     // Target side: record the choices base will later try to reproduce.
