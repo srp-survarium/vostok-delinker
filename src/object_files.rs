@@ -3,7 +3,7 @@ use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage}
 use crate::data_section_manifest::{
     ComdatSelection, DataSection, DataSectionManifest, SectionStorage, SectionTopology,
 };
-use crate::pdb_symbols::PdbSymbols;
+use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::relocs::{RelocKind, RelocationEncoding};
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
@@ -620,13 +620,19 @@ fn resolve_relative_relocations<'s>(
 
         let overloads = overloads.as_slice();
         let reloc_rva = fun_rva + offset_in_fun - 4;
-        let symbol = reloc_aliases.resolve_function_alias(
-            fun_rva,
-            target_rva.to_usize(),
-            reloc_rva,
-            overloads,
-            observed_aliases,
-        )?;
+        let symbol = match symbols.relocation_field_in_function(fun_rva, reloc_rva) {
+            FunctionRelocationField::Within { .. } => reloc_aliases.resolve_function_alias(
+                fun_rva,
+                target_rva.to_usize(),
+                reloc_rva,
+                overloads,
+                observed_aliases,
+            )?,
+            FunctionRelocationField::MissingFunction
+            | FunctionRelocationField::UnknownExtent
+            | FunctionRelocationField::OutsideExtent
+            | FunctionRelocationField::FieldOverflow => None,
+        };
 
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(

@@ -1,6 +1,6 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
-use crate::pdb_symbols::{self, PdbDataSymbol};
+use crate::pdb_symbols::{self, FunctionRelocationField, PdbDataSymbol};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::utils::ToUsize;
 
@@ -69,20 +69,22 @@ pub struct ResolvedRelocations<'a> {
 
 fn resolve_manifest_alias(
     aliases: &RelocAliasManifest,
-    symbols: &BTreeMap<usize, PdbDataSymbol>,
-    functions: &BTreeMap<usize, Vec<RawString<'static>>>,
+    owners: &BTreeMap<usize, PdbDataSymbol>,
+    symbols: &pdb_symbols::PdbSymbols,
     observed: &mut RelocAliasObservations,
     reloc_rva: usize,
     target_rva: usize,
 ) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
-    let Some((function_rva, _)) = functions.range(..=reloc_rva).next_back() else {
+    let FunctionRelocationField::Within { function_rva } =
+        symbols.relocation_field_owner(reloc_rva)
+    else {
         return Ok(None);
     };
-    let Some(alias) = aliases.resolve(*function_rva, target_rva, reloc_rva, observed) else {
+    let Some(alias) = aliases.resolve(function_rva, target_rva, reloc_rva, observed) else {
         return Ok(None);
     };
 
-    let mut owners = symbols
+    let mut owners = owners
         .iter()
         .filter(|(_, symbol)| symbol.name == alias.owner);
     let Some((owner_rva, _)) = owners.next() else {
@@ -311,20 +313,20 @@ pub fn resolve_absolute_relocations<'s>(
                     let symbol = if diff == 0
                         && (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
                     {
-                        let Some((owner_function_rva, _)) =
-                            symbols.functions.range(..=reloc_rva).next_back()
-                        else {
-                            anyhow::bail!(
-                                "function relocation site {reloc_rva:#x} has no containing function"
-                            );
-                        };
-                        reloc_aliases.resolve_function_alias(
-                            *owner_function_rva,
-                            target_rva,
-                            reloc_rva,
-                            function_overloads,
-                            &mut observed_aliases,
-                        )?
+                        match symbols.relocation_field_owner(reloc_rva) {
+                            FunctionRelocationField::Within { function_rva } => reloc_aliases
+                                .resolve_function_alias(
+                                    function_rva,
+                                    target_rva,
+                                    reloc_rva,
+                                    function_overloads,
+                                    &mut observed_aliases,
+                                )?,
+                            FunctionRelocationField::MissingFunction
+                            | FunctionRelocationField::UnknownExtent
+                            | FunctionRelocationField::OutsideExtent
+                            | FunctionRelocationField::FieldOverflow => None,
+                        }
                     } else {
                         None
                     };
@@ -343,7 +345,7 @@ pub fn resolve_absolute_relocations<'s>(
                         && let Some((addend, owner)) = resolve_manifest_alias(
                             reloc_aliases,
                             &symbols.constants,
-                            &symbols.functions,
+                            symbols,
                             &mut observed_aliases,
                             reloc_rva,
                             target_rva,
@@ -427,7 +429,7 @@ pub fn resolve_absolute_relocations<'s>(
                         && let Some((addend, owner)) = resolve_manifest_alias(
                             reloc_aliases,
                             &symbols.statics,
-                            &symbols.functions,
+                            symbols,
                             &mut observed_aliases,
                             reloc_rva,
                             target_rva,
