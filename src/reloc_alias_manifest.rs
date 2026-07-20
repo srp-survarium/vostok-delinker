@@ -6,6 +6,8 @@ use nom::sequence::terminated;
 use nom::{IResult, Parser};
 use pdb2::RawString;
 
+use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -256,36 +258,28 @@ impl RelocAliasManifest {
         Ok(Some(alias.owner))
     }
 
-    pub fn validate_site_membership(
-        &self,
-        functions: &BTreeMap<usize, Vec<RawString<'static>>>,
-    ) -> anyhow::Result<()> {
+    pub fn validate_site_membership(&self, symbols: &PdbSymbols) -> anyhow::Result<()> {
         for alias in self.aliases.values() {
             let Some(site_rva) = alias.site_rva else {
                 continue;
             };
-            let containing_function = functions
-                .range(..=site_rva)
-                .next_back()
-                .map(|(rva, _)| *rva);
-            if containing_function != Some(alias.function_rva) {
-                anyhow::bail!(
-                    "relocation alias exact site {site_rva:#x} is not in function {:#x}",
+            match symbols.relocation_field_in_function(alias.function_rva, site_rva) {
+                FunctionRelocationField::Within { .. } => {}
+                FunctionRelocationField::MissingFunction => anyhow::bail!(
+                    "relocation alias exact site {site_rva:#x} names missing function {:#x}",
                     alias.function_rva
-                );
-            }
-            if let Some((next_function_rva, _)) = functions
-                .range(alias.function_rva.saturating_add(1)..)
-                .next()
-            {
-                let site_end = site_rva
-                    .checked_add(std::mem::size_of::<u32>())
-                    .ok_or_else(|| anyhow::anyhow!("relocation alias exact site overflows RVA"))?;
-                if site_end > *next_function_rva {
-                    anyhow::bail!(
-                        "relocation alias exact site {site_rva:#x} crosses function {:#x} boundary",
-                        alias.function_rva
-                    );
+                ),
+                FunctionRelocationField::UnknownExtent => anyhow::bail!(
+                    "relocation alias exact site {site_rva:#x} names function {:#x} without a Procedure/Thunk extent",
+                    alias.function_rva
+                ),
+                FunctionRelocationField::OutsideExtent => anyhow::bail!(
+                    "relocation alias exact site field {site_rva:#x}..{:#x} is outside function {:#x}",
+                    site_rva.saturating_add(std::mem::size_of::<u32>()),
+                    alias.function_rva
+                ),
+                FunctionRelocationField::FieldOverflow => {
+                    anyhow::bail!("relocation alias exact site {site_rva:#x} overflows RVA")
                 }
             }
         }
@@ -373,11 +367,14 @@ mod tests {
         let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x3010\ta\t0\t1\n");
         let manifest =
             RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
-        let functions = BTreeMap::from([
-            (0x2000, vec![RawString::from(&b"a"[..])]),
-            (0x3000, vec![RawString::from(&b"b"[..])]),
-        ]);
-        assert!(manifest.validate_site_membership(&functions).is_err());
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x20))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x3000, RawString::from(&b"b"[..]), Some(0x20))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_err());
     }
 
     #[test]
@@ -385,11 +382,66 @@ mod tests {
         let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2ffe\ta\t0\t1\n");
         let manifest =
             RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
-        let functions = BTreeMap::from([
-            (0x2000, vec![RawString::from(&b"a"[..])]),
-            (0x3000, vec![RawString::from(&b"b"[..])]),
-        ]);
-        assert!(manifest.validate_site_membership(&functions).is_err());
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x1000))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x3000, RawString::from(&b"b"[..]), Some(0x20))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_err());
+    }
+
+    #[test]
+    fn exact_site_requires_a_procedure_extent() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2000\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), None)
+            .unwrap();
+        let error = manifest
+            .validate_site_membership(&symbols)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without a Procedure/Thunk extent"));
+    }
+
+    #[test]
+    fn exact_site_requires_an_existing_function() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2000\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let error = manifest
+            .validate_site_membership(&PdbSymbols::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("names missing function 0x2000"));
+    }
+
+    #[test]
+    fn exact_site_after_final_function_is_rejected() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2010\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x10))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_err());
+    }
+
+    #[test]
+    fn exact_site_field_may_end_at_function_extent() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x200c\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x10))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_ok());
     }
 
     #[test]
