@@ -60,7 +60,7 @@ pub struct ObjectOffset {
 #[derive(Copy, Clone)]
 pub enum ObjectLocation {
     Offset(ObjectOffset),
-    Extern,
+    Extern(object::SymbolKind),
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -663,7 +663,7 @@ impl ObjectFile {
             };
             self.add_relocation(
                 reloc_name,
-                ObjectLocation::Extern,
+                ObjectLocation::Extern(reloc_kind.external_symbol_kind()),
                 reloc_offset,
                 encoding,
                 SymbolReuse::ReuseExisting,
@@ -679,7 +679,7 @@ impl ObjectFile {
             } => {
                 self.add_relocation(
                     reloc_name,
-                    ObjectLocation::Extern,
+                    ObjectLocation::Extern(object::SymbolKind::Text),
                     reloc_offset,
                     encoding,
                     SymbolReuse::ReuseExisting,
@@ -1071,11 +1071,7 @@ impl ObjectFile {
         symbol_reuse: SymbolReuse,
     ) -> anyhow::Result<()> {
         let (value, kind, section) = match location {
-            ObjectLocation::Extern => (
-                0,
-                object::SymbolKind::Unknown,
-                object::write::SymbolSection::Undefined,
-            ),
+            ObjectLocation::Extern(kind) => (0, kind, object::write::SymbolSection::Undefined),
             ObjectLocation::Offset(ObjectOffset { offset, section_id }) => {
                 let kind = if Some(section_id) == self.text_section_id {
                     object::SymbolKind::Text
@@ -1184,6 +1180,15 @@ enum Name<'a> {
 }
 
 impl<'a> RelocKind<'a> {
+    fn external_symbol_kind(self) -> object::SymbolKind {
+        match self {
+            Self::Function { .. } => object::SymbolKind::Text,
+            Self::ConstantString { .. } | Self::Constant { .. } | Self::Static { .. } => {
+                object::SymbolKind::Unknown
+            }
+        }
+    }
+
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
             Self::Function {
@@ -1368,6 +1373,21 @@ mod tests {
             .collect()
     }
 
+    fn short_coff_symbol_type(bytes: &[u8], name: &[u8]) -> u16 {
+        use object::endian::LittleEndian;
+
+        assert!(name.len() <= 8);
+        let coff = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(bytes)
+            .unwrap();
+        let mut padded = [0_u8; 8];
+        padded[..name.len()].copy_from_slice(name);
+        coff.coff_symbol_table()
+            .iter()
+            .find(|(_, symbol)| symbol.name == padded)
+            .map(|(_, symbol)| symbol.typ.get(LittleEndian))
+            .unwrap()
+    }
+
     fn definition(scope: DataScope, section_offset: usize) -> DataDefinition {
         DataDefinition {
             symbol_name: RawString::from(&b"fixture"[..]),
@@ -1415,7 +1435,7 @@ mod tests {
         object
             .add_relocation(
                 name,
-                ObjectLocation::Extern,
+                ObjectLocation::Extern(object::SymbolKind::Unknown),
                 offset,
                 RelocationEncoding::Absolute,
                 SymbolReuse::ReuseExisting,
@@ -1424,7 +1444,7 @@ mod tests {
         object
             .add_relocation(
                 name,
-                ObjectLocation::Extern,
+                ObjectLocation::Extern(object::SymbolKind::Unknown),
                 offset + 4,
                 RelocationEncoding::Absolute,
                 SymbolReuse::ReuseExisting,
@@ -1437,6 +1457,34 @@ mod tests {
                 .undefined_symbols
                 .contains_key(b"external".as_slice())
         );
+        let bytes = object.object.write().unwrap();
+        assert_eq!(short_coff_symbol_type(&bytes, b"external"), 0);
+    }
+
+    #[test]
+    fn absolute_function_reference_uses_coff_function_type() {
+        let mut object = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let text_section_id = object.text_section();
+        let field = object.append_section_data(text_section_id, &[0; 4], 0x90);
+        object
+            .add_relocation(
+                RawString::from(&b"fn_ptr"[..]),
+                ObjectLocation::Extern(object::SymbolKind::Text),
+                field,
+                RelocationEncoding::Absolute,
+                SymbolReuse::ReuseExisting,
+            )
+            .unwrap();
+
+        let bytes = object.object.write().unwrap();
+        let parsed = object::File::parse(bytes.as_slice()).unwrap();
+        let symbol = parsed
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("fn_ptr"))
+            .unwrap();
+        assert!(symbol.is_undefined());
+        assert_eq!(symbol.kind(), object::SymbolKind::Text);
+        assert_eq!(short_coff_symbol_type(&bytes, b"fn_ptr"), 0x20);
     }
 
     #[test]

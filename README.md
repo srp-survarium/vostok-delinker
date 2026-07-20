@@ -292,3 +292,7 @@ overly broad row stops the delink. An exact site row takes precedence over a
 wildcard row with the same function and target and must declare one occurrence.
 Its four-byte relocation field must lie entirely within the declared PDB
 function. The manifest neither invents sites nor names.
+
+Recovered external function references use the COFF derived-function type for
+both relative branches and absolute function pointers. Data references remain
+untyped COFF symbols.
