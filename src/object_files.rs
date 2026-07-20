@@ -322,12 +322,13 @@ fn resolve_relative_relocations<'s>(
         fun_bytes[offset_in_fun - 4..offset_in_fun].copy_from_slice(&0_u32.to_le_bytes());
         let old_reloc = relocs_rva.insert(
             fun_rva + offset_in_fun - 4,
-            RelocKind::Function { overloads },
+            RelocKind::Function { overloads, relative: true },
         );
 
         if let Some(old_reloc) = old_reloc {
             let RelocKind::Function {
                 overloads: old_overloads,
+                ..
             } = old_reloc
             else {
                 unreachable!();
@@ -355,8 +356,8 @@ impl ObjectFile {
         let reloc_name = reloc_name.as_raw_string();
 
         match reloc_kind {
-            RelocKind::Function { overloads: _ } => {
-                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset)?;
+            RelocKind::Function { overloads: _, relative } => {
+                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, relative)?;
             }
 
             RelocKind::ConstantString { symbol: _, data } => {
@@ -367,6 +368,7 @@ impl ObjectFile {
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
+                    false,
                 )?;
             }
 
@@ -382,6 +384,7 @@ impl ObjectFile {
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
+                    false,
                 )?;
 
                 // Cycle guard for self-referential RVAs.
@@ -411,6 +414,7 @@ impl ObjectFile {
                     reloc_name,
                     ObjectLocation::Offset(static_offset_in_coff_data),
                     reloc_offset,
+                    false,
                 )?;
 
                 // Same cycle guard as the Constant arm above.
@@ -449,6 +453,7 @@ impl ObjectFile {
         name: RawString,
         location: ObjectLocation,
         offset: ObjectOffset,
+        relative: bool,
     ) -> anyhow::Result<()> {
         let (value, kind, section) = match location {
             ObjectLocation::Extern => (
@@ -481,14 +486,20 @@ impl ObjectFile {
             flags: object::SymbolFlags::None,
         });
 
+        let (kind, addend) = if relative {
+            (object::RelocationKind::Relative, -4)
+        } else {
+            (object::RelocationKind::Absolute, 0)
+        };
+
         self.object.add_relocation(
             offset.section_id,
             object::write::Relocation {
                 offset: offset.offset,
                 symbol,
-                addend: -4,
+                addend,
                 flags: object::RelocationFlags::Generic {
-                    kind: object::RelocationKind::Relative,
+                    kind,
                     encoding: object::RelocationEncoding::Generic,
                     size: 32,
                 },
@@ -526,7 +537,7 @@ enum Name<'a> {
 impl<'a> RelocKind<'a> {
     fn get_name(self, matcher: &SymbolMatcher) -> Name<'a> {
         match self {
-            Self::Function { overloads } => {
+            Self::Function { overloads, .. } => {
                 Name::Borrowed(matcher.pick(overloads, canonical_name(overloads)))
             }
             Self::ConstantString { symbol, data } => {

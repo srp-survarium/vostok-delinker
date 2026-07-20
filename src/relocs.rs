@@ -14,6 +14,7 @@ pub enum RelocKind<'a> {
     // .text
     Function {
         overloads: &'a [RawString<'static>],
+        relative: bool,
     },
 
     // .rdata
@@ -117,6 +118,7 @@ pub fn resolve_absolute_relocations<'s>(
                         reloc_rva,
                         RelocKind::Function {
                             overloads: function_overloads,
+                            relative: false,
                         },
                     );
                 }
