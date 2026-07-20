@@ -59,8 +59,8 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_section_manifest: Option<std::path::PathBuf>,
 
-    /// Reviewed function/target pairs whose data or function relocations use a
-    /// specific existing PDB owner symbol and addend.
+    /// Reviewed function/target/site selections whose data or function
+    /// relocations use a specific existing PDB owner symbol and addend.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub reloc_alias_manifest: Option<std::path::PathBuf>,
 
@@ -158,6 +158,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
     let reloc_alias_manifest =
         reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
+    reloc_alias_manifest.validate_site_membership(&pdb_symbols.functions)?;
     let relocs::ResolvedRelocations {
         coff_data,
         by_rva: relocs_rva,

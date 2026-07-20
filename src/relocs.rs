@@ -1,7 +1,7 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
 use crate::pdb_symbols;
-use crate::reloc_alias_manifest::RelocAliasManifest;
+use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::utils::ToUsize;
 
 use pdb2::RawString;
@@ -52,21 +52,21 @@ pub enum ManifestCoverage {
 pub struct ResolvedRelocations<'a> {
     pub coff_data: Vec<u8>,
     pub by_rva: BTreeMap<usize, RelocKind<'a>>,
-    pub observed_aliases: BTreeMap<(usize, usize), usize>,
+    pub observed_aliases: RelocAliasObservations,
 }
 
 fn resolve_manifest_alias(
     aliases: &RelocAliasManifest,
     symbols: &BTreeMap<usize, RawString<'static>>,
     functions: &BTreeMap<usize, Vec<RawString<'static>>>,
-    observed: &mut BTreeMap<(usize, usize), usize>,
+    observed: &mut RelocAliasObservations,
     reloc_rva: usize,
     target_rva: usize,
 ) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
     let Some((function_rva, _)) = functions.range(..=reloc_rva).next_back() else {
         return Ok(None);
     };
-    let Some(alias) = aliases.get(*function_rva, target_rva) else {
+    let Some(alias) = aliases.resolve(*function_rva, target_rva, reloc_rva, observed) else {
         return Ok(None);
     };
 
@@ -89,7 +89,6 @@ fn resolve_manifest_alias(
         anyhow::bail!("relocation alias owner/addend does not resolve to target");
     }
 
-    *observed.entry((*function_rva, target_rva)).or_default() += 1;
     Ok(Some((alias.addend, alias.owner)))
 }
 
@@ -122,7 +121,7 @@ pub fn resolve_absolute_relocations<'s>(
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
-    let mut observed_aliases = BTreeMap::<(usize, usize), usize>::new();
+    let mut observed_aliases = RelocAliasObservations::default();
 
     let mut pos = 0;
     let reloc_data = reloc_sec.data()?;
@@ -190,6 +189,7 @@ pub fn resolve_absolute_relocations<'s>(
                         reloc_aliases.resolve_function_alias(
                             *owner_function_rva,
                             target_rva,
+                            reloc_rva,
                             function_overloads,
                             &mut observed_aliases,
                         )?
