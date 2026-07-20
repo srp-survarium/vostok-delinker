@@ -1,6 +1,6 @@
-use pdb2::{FallibleIterator, RawString};
+use pdb2::{FallibleIterator, RawString, TypeData, TypeIndex};
 
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{BTreeMap, HashMap, btree_map};
 
 use crate::Env;
 use crate::utils::{ToUsize, leak};
@@ -11,8 +11,30 @@ pub struct PdbSymbols {
     pub imports: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
-    pub constants: BTreeMap<usize, RawString<'static>>,
-    pub statics: BTreeMap<usize, RawString<'static>>,
+    pub constants: BTreeMap<usize, PdbDataSymbol>,
+    pub statics: BTreeMap<usize, PdbDataSymbol>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PdbDataSymbol {
+    pub name: RawString<'static>,
+    size: Option<usize>,
+}
+
+impl PdbDataSymbol {
+    pub fn new(name: RawString<'static>, size: Option<usize>) -> Self {
+        Self { name, size }
+    }
+
+    pub fn contains(self, symbol_rva: usize, target_rva: usize) -> bool {
+        target_rva >= symbol_rva && self.size.is_none_or(|size| target_rva - symbol_rva < size)
+    }
+
+    fn fill_size_from(&mut self, other: Self) {
+        if self.size.is_none() {
+            self.size = other.size;
+        }
+    }
 }
 
 impl PdbSymbols {
@@ -21,14 +43,19 @@ impl PdbSymbols {
         S: pdb2::Source<'static> + 'static,
     {
         let mut this = Self::default();
+        let mut type_sizes = TypeSizeResolver::parse(pdb);
 
-        this.iterate_symbol_table(env)?;
-        this.iterate_modules(env, pdb)?;
+        this.iterate_symbol_table(env, &mut type_sizes)?;
+        this.iterate_modules(env, pdb, &mut type_sizes)?;
 
         Ok(this)
     }
 
-    fn iterate_symbol_table(&mut self, env: &Env) -> anyhow::Result<()> {
+    fn iterate_symbol_table(
+        &mut self,
+        env: &Env,
+        type_sizes: &mut TypeSizeResolver,
+    ) -> anyhow::Result<()> {
         // Data symbols partially repeat Public symbols, but they also have unique symbols.
         //
         // Whenever available we would prefer Public symbols, since those are mangled and contain
@@ -104,26 +131,36 @@ impl PdbSymbols {
                     // @TODO: There can be multiple symbols for the same constant name.
                     // While it makes sense to keep all of them and find closest,
                     // for now we simply keep one.
-                    let _old_symbol = self.constants.insert(symbol_rva, name);
+                    let _old_symbol = self
+                        .constants
+                        .insert(symbol_rva, PdbDataSymbol::new(name, None));
                 }
 
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
                     if offset.section == env.data.id =>
                 {
-                    let old_symbol = self.statics.insert(symbol_rva, name);
+                    let old_symbol = self
+                        .statics
+                        .insert(symbol_rva, PdbDataSymbol::new(name, None));
                     assert_eq!(old_symbol, None, "Static symbols cannot repeat");
                 }
 
                 // Unmangled data symbols to cover missing spots.
-                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                pdb2::SymbolData::Data(pdb2::DataSymbol { type_index, .. })
                     if offset.section == env.rdata.id =>
                 {
-                    constant_data_symbols.push((symbol_rva, name));
+                    constant_data_symbols.push((
+                        symbol_rva,
+                        PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
+                    ));
                 }
-                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                pdb2::SymbolData::Data(pdb2::DataSymbol { type_index, .. })
                     if offset.section == env.data.id =>
                 {
-                    static_data_symbols.push((symbol_rva, name));
+                    static_data_symbols.push((
+                        symbol_rva,
+                        PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
+                    ));
                 }
                 _ => {}
             }
@@ -131,17 +168,17 @@ impl PdbSymbols {
         for (symbol_rva, name) in import_data_symbols {
             self.imports.entry(symbol_rva).or_insert(name);
         }
-        for (symbol_rva, name) in static_data_symbols {
+        for (symbol_rva, symbol) in static_data_symbols {
             match self.statics.entry(symbol_rva) {
-                btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
-                btree_map::Entry::Occupied(_) => (),
+                btree_map::Entry::Vacant(entry) => _ = entry.insert(symbol),
+                btree_map::Entry::Occupied(mut entry) => entry.get_mut().fill_size_from(symbol),
             }
         }
 
-        for (symbol_rva, name) in constant_data_symbols {
+        for (symbol_rva, symbol) in constant_data_symbols {
             match self.constants.entry(symbol_rva) {
-                btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
-                btree_map::Entry::Occupied(_) => (),
+                btree_map::Entry::Vacant(entry) => _ = entry.insert(symbol),
+                btree_map::Entry::Occupied(mut entry) => entry.get_mut().fill_size_from(symbol),
             }
         }
 
@@ -153,6 +190,7 @@ impl PdbSymbols {
 
         env: &Env,
         pdb: &mut pdb2::PDB<'static, S>,
+        type_sizes: &mut TypeSizeResolver,
     ) -> anyhow::Result<()>
     where
         S: pdb2::Source<'static> + 'static,
@@ -176,7 +214,12 @@ impl PdbSymbols {
                         self.add_function_symbol(env, name, offset)
                     }
 
-                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
+                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol {
+                        offset,
+                        name,
+                        type_index,
+                        ..
+                    })) => {
                         if let Some(symbol_rva) = env.iat_rva(offset) {
                             self.imports.entry(symbol_rva).or_insert(name);
                             continue;
@@ -193,13 +236,19 @@ impl PdbSymbols {
 
                         match () {
                             () if offset.section == env.rdata.id => {
-                                let _old_symbol = self.constants.insert(symbol_rva, name);
+                                let _old_symbol = self.constants.insert(
+                                    symbol_rva,
+                                    PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
+                                );
                             }
                             () if offset.section == env.data.id => {
                                 // Prefer symbol names from modules.
                                 // As those are closer to the original symbols.
                                 // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
-                                let _old_symbol = self.statics.insert(symbol_rva, name);
+                                let _old_symbol = self.statics.insert(
+                                    symbol_rva,
+                                    PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
+                                );
                             }
                             _ => continue,
                         };
@@ -242,6 +291,139 @@ impl PdbSymbols {
     }
 }
 
+struct TypeSizeResolver {
+    finder: Option<pdb2::TypeFinder<'static>>,
+    cache: HashMap<TypeIndex, Option<usize>>,
+}
+
+impl TypeSizeResolver {
+    fn parse<S>(pdb: &mut pdb2::PDB<'static, S>) -> Self
+    where
+        S: pdb2::Source<'static> + 'static,
+    {
+        let Ok(type_information) = pdb.type_information() else {
+            return Self {
+                finder: None,
+                cache: HashMap::new(),
+            };
+        };
+        let type_information = leak(type_information);
+        let mut finder = type_information.finder();
+        let mut iter = type_information.iter();
+        loop {
+            match iter.next() {
+                Ok(Some(_)) => finder.update(&iter),
+                Ok(None) => break,
+                Err(_) => {
+                    return Self {
+                        finder: None,
+                        cache: HashMap::new(),
+                    };
+                }
+            }
+        }
+
+        Self {
+            finder: Some(finder),
+            cache: HashMap::new(),
+        }
+    }
+
+    fn size_of(&mut self, index: TypeIndex) -> Option<usize> {
+        if let Some(size) = self.cache.get(&index) {
+            return *size;
+        }
+
+        let Some(finder) = &self.finder else {
+            return None;
+        };
+
+        self.cache.insert(index, None);
+        let size = match finder.find(index).and_then(|typ| typ.parse()) {
+            Ok(TypeData::Primitive(typ)) => primitive_size(typ.kind, typ.indirection),
+            Ok(TypeData::Pointer(typ)) => {
+                let size = typ.attributes.size();
+                (size != 0).then_some(usize::from(size))
+            }
+            Ok(TypeData::Modifier(typ)) => self.size_of(typ.underlying_type),
+            Ok(TypeData::Array(typ)) => typ
+                .dimensions
+                .last()
+                .copied()
+                .map(|size| size.to_usize())
+                .filter(|&size| size != 0),
+            Ok(TypeData::Class(typ)) => usize::try_from(typ.size).ok().filter(|&size| size != 0),
+            Ok(TypeData::Union(typ)) => usize::try_from(typ.size).ok().filter(|&size| size != 0),
+            Ok(TypeData::Enumeration(typ)) => self.size_of(typ.underlying_type),
+            _ => None,
+        };
+        self.cache.insert(index, size);
+        size
+    }
+}
+
+fn primitive_size(
+    kind: pdb2::PrimitiveKind,
+    indirection: Option<pdb2::Indirection>,
+) -> Option<usize> {
+    if let Some(indirection) = indirection {
+        return match indirection {
+            pdb2::Indirection::Near16 => Some(2),
+            pdb2::Indirection::Far16 | pdb2::Indirection::Huge16 => Some(4),
+            pdb2::Indirection::Near32 => Some(4),
+            pdb2::Indirection::Far32 => Some(6),
+            pdb2::Indirection::Near64 => Some(8),
+            pdb2::Indirection::Near128 => Some(16),
+        };
+    }
+
+    match kind {
+        pdb2::PrimitiveKind::NoType | pdb2::PrimitiveKind::Void => None,
+        pdb2::PrimitiveKind::Char
+        | pdb2::PrimitiveKind::UChar
+        | pdb2::PrimitiveKind::RChar
+        | pdb2::PrimitiveKind::Char8
+        | pdb2::PrimitiveKind::I8
+        | pdb2::PrimitiveKind::U8
+        | pdb2::PrimitiveKind::Bool8 => Some(1),
+        pdb2::PrimitiveKind::WChar
+        | pdb2::PrimitiveKind::RChar16
+        | pdb2::PrimitiveKind::Short
+        | pdb2::PrimitiveKind::UShort
+        | pdb2::PrimitiveKind::I16
+        | pdb2::PrimitiveKind::U16
+        | pdb2::PrimitiveKind::F16
+        | pdb2::PrimitiveKind::Bool16 => Some(2),
+        pdb2::PrimitiveKind::RChar32
+        | pdb2::PrimitiveKind::Long
+        | pdb2::PrimitiveKind::ULong
+        | pdb2::PrimitiveKind::I32
+        | pdb2::PrimitiveKind::U32
+        | pdb2::PrimitiveKind::F32
+        | pdb2::PrimitiveKind::F32PP
+        | pdb2::PrimitiveKind::Bool32
+        | pdb2::PrimitiveKind::HRESULT => Some(4),
+        pdb2::PrimitiveKind::Quad
+        | pdb2::PrimitiveKind::UQuad
+        | pdb2::PrimitiveKind::I64
+        | pdb2::PrimitiveKind::U64
+        | pdb2::PrimitiveKind::F64
+        | pdb2::PrimitiveKind::Complex32
+        | pdb2::PrimitiveKind::Bool64 => Some(8),
+        pdb2::PrimitiveKind::F48 => Some(6),
+        pdb2::PrimitiveKind::F80 => Some(10),
+        pdb2::PrimitiveKind::Octa
+        | pdb2::PrimitiveKind::UOcta
+        | pdb2::PrimitiveKind::I128
+        | pdb2::PrimitiveKind::U128
+        | pdb2::PrimitiveKind::F128
+        | pdb2::PrimitiveKind::Complex64 => Some(16),
+        pdb2::PrimitiveKind::Complex80 => Some(20),
+        pdb2::PrimitiveKind::Complex128 => Some(32),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +439,51 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_eq!(names[0].as_bytes(), b"real_a");
         assert_eq!(names[1].as_bytes(), b"real_b");
+    }
+
+    #[test]
+    fn known_data_size_rejects_the_end_boundary() {
+        let symbol = PdbDataSymbol::new(RawString::from(&b"table"[..]), Some(8));
+        assert!(symbol.contains(0x1000, 0x1000));
+        assert!(symbol.contains(0x1000, 0x1007));
+        assert!(!symbol.contains(0x1000, 0x0fff));
+        assert!(!symbol.contains(0x1000, 0x1008));
+    }
+
+    #[test]
+    fn unknown_data_size_does_not_restrict_the_fallback() {
+        let symbol = PdbDataSymbol::new(RawString::from(&b"table"[..]), None);
+        assert!(symbol.contains(0x1000, 0x1000));
+        assert!(symbol.contains(0x1000, 0x2000));
+    }
+
+    #[test]
+    fn data_record_adds_size_without_replacing_public_name() {
+        let mut public = PdbDataSymbol::new(RawString::from(&b"?table@@3PAHA"[..]), None);
+        let data = PdbDataSymbol::new(RawString::from(&b"table"[..]), Some(16));
+        public.fill_size_from(data);
+        assert_eq!(public.name.as_bytes(), b"?table@@3PAHA");
+        assert!(public.contains(0x1000, 0x100f));
+        assert!(!public.contains(0x1000, 0x1010));
+    }
+
+    #[test]
+    fn codeview_complex_sizes_cover_both_components() {
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex32, None),
+            Some(8)
+        );
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex64, None),
+            Some(16)
+        );
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex80, None),
+            Some(20)
+        );
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex128, None),
+            Some(32)
+        );
     }
 }

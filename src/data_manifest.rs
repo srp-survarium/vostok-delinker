@@ -250,11 +250,13 @@ impl DataManifest {
             }
 
             let symbol_name = match storage {
-                DataStorage::Data | DataStorage::Bss => symbols.statics.get(&rva).copied(),
+                DataStorage::Data | DataStorage::Bss => {
+                    symbols.statics.get(&rva).map(|symbol| symbol.name)
+                }
                 DataStorage::Rdata => symbols
                     .constants
                     .get(&rva)
-                    .copied()
+                    .map(|symbol| symbol.name)
                     .or_else(|| symbols.strings.get(&rva).map(|(name, _)| *name)),
             }
             .ok_or_else(|| {
@@ -361,11 +363,15 @@ mod tests {
             (0x180, &b"\x80raw"[..]),
             (0x300, &b"scratch"[..]),
         ] {
-            symbols.statics.insert(rva, RawString::from(name));
+            symbols.statics.insert(
+                rva,
+                crate::pdb_symbols::PdbDataSymbol::new(RawString::from(name), None),
+            );
         }
-        symbols
-            .constants
-            .insert(0x200, RawString::from(&b"constant"[..]));
+        symbols.constants.insert(
+            0x200,
+            crate::pdb_symbols::PdbDataSymbol::new(RawString::from(&b"constant"[..]), None),
+        );
         symbols
     }
 
