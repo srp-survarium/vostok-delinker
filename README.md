@@ -164,26 +164,33 @@ have these meanings:
 | `object` | Relative output object path, normalized by the same rules as the data manifest. |
 | `ordinal` | One-based position in the original COFF section table. |
 | `name` | Original one-to-eight-byte COFF section name. |
-| `rva` | Start RVA of an affine linked data range, or `-` when the section has no directly recoverable linked range. |
+| `rva` | Start RVA of an affine linked data range, or `-` when definitions must be copied independently into candidate offsets. |
 | `size` | Original section extent in bytes. |
 | `alignment` | Original non-zero, power-of-two section alignment. |
 | `characteristics` | Complete COFF section characteristics in decimal or `0x` hexadecimal notation. |
 | `comdat_selection` | COFF selection value: `0` none, `1` no duplicates, `2` any, `3` same size, `4` exact match, `5` associative, `6` largest, or `7` newest. |
 | `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section. |
-| `storage` | `data`, `rdata`, or `bss` for an affine linked range, otherwise `-`. Storage and RVA must either both be present or both be absent. |
+| `storage` | `data`, `rdata`, or `bss` for a data-bearing candidate section, otherwise `-`. An RVA requires storage, while storage may be present without an affine RVA. |
 
 The manifest owns section order, names, characteristics, alignment, linked data
 ranges, and COMDAT relationships. The PDB still owns symbol names. Data-manifest
 rows bind definitions to these sections by ordinal and offset; the section
 manifest never creates or renames a definition.
 
-This implementation materializes affine `.data`, `.rdata`, and `.bss` ranges
-and non-associative data COMDAT groups. It also preserves the order, names, and
-characteristics of other section rows as empty section records. Recovering
-non-affine contents and associative groups requires additional reviewed input.
+Vostok materializes affine `.data`, `.rdata`, and `.bss` ranges directly from
+the linked image. For a storage-assigned section without an affine RVA, it
+creates the complete candidate extent, places every reviewed data-manifest
+definition at its section offset, copies initialized payloads from each
+definition's independent retail RVA, and retains zero-filled gaps and `.bss`.
+Definition ranges in one candidate section may not overlap.
 
-Assigned data sections are checked before emission. RVA placement must satisfy
-the declared alignment; the numeric alignment must agree with the COFF
+The implementation also emits non-associative data COMDAT groups. It preserves
+the order, names, and characteristics of non-data rows as empty section records;
+recovering their contents and associative groups requires additional reviewed
+input.
+
+Assigned data sections are checked before emission. Affine RVA placement must
+satisfy the declared alignment; the numeric alignment must agree with the COFF
 characteristics; storage must agree with the section name and initialized,
 uninitialized, and writable flags; and COMDAT flags must agree with the
 selection value. Placed ranges cannot overlap unless two different objects

@@ -216,9 +216,9 @@ impl DataSectionManifest {
                     String::from_utf8_lossy(value)
                 ),
             };
-            if storage.is_some() != rva.is_some() {
+            if rva.is_some() && storage.is_none() {
                 anyhow::bail!(
-                    "{}:{}: data section storage and RVA must both be present or absent",
+                    "{}:{}: an assigned data section RVA requires a storage class",
                     path.display(),
                     line_number
                 );
@@ -449,6 +449,13 @@ mod tests {
     fn validates_contiguous_and_associative_ordinals() {
         assert!(parse("a.c\t2\t.data\t0x100\t4\t4\t0\t0\t-\tdata\n").is_err());
         assert!(parse("a.c\t1\t.debug$F\t-\t4\t1\t0\t5\t2\t-\n").is_err());
+    }
+
+    #[test]
+    fn permits_storage_assigned_sections_without_an_affine_retail_rva() {
+        let manifest = parse("a.c\t1\t.data\t-\t0x10\t8\t0xc0400040\t0\t-\tdata\n").unwrap();
+        assert_eq!(manifest.sections()[0].rva, None);
+        assert_eq!(manifest.sections()[0].storage, Some(SectionStorage::Data));
     }
 
     #[test]
