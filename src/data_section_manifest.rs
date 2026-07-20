@@ -100,9 +100,17 @@ pub struct DataSection {
     pub storage: Option<SectionStorage>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SectionTopology {
+    #[default]
+    Synthesized,
+    Exact,
+}
+
 #[derive(Default)]
 pub struct DataSectionManifest {
     sections: Vec<DataSection>,
+    topology: SectionTopology,
 }
 
 impl DataSectionManifest {
@@ -355,11 +363,18 @@ impl DataSectionManifest {
                 );
             }
         }
-        Ok(Self { sections })
+        Ok(Self {
+            sections,
+            topology: SectionTopology::Exact,
+        })
     }
 
     pub fn sections(&self) -> &[DataSection] {
         &self.sections
+    }
+
+    pub fn topology(&self) -> SectionTopology {
+        self.topology
     }
 }
 
@@ -443,6 +458,15 @@ mod tests {
             ComdatSelection::Any
         );
         assert_eq!(manifest.sections()[1].storage, Some(SectionStorage::Data));
+    }
+
+    #[test]
+    fn supplied_manifest_selects_exact_topology_without_rows() {
+        assert_eq!(
+            DataSectionManifest::default().topology(),
+            SectionTopology::Synthesized
+        );
+        assert_eq!(parse("").unwrap().topology(), SectionTopology::Exact);
     }
 
     #[test]
