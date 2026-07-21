@@ -57,6 +57,18 @@ pub struct Cli {
     /// resolve to a definition in `--data-manifest`.
     #[arg(long, requires = "data_manifest")]
     pub strict: bool,
+
+    /// Rediscover absolute relocation sites from the PDB by scanning the image for
+    /// fields that hold a known symbol address. For images whose `.reloc`
+    /// directory is missing or incomplete. Best-effort — may introduce a few false
+    /// relocations; superseded by a reviewed reloc manifest.
+    #[arg(long)]
+    pub rediscover_relocations_from_pdb: bool,
+
+    /// When rediscovering, accept a target within this many bytes after a known
+    /// symbol start (to catch interior pointers). 0 = exact symbol starts only.
+    #[arg(long, default_value_t = 32)]
+    pub rediscovery_interior_bound: usize,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -87,6 +99,8 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map,
         data_manifest,
         strict,
+        rediscover_relocations_from_pdb,
+        rediscovery_interior_bound,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -117,6 +131,8 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
         manifest_coverage,
+        rediscover_relocations_from_pdb,
+        rediscovery_interior_bound,
     )?;
 
     Ok(())
@@ -132,6 +148,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
     manifest_coverage: relocs::ManifestCoverage,
+    rediscover_relocations_from_pdb: bool,
+    rediscovery_interior_bound: usize,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
@@ -143,6 +161,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &pdb_symbols,
         &data_manifest,
         manifest_coverage,
+        rediscover_relocations_from_pdb,
+        rediscovery_interior_bound,
     )?;
 
     // Base side reconciles its folded names against the target's recorded

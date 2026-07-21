@@ -75,52 +75,19 @@ pub fn resolve_absolute_relocations<'s>(
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
     manifest_coverage: ManifestCoverage,
+    rediscover_from_pdb: bool,
+    rediscovery_interior_bound: usize,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
-    let Some(reloc_sec) = exe.section_by_name(".reloc") else {
-        anyhow::bail!("Missing .reloc section");
-    };
-
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
 
-    let mut pos = 0;
-    let reloc_data = reloc_sec.data()?;
-    while pos + HEADER_SIZE <= reloc_data.len() {
-        let RelocHeader {
-            page_rva,
-            block_size,
-        } = bytemuck::pod_read_unaligned::<RelocHeader>(&reloc_data[pos..pos + HEADER_SIZE]);
-
-        if block_size == 0 || block_size < 8 {
-            break;
-        }
-
-        let entries: &[RelocEntry] =
-            bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..pos + block_size.to_usize()]);
-        pos += block_size.to_usize();
-
-        for RelocEntry { entry } in entries {
-            let reloc_type = entry >> 12;
-            let reloc_offset = entry & 0x0FFF;
-
-            const RELOC_TYP_HIGHLOW: u16 = 3;
-
-            if reloc_type != RELOC_TYP_HIGHLOW {
-                continue;
-            }
-
-            // .reloc        .text/.rdata/.data  .text/.rdata/.data
-            // [reloc_rva]   [target_va]         [target]
-            //   |              ^    |              ^
-            //   |              |    |              |
-            //   +--------------+    +--------------+
-            //
-            // * `target_va` replaced with offset of the closest named symbol
-            //
-            let reloc_rva = (page_rva + u32::from(reloc_offset)).to_usize();
-
-            resolve_absolute_site(
+    // A stripped image has no base-relocation directory. Tolerate that only with a
+    // recovery method, else we'd silently drop real relocations.
+    match (exe.section_by_name(".reloc"), rediscover_from_pdb) {
+        (Some(section), false) => {
+            resolve_reloc_directory(
+                section.data()?,
                 env,
                 symbols,
                 data_manifest,
@@ -128,19 +95,141 @@ pub fn resolve_absolute_relocations<'s>(
                 &exe_data,
                 &mut coff_data,
                 &mut relocs_rva,
-                reloc_rva,
             )?;
         }
-    }
+        (None, true) => {
+            rediscover_absolute_sites_from_pdb(
+                env,
+                symbols,
+                data_manifest,
+                manifest_coverage,
+                &exe_data,
+                &mut coff_data,
+                &mut relocs_rva,
+                rediscovery_interior_bound,
+            )?;
+        }
+
+        (Some(_), true) => anyhow::bail!(
+            "image already has a `.reloc` base-relocation directory; \
+             --rediscover-relocations-from-pdb is only for images without one"
+        ),
+        (None, false) => anyhow::bail!(
+            "image has no `.reloc` base-relocation directory; pass \
+             --rediscover-relocations-from-pdb to recover absolute relocations \
+             from the PDB"
+        ),
+    };
 
     Ok((coff_data, relocs_rva))
 }
 
-/// Resolve one absolute relocation site: a 4-byte field at `reloc_rva` holding a
-/// linked target VA. Classify the target against the PDB symbols and the data
-/// manifest, rewrite the field in `coff_data` to the in-object addend, and record
-/// the `RelocKind`. This is the per-site body shared by every site source (the
-/// `.reloc` directory today; PDB rediscovery and the reloc manifest later).
+/// Resolve every HIGHLOW site in the PE base-relocation directory (`.reloc`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_reloc_directory<'s>(
+    reloc_data: &[u8],
+    env: &Env,
+    symbols: &'s pdb_symbols::PdbSymbols,
+    data_manifest: &DataManifest,
+    manifest_coverage: ManifestCoverage,
+    exe_data: &[u8],
+    coff_data: &mut [u8],
+    relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+) -> anyhow::Result<()> {
+    let mut pos = 0;
+    while pos + HEADER_SIZE <= reloc_data.len() {
+        let RelocHeader {
+            page_rva,
+            block_size,
+        } = bytemuck::pod_read_unaligned::<RelocHeader>(&reloc_data[pos..pos + HEADER_SIZE]);
+        if block_size == 0 || block_size < 8 {
+            break;
+        }
+        let entries: &[RelocEntry] =
+            bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..pos + block_size.to_usize()]);
+        pos += block_size.to_usize();
+
+        for RelocEntry { entry } in entries {
+            const RELOC_TYP_HIGHLOW: u16 = 3;
+            if entry >> 12 != RELOC_TYP_HIGHLOW {
+                continue;
+            }
+            let reloc_rva = (page_rva + u32::from(entry & 0x0FFF)).to_usize();
+            resolve_absolute_site(
+                env,
+                symbols,
+                data_manifest,
+                manifest_coverage,
+                exe_data,
+                coff_data,
+                relocs_rva,
+                reloc_rva,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Rediscover absolute relocation sites for an image with no (or a partial)
+/// `.reloc` directory: scan `.text`/`.rdata`/`.data` for fields holding a known
+/// PDB symbol VA and resolve each fresh one. Best-effort; `.reloc` sites are kept.
+#[allow(clippy::too_many_arguments)]
+fn rediscover_absolute_sites_from_pdb<'s>(
+    env: &Env,
+    symbols: &'s pdb_symbols::PdbSymbols,
+    data_manifest: &DataManifest,
+    manifest_coverage: ManifestCoverage,
+    exe_data: &[u8],
+    coff_data: &mut [u8],
+    relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    interior_bound: usize,
+) -> anyhow::Result<()> {
+    let image_base = env.image_base.to_usize();
+    let mut starts: Vec<usize> = symbols
+        .functions
+        .keys()
+        .chain(symbols.statics.keys())
+        .chain(symbols.constants.keys())
+        .chain(symbols.strings.keys())
+        .copied()
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+
+    for (start, size) in [
+        (env.text.rva, env.text.size),
+        (env.rdata.rva, env.rdata.size),
+        (env.data.rva, env.data.size),
+    ] {
+        let end = (start + size).min(exe_data.len());
+        let mut site = start;
+        while site + 4 <= end {
+            let value = u32::from_le_bytes(exe_data[site..site + 4].try_into().unwrap()) as usize;
+            if value >= image_base
+                && rediscovered_target_is_known(&starts, value - image_base, interior_bound)
+                && !relocs_rva.contains_key(&site)
+            {
+                resolve_absolute_site(
+                    env,
+                    symbols,
+                    data_manifest,
+                    manifest_coverage,
+                    exe_data,
+                    coff_data,
+                    relocs_rva,
+                    site,
+                )?;
+            }
+            site += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolve one absolute relocation site (a field at `reloc_rva` holding a target
+/// VA): classify the target, rewrite the field to its in-object addend, and record
+/// the `RelocKind`. Shared by every site source (`.reloc`, PDB rediscovery, ...).
 fn resolve_absolute_site<'s>(
     env: &Env,
     symbols: &'s pdb_symbols::PdbSymbols,
@@ -287,6 +376,21 @@ fn resolve_absolute_site<'s>(
     Ok(())
 }
 
+/// Trust a rediscovered target when it is a known symbol start, or within
+/// `interior_bound` bytes after one (an interior pointer). `starts` is sorted.
+fn rediscovered_target_is_known(
+    starts: &[usize],
+    target_rva: usize,
+    interior_bound: usize,
+) -> bool {
+    match starts.binary_search(&target_rva) {
+        Ok(_) => true,
+        Err(index) => {
+            interior_bound > 0 && index > 0 && target_rva - starts[index - 1] < interior_bound
+        }
+    }
+}
+
 fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
     let image_base = exe
         .nt_headers()
@@ -309,4 +413,26 @@ fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
         }
     }
     mapped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rediscovered_target_is_known;
+
+    #[test]
+    fn rediscovered_target_matches_starts_and_interior() {
+        let starts = [0x1000usize, 0x2000, 0x2040];
+        // Exact symbol starts always match.
+        assert!(rediscovered_target_is_known(&starts, 0x1000, 0));
+        assert!(rediscovered_target_is_known(&starts, 0x2040, 0));
+        // With bound 0, interior addresses are rejected.
+        assert!(!rediscovered_target_is_known(&starts, 0x1004, 0));
+        // Within `interior_bound` bytes after a start (half-open) is accepted.
+        assert!(rediscovered_target_is_known(&starts, 0x1004, 0x20));
+        assert!(!rediscovered_target_is_known(&starts, 0x1020, 0x20));
+        assert!(rediscovered_target_is_known(&starts, 0x2038, 0x100));
+        // Below the first start, and far past the last beyond the bound, never match.
+        assert!(!rediscovered_target_is_known(&starts, 0x0800, 0x1000));
+        assert!(!rediscovered_target_is_known(&starts, 0x3000, 0x40));
+    }
 }
