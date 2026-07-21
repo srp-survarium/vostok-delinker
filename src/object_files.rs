@@ -89,13 +89,7 @@ impl ObjectFiles<'_> {
             this.objects
                 .get_mut(definition.object)
                 .unwrap()
-                .add_data_relocations(
-                    *definition,
-                    matcher,
-                    coff_data,
-                    &relocs_rva,
-                    data_manifest,
-                )?;
+                .add_data_relocations(*definition, matcher, coff_data, &relocs_rva)?;
         }
 
         let mut modules = env.dbi.modules()?;
@@ -134,7 +128,7 @@ impl ObjectFiles<'_> {
                 };
 
                 let fun_rva = env.text.rva + fun_offset.offset.to_usize();
-                let fun_bytes = resolve_relative_relocations(
+                let fun_bytes = resolve_relative_text_relocations(
                     env,
                     fun_rva,
                     fun_size,
@@ -171,7 +165,6 @@ impl ObjectFiles<'_> {
                         coff_data,
                         &relocs_rva,
                         &mut visited,
-                        data_manifest,
                         TargetMaterialization::Materialize,
                     )?;
                 }
@@ -299,6 +292,25 @@ fn get_function_location(
     Ok(Some(location))
 }
 
+/// A relative branch site is classified from scratch every time its function is
+/// visited, so re-inserting one must yield the identical `Function` relocation —
+/// the same overload slice. Anything else means two different callees were mapped
+/// onto one site, i.e. a classification bug, so this asserts rather than returns.
+fn assert_reinserted_branch_is_identical(previous: RelocKind, overloads: &[RawString<'static>]) {
+    let RelocKind::Function {
+        overloads: previous_overloads,
+        ..
+    } = previous
+    else {
+        unreachable!("a relative branch site can only hold a Function relocation");
+    };
+    assert_eq!(
+        overloads.as_ptr(),
+        previous_overloads.as_ptr(),
+        "a relative branch site was reclassified to a different function",
+    );
+}
+
 /// Resolve external relative jumps in the function as relocations.
 ///
 /// And return the final resolved function assembly.
@@ -307,7 +319,7 @@ fn get_function_location(
 // the function is processed.
 //
 // At the same time `relocs_rva` sorts automatically!
-fn resolve_relative_relocations<'s>(
+fn resolve_relative_text_relocations<'s>(
     env: &Env,
 
     fun_rva: usize,
@@ -375,14 +387,7 @@ fn resolve_relative_relocations<'s>(
         );
 
         if let Some(old_reloc) = old_reloc {
-            let RelocKind::Function {
-                overloads: old_overloads,
-                ..
-            } = old_reloc
-            else {
-                unreachable!();
-            };
-            assert_eq!(overloads.as_ptr(), old_overloads.as_ptr());
+            assert_reinserted_branch_is_identical(old_reloc, overloads);
         }
     }
 
@@ -400,42 +405,14 @@ impl ObjectFile {
         relocs_rva: &BTreeMap<usize, RelocKind>,
         // Target RVAs already expanded on this pointer chain (cycle guard).
         visited: &mut HashSet<usize>,
-        data_manifest: &DataManifest,
         target_materialization: TargetMaterialization,
     ) -> anyhow::Result<()> {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
 
-        let target_is_manifest_definition = match reloc_kind {
-            RelocKind::Constant { target_rva, .. } | RelocKind::Static { target_rva, .. } => {
-                data_manifest.owner_and_addend_for_rva(target_rva).is_some()
-            }
-            RelocKind::Function { .. } | RelocKind::ConstantString { .. } => false,
-        };
-        if target_materialization == TargetMaterialization::ReferenceOnly
-            || target_is_manifest_definition
-        {
-            let encoding = match reloc_kind {
-                RelocKind::Function { encoding, .. } => encoding,
-                RelocKind::ConstantString { .. }
-                | RelocKind::Constant { .. }
-                | RelocKind::Static { .. } => RelocationEncoding::Absolute,
-            };
-            let symbol_reuse = if target_is_manifest_definition {
-                SymbolReuse::ReuseIfDefined
-            } else {
-                SymbolReuse::AlwaysCreate
-            };
-            self.add_relocation(
-                reloc_name,
-                ObjectLocation::Extern,
-                reloc_offset,
-                encoding,
-                symbol_reuse,
-            )?;
-            return Ok(());
-        }
-
+        // `Function` and `ReviewedData` reference a real definition elsewhere; a
+        // `Conjured*` target is materialized as a private per-TU copy, unless the
+        // caller only wants a reference.
         match reloc_kind {
             RelocKind::Function {
                 overloads: _,
@@ -450,7 +427,35 @@ impl ObjectFile {
                 )?;
             }
 
-            RelocKind::ConstantString { symbol: _, data } => {
+            RelocKind::ReviewedData { .. } => {
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern,
+                    reloc_offset,
+                    RelocationEncoding::Absolute,
+                    SymbolReuse::ReuseIfDefined,
+                )?;
+            }
+
+            RelocKind::ConjuredString { .. }
+            | RelocKind::ConjuredConstant { .. }
+            | RelocKind::ConjuredStatic { .. }
+                if target_materialization == TargetMaterialization::ReferenceOnly =>
+            {
+                // All `.rdata`/`.data` conjured data referenced from inside a
+                // reviewed definition is considered external: emit an undefined
+                // reference, never a local copy. Nothing here owns it, so it
+                // resolves by name and dangles until the target is itself reviewed.
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern,
+                    reloc_offset,
+                    RelocationEncoding::Absolute,
+                    SymbolReuse::AlwaysCreate,
+                )?;
+            }
+
+            RelocKind::ConjuredString { symbol: _, data } => {
                 let const_offset_in_coff_rdata =
                     self.append_section_data(self.rdata_section_id, data, 0x00);
 
@@ -463,7 +468,7 @@ impl ObjectFile {
                 )?;
             }
 
-            RelocKind::Constant {
+            RelocKind::ConjuredConstant {
                 symbol: _,
                 target_rva,
             } => {
@@ -489,14 +494,13 @@ impl ObjectFile {
                             coff_data,
                             relocs_rva,
                             visited,
-                            data_manifest,
                             TargetMaterialization::Materialize,
                         )?;
                     }
                 }
             }
 
-            RelocKind::Static {
+            RelocKind::ConjuredStatic {
                 symbol: _,
                 target_rva,
             } => {
@@ -512,7 +516,7 @@ impl ObjectFile {
                     SymbolReuse::AlwaysCreate,
                 )?;
 
-                // Same cycle guard as the Constant arm above.
+                // Same cycle guard as the ConjuredConstant arm above.
                 if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
                     if visited.insert(target_rva) {
                         self.add_relocation_at(
@@ -522,7 +526,6 @@ impl ObjectFile {
                             coff_data,
                             relocs_rva,
                             visited,
-                            data_manifest,
                             TargetMaterialization::Materialize,
                         )?;
                     }
@@ -601,7 +604,6 @@ impl ObjectFile {
         matcher: &SymbolMatcher,
         coff_data: &[u8],
         relocs_rva: &BTreeMap<usize, RelocKind>,
-        data_manifest: &DataManifest,
     ) -> anyhow::Result<()> {
         let definition_end = definition.rva.checked_add(definition.size).unwrap();
         let symbol_id = self
@@ -629,7 +631,6 @@ impl ObjectFile {
                 coff_data,
                 relocs_rva,
                 &mut visited,
-                data_manifest,
                 TargetMaterialization::ReferenceOnly,
             )?;
         }
@@ -756,18 +757,19 @@ impl<'a> RelocKind<'a> {
             Self::Function { overloads, .. } => {
                 Name::Borrowed(matcher.pick(overloads, canonical_name(overloads)))
             }
-            Self::ConstantString { symbol, data } => {
+            Self::ConjuredString { symbol, data } => {
                 let reloc_name = get_constant_name(symbol, data);
                 Name::Owned(reloc_name)
             }
-            Self::Constant {
-                symbol: reloc_name,
+            Self::ReviewedData { symbol } => Name::Borrowed(symbol),
+            Self::ConjuredConstant {
+                symbol,
                 target_rva: _,
-            } => Name::Borrowed(reloc_name),
-            Self::Static {
-                symbol: reloc_name,
+            } => Name::Borrowed(symbol),
+            Self::ConjuredStatic {
+                symbol,
                 target_rva: _,
-            } => Name::Borrowed(reloc_name),
+            } => Name::Borrowed(symbol),
         }
     }
 }
