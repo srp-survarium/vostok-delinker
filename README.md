@@ -221,16 +221,15 @@ have these meanings:
 | `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section. |
 | `storage` | `data`, `rdata`, or `bss` for an affine linked range, otherwise `-`. Storage and RVA must either both be present or both be absent. |
 
-The manifest owns section order, names, characteristics, alignment, and linked
-data ranges. The PDB still owns symbol names. Data-manifest rows bind definitions
-to these sections by ordinal and offset; the section manifest never creates or
-renames a definition.
+The manifest owns section order, names, characteristics, alignment, linked data
+ranges, and COMDAT relationships. The PDB still owns symbol names. Data-manifest
+rows bind definitions to these sections by ordinal and offset; the section
+manifest never creates or renames a definition.
 
-This implementation materializes affine `.data`, `.rdata`, and `.bss` ranges and
-preserves the order, names, and characteristics of other section rows as empty
-section records. A section that requests a COMDAT selection is rejected for now;
-COMDAT group emission, non-affine contents, and associative groups require
-additional work.
+This implementation materializes affine `.data`, `.rdata`, and `.bss` ranges
+and non-associative data COMDAT groups. It also preserves the order, names, and
+characteristics of other section rows as empty section records. Recovering
+non-affine contents and associative groups requires additional reviewed input.
 
 ### What the manifest improves
 
@@ -257,4 +256,4 @@ in the owner object and matched the definition at `100.0%`.
 
 The data manifest restores reviewed definitions and their position within each
 emitted storage section. The data section manifest separately restores reviewed
-same-name sections; COMDAT grouping is emitted by a follow-up.
+same-name sections and COMDAT topology.
