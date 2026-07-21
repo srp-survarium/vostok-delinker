@@ -93,12 +93,8 @@ precision (about 1-2% of the emitted relocations are false). A project past
 bootstrapping supplies an exact, reviewed relocation list instead of relying on
 the scan.
 
-A relocation the scan misses stays a raw absolute address in the emitted object,
-with no COFF relocation record for it. objdiff masks relocation fields, but since
-this field has none, the literal linked address shows through and mismatches the
-base object (which relocates that field against a symbol). So a miss costs the
-affected field's match, not the whole object, and it always surfaces as an
-absolute address in the diff.
+A relocation the scan misses surfaces in objdiff as a raw absolute address; see
+[docs/reloc-rediscovery.md](docs/reloc-rediscovery.md).
 
 ## Data manifest
 
