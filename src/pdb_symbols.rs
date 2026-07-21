@@ -148,14 +148,11 @@ impl PdbSymbols {
             while let Some(symbol) = iter.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
-                        name,
-                        offset,
-                        len,
-                        ..
-                    })) => self.add_function_symbol(env, name, offset, len),
-                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
-                        name, offset, len, ..
-                    })) => self.add_function_symbol(env, name, offset, u32::from(len)),
+                        name, offset, ..
+                    })) => self.add_function_symbol(env, name, offset),
+                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol { name, offset, .. })) => {
+                        self.add_function_symbol(env, name, offset)
+                    }
 
                     Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
                         let symbol_rva = match () {
@@ -200,34 +197,11 @@ impl PdbSymbols {
 
         name: RawString<'static>,
         offset: pdb2::PdbInternalSectionOffset,
-        size: u32,
     ) {
         let symbol_rva = env.text.rva + offset.offset.to_usize();
 
-        let fun_offset_in_text = offset.offset.to_usize();
-        let fun_body = &env.text.data[fun_offset_in_text..fun_offset_in_text + size.to_usize()];
-
-        #[rustfmt::skip]
-        const COMMON_FUNCTION_RENAMES: &[(&[u8], &[u8])] = &[
-            (b"empty_stub", &[0xC3]),
-            (b"identity",   &[0x8B, 0x44, 0x24, 0x04, 0xC3]),
-            (b"vec_begin",  &[0x8B, 0x0, 0xC3]),
-            (b"vec_size",   &[0x8B, 0x41, 0x04, 0x2B, 0x01, 0xC1, 0xF8, 0x02, 0xC3]),
-        ];
-
-        let fun_rename = COMMON_FUNCTION_RENAMES
-            .iter()
-            .find(|(_, code)| *code == fun_body)
-            .map(|(name, _)| (*name).into());
-
-        match self.functions.entry(symbol_rva) {
-            btree_map::Entry::Vacant(entry) => {
-                entry.insert(vec![fun_rename.unwrap_or(name)]);
-            }
-            btree_map::Entry::Occupied(mut entry) => match fun_rename {
-                Some(fun_rename) => *entry.get_mut() = vec![fun_rename],
-                None => (),
-            },
-        }
+        self.functions
+            .entry(symbol_rva)
+            .or_insert_with(|| vec![name]);
     }
 }
