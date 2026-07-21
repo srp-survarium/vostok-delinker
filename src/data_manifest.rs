@@ -11,7 +11,8 @@ use pdb2::RawString;
 use std::collections::HashSet;
 use std::path::Path;
 
-const HEADER: &[u8] = b"object\trva\tsize\tstorage\talignment\tsection_offset\tscope";
+const HEADER: &[u8] =
+    b"object\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope";
 
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
@@ -20,6 +21,7 @@ struct ManifestRow<'a> {
     size: &'a [u8],
     storage: &'a [u8],
     alignment: &'a [u8],
+    section_ordinal: &'a [u8],
     section_offset: &'a [u8],
     scope: &'a [u8],
 }
@@ -37,16 +39,18 @@ fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
-    let (input, (object, rva, size, storage, alignment, section_offset, scope)) = (
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        field,
-    )
-        .parse(input)?;
+    let (input, (object, rva, size, storage, alignment, section_ordinal, section_offset, scope)) =
+        (
+            terminated(field, tag(&b"\t"[..])),
+            terminated(field, tag(&b"\t"[..])),
+            terminated(field, tag(&b"\t"[..])),
+            terminated(field, tag(&b"\t"[..])),
+            terminated(field, tag(&b"\t"[..])),
+            terminated(field, tag(&b"\t"[..])),
+            terminated(field, tag(&b"\t"[..])),
+            field,
+        )
+            .parse(input)?;
 
     Ok((
         input,
@@ -56,6 +60,7 @@ fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
             size,
             storage,
             alignment,
+            section_ordinal,
             section_offset,
             scope,
         },
@@ -86,6 +91,7 @@ pub struct DataDefinition {
     pub size: usize,
     pub storage: DataStorage,
     pub alignment: u64,
+    pub section_ordinal: Option<usize>,
     pub section_offset: Option<usize>,
     pub scope: DataScope,
 }
@@ -138,7 +144,7 @@ impl DataManifest {
 
             let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
                 anyhow::anyhow!(
-                    "{}:{}: expected exactly seven tab-separated columns",
+                    "{}:{}: expected exactly eight tab-separated columns",
                     path.display(),
                     line_number
                 )
@@ -212,6 +218,26 @@ impl DataManifest {
                 }
                 Some(offset)
             };
+            let section_ordinal = if row.section_ordinal == b"-" {
+                None
+            } else {
+                let ordinal = parse_number(row.section_ordinal)?;
+                if ordinal == 0 {
+                    anyhow::bail!(
+                        "{}:{}: section ordinal must be non-zero",
+                        path.display(),
+                        line_number
+                    );
+                }
+                Some(ordinal)
+            };
+            if section_ordinal.is_some() && section_offset.is_none() {
+                anyhow::bail!(
+                    "{}:{}: a section ordinal requires a section offset",
+                    path.display(),
+                    line_number
+                );
+            }
             let scope = match row.scope {
                 b"external" => DataScope::External,
                 b"local" => DataScope::Local,
@@ -250,6 +276,7 @@ impl DataManifest {
                 size,
                 storage,
                 alignment,
+                section_ordinal,
                 section_offset,
                 scope,
             });
@@ -278,6 +305,7 @@ impl DataManifest {
             (
                 definition.object,
                 definition.storage,
+                definition.section_ordinal.unwrap_or(0),
                 definition.section_offset.unwrap_or(definition.rva),
                 definition.rva,
             )
@@ -323,7 +351,8 @@ fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
 
-    const HEADER_TEXT: &str = "object\trva\tsize\tstorage\talignment\tsection_offset\tscope\n";
+    const HEADER_TEXT: &str =
+        "object\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope\n";
 
     fn symbols() -> PdbSymbols {
         let mut symbols = PdbSymbols::default();
@@ -365,10 +394,10 @@ mod tests {
     fn accepts_comments_crlf_paths_and_all_storage_classes() {
         let text = concat!(
             "# generated evidence\r\n",
-            "object\trva\tsize\tstorage\talignment\tsection_offset\tscope\r\n",
-            "engine/world.c\t0x100\t0x20\tdata\t0x4\t0\texternal\r\n",
-            "engine/constants.c\t0X200\t16\trdata\t8\t-\tlocal\r\n",
-            "engine/state.c\t0x300\t4\tbss\t1\t0\texternal\r\n",
+            "object\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope\r\n",
+            "engine/world.c\t0x100\t0x20\tdata\t0x4\t-\t0\texternal\r\n",
+            "engine/constants.c\t0X200\t16\trdata\t8\t-\t-\tlocal\r\n",
+            "engine/state.c\t0x300\t4\tbss\t1\t-\t0\texternal\r\n",
         );
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.definitions().len(), 3);
@@ -399,7 +428,7 @@ mod tests {
     #[test]
     fn accepts_missing_final_line_ending_and_uses_raw_pdb_symbol_bytes() {
         let mut bytes = HEADER.to_vec();
-        bytes.extend_from_slice(b"\nu.c\t0x180\t4\tdata\t4\t0\texternal");
+        bytes.extend_from_slice(b"\nu.c\t0x180\t4\tdata\t4\t-\t0\texternal");
         let parsed = DataManifest::parse(&bytes, Path::new("test.tsv"), &symbols()).unwrap();
         assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"\x80raw");
     }
@@ -407,7 +436,7 @@ mod tests {
     #[test]
     fn rejects_bare_carriage_return_line_endings() {
         let mut bytes = HEADER.to_vec();
-        bytes.extend_from_slice(b"\ru.c\t0x100\t4\tdata\t4\t0\texternal");
+        bytes.extend_from_slice(b"\ru.c\t0x100\t4\tdata\t4\t-\t0\texternal");
         let error = DataManifest::parse(&bytes, Path::new("test.tsv"), &symbols())
             .err()
             .unwrap()
@@ -447,8 +476,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_column_counts() {
-        assert!(error("u.c\t0x100\t4\tdata\t4\t0").contains("exactly seven"));
-        assert!(error("u.c\t0x100\t4\tdata\t4\t0\texternal\textra").contains("exactly seven"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t-\t0").contains("exactly eight"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t-\t0\texternal\textra").contains("exactly eight"));
     }
 
     #[test]
@@ -463,7 +492,7 @@ mod tests {
             "a/./u.c",
             "a//u.c",
         ] {
-            let row = format!("{object}\t0x100\t4\tdata\t4\t0\texternal");
+            let row = format!("{object}\t0x100\t4\tdata\t4\t-\t0\texternal");
             assert!(
                 error(&row).contains("relative and normalized"),
                 "accepted {object}"
@@ -474,8 +503,8 @@ mod tests {
     #[test]
     fn rejects_nul_and_control_bytes_in_text_fields() {
         for row in [
-            "a\0b.c\t0x100\t4\tdata\t4\t0\texternal",
-            "u\x7f.c\t0x100\t4\tdata\t4\t0\texternal",
+            "a\0b.c\t0x100\t4\tdata\t4\t-\t0\texternal",
+            "u\x7f.c\t0x100\t4\tdata\t4\t-\t0\texternal",
         ] {
             assert!(error(row).contains("control byte"));
         }
@@ -483,14 +512,14 @@ mod tests {
 
     #[test]
     fn rejects_allocations_without_compatible_pdb_symbols() {
-        assert!(error("u.c\t0x101\t4\tdata\t4\t0\texternal").contains("PDB data symbol"));
-        assert!(error("u.c\t0x100\t4\trdata\t4\t0\texternal").contains("PDB data symbol"));
+        assert!(error("u.c\t0x101\t4\tdata\t4\t-\t0\texternal").contains("PDB data symbol"));
+        assert!(error("u.c\t0x100\t4\trdata\t4\t-\t0\texternal").contains("PDB data symbol"));
     }
 
     #[test]
     fn rejects_duplicate_rvas() {
         let text = format!(
-            "{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t0\texternal\ntwo.c\t0x100\t4\tdata\t4\t0\texternal\n"
+            "{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t-\t0\texternal\ntwo.c\t0x100\t4\tdata\t4\t-\t0\texternal\n"
         );
         assert!(
             parse(&text)
@@ -504,7 +533,7 @@ mod tests {
     #[test]
     fn rejects_overlaps_across_owner_objects() {
         let text = format!(
-            "{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\t0\texternal\ntwo.c\t0x110\t4\tdata\t4\t0\texternal\n"
+            "{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\t-\t0\texternal\ntwo.c\t0x110\t4\tdata\t4\t-\t0\texternal\n"
         );
         assert!(
             parse(&text)
@@ -518,31 +547,32 @@ mod tests {
     #[test]
     fn accepts_adjacent_extents_across_owner_objects() {
         let text = format!(
-            "{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\t0\texternal\ntwo.c\t0x120\t4\tdata\t4\t0\texternal\n"
+            "{HEADER_TEXT}one.c\t0x100\t0x20\tdata\t4\t-\t0\texternal\ntwo.c\t0x120\t4\tdata\t4\t-\t0\texternal\n"
         );
         assert_eq!(parse(&text).unwrap().definitions().len(), 2);
     }
 
     #[test]
     fn rejects_extent_overflow_and_zero_size() {
-        let overflow = format!("u.c\t{}\t2\tdata\t4\t0\texternal", usize::MAX);
+        let overflow = format!("u.c\t{}\t2\tdata\t4\t-\t0\texternal", usize::MAX);
         assert!(error(&overflow).contains("overflows"));
-        assert!(error("u.c\t0x100\t0\tdata\t4\t0\texternal").contains("non-zero"));
-        let offset_overflow = format!("u.c\t0x100\t4\tdata\t4\t{}\texternal", usize::MAX);
+        assert!(error("u.c\t0x100\t0\tdata\t4\t-\t0\texternal").contains("non-zero"));
+        let offset_overflow = format!("u.c\t0x100\t4\tdata\t4\t-\t{}\texternal", usize::MAX);
         assert!(error(&offset_overflow).contains("object section"));
-        assert!(error("u.c\t0x100\t4\tdata\t4\t0\tglobal").contains("unsupported scope"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t-\t0\tglobal").contains("unsupported scope"));
+        assert!(error("u.c\t0x100\t4\tdata\t4\t1\t-\texternal").contains("requires"));
     }
 
     #[test]
     fn rejects_zero_and_non_power_of_two_alignment() {
-        assert!(error("u.c\t0x100\t4\tdata\t0\t0\texternal").contains("power of two"));
-        assert!(error("u.c\t0x100\t4\tdata\t3\t0\texternal").contains("power of two"));
+        assert!(error("u.c\t0x100\t4\tdata\t0\t-\t0\texternal").contains("power of two"));
+        assert!(error("u.c\t0x100\t4\tdata\t3\t-\t0\texternal").contains("power of two"));
     }
 
     #[test]
     fn resolves_interior_owner_and_addend_at_exact_boundaries() {
         let parsed = parse(&format!(
-            "{HEADER_TEXT}v.c\t0x140\t0x10\tdata\t4\t0\texternal\nu.c\t0x100\t0x20\tdata\t4\t0\texternal\n"
+            "{HEADER_TEXT}v.c\t0x140\t0x10\tdata\t4\t-\t0\texternal\nu.c\t0x100\t0x20\tdata\t4\t-\t0\texternal\n"
         ))
         .unwrap();
         assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"table");
@@ -563,7 +593,7 @@ mod tests {
     #[test]
     fn candidate_offsets_control_emission_without_changing_the_rva_index() {
         let parsed = parse(&format!(
-            "{HEADER_TEXT}u.c\t0x100\t4\tdata\t4\t4\texternal\nu.c\t0x140\t4\tdata\t4\t0\texternal\n"
+            "{HEADER_TEXT}u.c\t0x100\t4\tdata\t4\t-\t4\texternal\nu.c\t0x140\t4\tdata\t4\t-\t0\texternal\n"
         ))
         .unwrap();
         assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"table");
