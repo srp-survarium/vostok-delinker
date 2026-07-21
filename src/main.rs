@@ -3,6 +3,7 @@
 mod data_manifest;
 mod object_files;
 mod pdb_symbols;
+mod reloc_manifest;
 mod relocs;
 mod symbol_matcher;
 mod utils;
@@ -58,6 +59,13 @@ pub struct Cli {
     #[arg(long, requires = "data_manifest")]
     pub strict: bool,
 
+    /// Reviewed list of absolute relocation sites (`site_rva`, `kind`), for an
+    /// image whose `.reloc` directory is missing. Combines with
+    /// `--rediscover-relocations-from-pdb`: manifest sites are authoritative and
+    /// rediscovery fills the rest.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub reloc_manifest: Option<std::path::PathBuf>,
+
     /// Rediscover absolute relocation sites from the PDB by scanning the image for
     /// fields that hold a known symbol address. For images whose `.reloc`
     /// directory is missing or incomplete. Best-effort — may introduce a few false
@@ -99,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map,
         data_manifest,
         strict,
+        reloc_manifest,
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
     } = Cli::parse();
@@ -131,6 +140,7 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
         manifest_coverage,
+        reloc_manifest.as_deref(),
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
     )?;
@@ -148,6 +158,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
     manifest_coverage: relocs::ManifestCoverage,
+    reloc_manifest_path: Option<&std::path::Path>,
     rediscover_relocations_from_pdb: bool,
     rediscovery_interior_bound: usize,
 ) -> anyhow::Result<()> {
@@ -155,12 +166,14 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
 
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path, &pdb_symbols)?;
+    let reloc_manifest = reloc_manifest::RelocManifest::load(reloc_manifest_path)?;
     let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
         &env,
         exe,
         &pdb_symbols,
         &data_manifest,
         manifest_coverage,
+        reloc_manifest.as_ref(),
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
     )?;

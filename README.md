@@ -57,14 +57,19 @@ Run `vostok-delinker --help` for the complete option list.
 
 A fixed-base or stripped executable (`IMAGE_FILE_RELOCS_STRIPPED`) carries no
 base-relocation directory. Vostok still recovers relative branches from the
-instruction decoder; for the absolute relocations that the `.reloc` directory
-would have listed, pass `--rediscover-relocations-from-pdb`. It scans
-`.text`/`.rdata`/`.data` for 4-byte fields that hold the address of a known PDB
-symbol and reconstructs a relocation for each. Rediscovery is only for images
-that lack a `.reloc` directory: a present directory is already complete and
-authoritative, so passing the flag alongside it is rejected. An image that lacks
-`.reloc` and is given no recovery method is a hard error, not a silent partial
-delink.
+instruction decoder; the absolute relocations the `.reloc` directory would have
+listed come from one of two recovery inputs, which may be combined:
+
+- `--reloc-manifest` -- a reviewed TSV of exact `site_rva`/`kind` rows (see
+  [docs/reloc-rediscovery.md](docs/reloc-rediscovery.md)). Authoritative.
+- `--rediscover-relocations-from-pdb` -- the best-effort scan described below;
+  when combined with a manifest it fills only the sites the manifest omits.
+
+A present `.reloc` directory is already complete, so passing either recovery
+input alongside it is rejected; an image that lacks `.reloc` and is given neither
+is a hard error, not a silent partial delink. The scan itself locates 4-byte
+fields in `.text`/`.rdata`/`.data` that hold the address of a known PDB symbol
+and reconstructs a relocation for each.
 
 Most relocations point *inside* a symbol, not at its start (`&table[i]`,
 `&s.field`, a jump-table entry). Because PDB data symbols often lack sizes,
@@ -90,7 +95,7 @@ coincidental in-range words (lower precision); `0` accepts exact starts only.
 This is a best-effort bootstrap. Measured against the real `.reloc` on games that
 still have one, the default captures roughly 78-86% of relocations at 98-99%
 precision (about 1-2% of the emitted relocations are false). A project past
-bootstrapping supplies an exact, reviewed relocation list instead of relying on
+bootstrapping supplies those sites via `--reloc-manifest` instead of relying on
 the scan.
 
 A relocation the scan misses surfaces in objdiff as a raw absolute address; see
