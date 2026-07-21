@@ -120,143 +120,171 @@ pub fn resolve_absolute_relocations<'s>(
             //
             let reloc_rva = (page_rva + u32::from(reloc_offset)).to_usize();
 
-            let target_va =
-                bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
-            let target_rva = (target_va - env.image_base).to_usize();
-
-            let coff_data_reloc = &mut coff_data[reloc_rva..reloc_rva + 4];
-
-            match () {
-                () if (env.text.rva..env.text.rva + env.text.size).contains(&target_rva) => {
-                    let (function_rva, function_overloads) = symbols
-                        .functions
-                        .range(..=target_rva)
-                        .next_back()
-                        .expect("all function relocs to be named");
-
-                    let diff = u32::try_from(target_rva - *function_rva)?;
-                    coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-
-                    relocs_rva.insert(
-                        reloc_rva,
-                        RelocKind::Function {
-                            overloads: function_overloads,
-                            encoding: RelocationEncoding::Absolute,
-                        },
-                    );
-                }
-                () if (env.rdata.rva..env.rdata.rva + env.rdata.size).contains(&target_rva) => {
-                    let owner = data_manifest.owner_and_addend_for_rva(target_rva);
-                    match (manifest_coverage, owner) {
-                        (_, Some((owner, addend))) => {
-                            let diff = u32::try_from(addend)?;
-                            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-                            relocs_rva.insert(
-                                reloc_rva,
-                                RelocKind::ReviewedData {
-                                    symbol: owner.symbol_name,
-                                },
-                            );
-                        }
-                        (ManifestCoverage::RequireComplete, None) => {
-                            anyhow::bail!(
-                                "--strict: PE base relocation at RVA {reloc_rva:#x} targets data \
-                                 RVA {target_rva:#x}, which is not covered by the data manifest"
-                            );
-                        }
-                        (ManifestCoverage::AllowPartial, None) => {
-                            match symbols.strings.range(..=target_rva).next_back() {
-                                Some((string_rva, (string_mangled_name, string)))
-                                    if target_rva - string_rva < string.len() =>
-                                {
-                                    let diff = u32::try_from(target_rva - *string_rva)?;
-                                    coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-
-                                    relocs_rva.insert(
-                                        reloc_rva,
-                                        RelocKind::ConjuredString {
-                                            symbol: *string_mangled_name,
-                                            data: string,
-                                        },
-                                    );
-                                }
-
-                                Some(_) | None => {
-                                    let Some((constant_rva, constant_name)) =
-                                        symbols.constants.range(..=target_rva).next_back()
-                                    else {
-                                        unreachable!("All constants must be named");
-                                    };
-
-                                    // @TODO: Many relocations (~2k) have very huge diffs,
-                                    // meaning they do not actually belong to a found symbol.
-                                    // This needs to be investigated (if this will affect objdiff matching)
-                                    let diff = u32::try_from(target_rva - *constant_rva)?;
-                                    coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-
-                                    relocs_rva.insert(
-                                        reloc_rva,
-                                        RelocKind::ConjuredConstant {
-                                            symbol: *constant_name,
-                                            target_rva,
-                                        },
-                                    );
-                                }
-                            };
-                        }
-                    }
-                }
-                () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
-                    let owner = data_manifest.owner_and_addend_for_rva(target_rva);
-                    match (manifest_coverage, owner) {
-                        (_, Some((owner, addend))) => {
-                            let diff = u32::try_from(addend)?;
-                            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-                            relocs_rva.insert(
-                                reloc_rva,
-                                RelocKind::ReviewedData {
-                                    symbol: owner.symbol_name,
-                                },
-                            );
-                        }
-                        (ManifestCoverage::RequireComplete, None) => {
-                            anyhow::bail!(
-                                "--strict: PE base relocation at RVA {reloc_rva:#x} targets data \
-                                 RVA {target_rva:#x}, which is not covered by the data manifest"
-                            );
-                        }
-                        (ManifestCoverage::AllowPartial, None) => {
-                            let Some((static_rva, static_name)) =
-                                symbols.statics.range(..=target_rva).next_back()
-                            else {
-                                let _reloc_va = reloc_rva + env.image_base.to_usize();
-                                // @TODO: There is a "single" unnamed static relocation in base, which is a
-                                // string "rb\0" used for `fopen` in `ov_fopen`.
-                                continue;
-                            };
-
-                            // @TODO: Many relocations (~10k) have very huge diffs,
-                            // meaning they do not actually belong to a found symbol.
-                            // This needs to be investigated (if this will affect objdiff matching)
-                            let diff = u32::try_from(target_rva - *static_rva)?;
-                            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
-
-                            relocs_rva.insert(
-                                reloc_rva,
-                                RelocKind::ConjuredStatic {
-                                    symbol: *static_name,
-                                    target_rva,
-                                },
-                            );
-                        }
-                    }
-                }
-                () => (),
-            }
+            resolve_absolute_site(
+                env,
+                symbols,
+                data_manifest,
+                manifest_coverage,
+                &exe_data,
+                &mut coff_data,
+                &mut relocs_rva,
+                reloc_rva,
+            )?;
         }
     }
 
     Ok((coff_data, relocs_rva))
+}
+
+/// Resolve one absolute relocation site: a 4-byte field at `reloc_rva` holding a
+/// linked target VA. Classify the target against the PDB symbols and the data
+/// manifest, rewrite the field in `coff_data` to the in-object addend, and record
+/// the `RelocKind`. This is the per-site body shared by every site source (the
+/// `.reloc` directory today; PDB rediscovery and the reloc manifest later).
+fn resolve_absolute_site<'s>(
+    env: &Env,
+    symbols: &'s pdb_symbols::PdbSymbols,
+    data_manifest: &DataManifest,
+    manifest_coverage: ManifestCoverage,
+    exe_data: &[u8],
+    coff_data: &mut [u8],
+    relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    reloc_rva: usize,
+) -> anyhow::Result<()> {
+    let target_va = bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
+    let target_rva = (target_va - env.image_base).to_usize();
+
+    let coff_data_reloc = &mut coff_data[reloc_rva..reloc_rva + 4];
+
+    match () {
+        () if (env.text.rva..env.text.rva + env.text.size).contains(&target_rva) => {
+            let (function_rva, function_overloads) = symbols
+                .functions
+                .range(..=target_rva)
+                .next_back()
+                .expect("all function relocs to be named");
+
+            let diff = u32::try_from(target_rva - *function_rva)?;
+            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+
+            relocs_rva.insert(
+                reloc_rva,
+                RelocKind::Function {
+                    overloads: function_overloads,
+                    encoding: RelocationEncoding::Absolute,
+                },
+            );
+        }
+        () if (env.rdata.rva..env.rdata.rva + env.rdata.size).contains(&target_rva) => {
+            let owner = data_manifest.owner_and_addend_for_rva(target_rva);
+            match (manifest_coverage, owner) {
+                (_, Some((owner, addend))) => {
+                    let diff = u32::try_from(addend)?;
+                    coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+                    relocs_rva.insert(
+                        reloc_rva,
+                        RelocKind::ReviewedData {
+                            symbol: owner.symbol_name,
+                        },
+                    );
+                }
+                (ManifestCoverage::RequireComplete, None) => {
+                    anyhow::bail!(
+                        "--strict: PE base relocation at RVA {reloc_rva:#x} targets data \
+                         RVA {target_rva:#x}, which is not covered by the data manifest"
+                    );
+                }
+                (ManifestCoverage::AllowPartial, None) => {
+                    match symbols.strings.range(..=target_rva).next_back() {
+                        Some((string_rva, (string_mangled_name, string)))
+                            if target_rva - string_rva < string.len() =>
+                        {
+                            let diff = u32::try_from(target_rva - *string_rva)?;
+                            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+
+                            relocs_rva.insert(
+                                reloc_rva,
+                                RelocKind::ConjuredString {
+                                    symbol: *string_mangled_name,
+                                    data: string,
+                                },
+                            );
+                        }
+
+                        Some(_) | None => {
+                            let Some((constant_rva, constant_name)) =
+                                symbols.constants.range(..=target_rva).next_back()
+                            else {
+                                unreachable!("All constants must be named");
+                            };
+
+                            // @TODO: Many relocations (~2k) have very huge diffs,
+                            // meaning they do not actually belong to a found symbol.
+                            // This needs to be investigated (if this will affect objdiff matching)
+                            let diff = u32::try_from(target_rva - *constant_rva)?;
+                            coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+
+                            relocs_rva.insert(
+                                reloc_rva,
+                                RelocKind::ConjuredConstant {
+                                    symbol: *constant_name,
+                                    target_rva,
+                                },
+                            );
+                        }
+                    };
+                }
+            }
+        }
+        () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
+            let owner = data_manifest.owner_and_addend_for_rva(target_rva);
+            match (manifest_coverage, owner) {
+                (_, Some((owner, addend))) => {
+                    let diff = u32::try_from(addend)?;
+                    coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+                    relocs_rva.insert(
+                        reloc_rva,
+                        RelocKind::ReviewedData {
+                            symbol: owner.symbol_name,
+                        },
+                    );
+                }
+                (ManifestCoverage::RequireComplete, None) => {
+                    anyhow::bail!(
+                        "--strict: PE base relocation at RVA {reloc_rva:#x} targets data \
+                         RVA {target_rva:#x}, which is not covered by the data manifest"
+                    );
+                }
+                (ManifestCoverage::AllowPartial, None) => {
+                    let Some((static_rva, static_name)) =
+                        symbols.statics.range(..=target_rva).next_back()
+                    else {
+                        let _reloc_va = reloc_rva + env.image_base.to_usize();
+                        // @TODO: There is a "single" unnamed static relocation in base, which is a
+                        // string "rb\0" used for `fopen` in `ov_fopen`.
+                        return Ok(());
+                    };
+
+                    // @TODO: Many relocations (~10k) have very huge diffs,
+                    // meaning they do not actually belong to a found symbol.
+                    // This needs to be investigated (if this will affect objdiff matching)
+                    let diff = u32::try_from(target_rva - *static_rva)?;
+                    coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
+
+                    relocs_rva.insert(
+                        reloc_rva,
+                        RelocKind::ConjuredStatic {
+                            symbol: *static_name,
+                            target_rva,
+                        },
+                    );
+                }
+            }
+        }
+        () => (),
+    }
+
+    Ok(())
 }
 
 fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
