@@ -1,6 +1,7 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
 use crate::pdb_symbols;
+use crate::reloc_manifest::RelocManifest;
 use crate::utils::ToUsize;
 
 use pdb2::RawString;
@@ -75,6 +76,7 @@ pub fn resolve_absolute_relocations<'s>(
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
     manifest_coverage: ManifestCoverage,
+    reloc_manifest: Option<&RelocManifest>,
     rediscover_from_pdb: bool,
     rediscovery_interior_bound: usize,
 ) -> anyhow::Result<(Vec<u8>, BTreeMap<usize, RelocKind<'s>>)> {
@@ -82,9 +84,12 @@ pub fn resolve_absolute_relocations<'s>(
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
 
-    // A stripped image has no base-relocation directory. Tolerate that only with a
-    // recovery method, else we'd silently drop real relocations.
-    match (exe.section_by_name(".reloc"), rediscover_from_pdb) {
+    // Absolute sites come from the `.reloc` directory, or -- for a stripped image
+    // that has none -- from a reviewed reloc manifest and/or PDB rediscovery. A
+    // present directory is already complete, so a recovery method alongside it is
+    // redundant; recovering nothing would silently drop real relocations.
+    let recovery = reloc_manifest.is_some() || rediscover_from_pdb;
+    match (exe.section_by_name(".reloc"), recovery) {
         (Some(section), false) => {
             resolve_reloc_directory(
                 section.data()?,
@@ -98,26 +103,40 @@ pub fn resolve_absolute_relocations<'s>(
             )?;
         }
         (None, true) => {
-            rediscover_absolute_sites_from_pdb(
-                env,
-                symbols,
-                data_manifest,
-                manifest_coverage,
-                &exe_data,
-                &mut coff_data,
-                &mut relocs_rva,
-                rediscovery_interior_bound,
-            )?;
+            // Manifest sites are authoritative; rediscovery then fills the rest.
+            if let Some(reloc_manifest) = reloc_manifest {
+                resolve_manifest_sites(
+                    reloc_manifest,
+                    env,
+                    symbols,
+                    data_manifest,
+                    manifest_coverage,
+                    &exe_data,
+                    &mut coff_data,
+                    &mut relocs_rva,
+                )?;
+            }
+            if rediscover_from_pdb {
+                rediscover_absolute_sites_from_pdb(
+                    env,
+                    symbols,
+                    data_manifest,
+                    manifest_coverage,
+                    &exe_data,
+                    &mut coff_data,
+                    &mut relocs_rva,
+                    rediscovery_interior_bound,
+                )?;
+            }
         }
 
         (Some(_), true) => anyhow::bail!(
-            "image already has a `.reloc` base-relocation directory; \
-             --rediscover-relocations-from-pdb is only for images without one"
+            "image already has a `.reloc` base-relocation directory; --reloc-manifest \
+             and --rediscover-relocations-from-pdb are only for images without one"
         ),
         (None, false) => anyhow::bail!(
-            "image has no `.reloc` base-relocation directory; pass \
-             --rediscover-relocations-from-pdb to recover absolute relocations \
-             from the PDB"
+            "image has no `.reloc` base-relocation directory; supply --reloc-manifest \
+             and/or --rediscover-relocations-from-pdb to recover its absolute relocations"
         ),
     };
 
@@ -166,6 +185,36 @@ fn resolve_reloc_directory<'s>(
                 reloc_rva,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Resolve every reviewed site listed in the reloc manifest.
+#[allow(clippy::too_many_arguments)]
+fn resolve_manifest_sites<'s>(
+    reloc_manifest: &RelocManifest,
+    env: &Env,
+    symbols: &'s pdb_symbols::PdbSymbols,
+    data_manifest: &DataManifest,
+    manifest_coverage: ManifestCoverage,
+    exe_data: &[u8],
+    coff_data: &mut [u8],
+    relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+) -> anyhow::Result<()> {
+    for &site in reloc_manifest.sites() {
+        if site + 4 > exe_data.len() {
+            anyhow::bail!("reloc manifest site RVA {site:#x} is outside the mapped image");
+        }
+        resolve_absolute_site(
+            env,
+            symbols,
+            data_manifest,
+            manifest_coverage,
+            exe_data,
+            coff_data,
+            relocs_rva,
+            site,
+        )?;
     }
     Ok(())
 }
