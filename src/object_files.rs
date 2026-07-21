@@ -15,7 +15,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 use pdb2::{FallibleIterator, RawString};
 
 use object::write::SymbolId;
-use object::{SectionFlags, SectionKind};
+use object::{ComdatKind, SectionFlags, SectionKind};
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -29,6 +29,8 @@ pub struct ObjectFile {
     pub text_section_id: object::write::SectionId,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
     topology_sections: Vec<EmittedTopologySection>,
+    pending_data_comdats: Vec<PendingDataComdat>,
+    comdat_leaders: HashMap<usize, SymbolId>,
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +38,13 @@ struct EmittedTopologySection {
     id: object::write::SectionId,
     storage: Option<SectionStorage>,
     rva: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingDataComdat {
+    ordinal: usize,
+    section: object::write::SectionId,
+    selection: ComdatSelection,
 }
 
 #[derive(Copy, Clone)]
@@ -218,7 +227,7 @@ impl ObjectFiles<'_> {
         let base_len = base.as_os_str().as_encoded_bytes().len();
         let mut path = base.to_path_buf();
 
-        for (prefix, object_file) in self.objects {
+        for (prefix, mut object_file) in self.objects {
             path.as_mut_os_string().truncate(base_len);
 
             let prefix = prefix
@@ -233,6 +242,7 @@ impl ObjectFiles<'_> {
             path.as_mut_os_string().push(".obj");
 
             std::fs::create_dir_all(path.parent().unwrap())?;
+            object_file.finish_data_comdats()?;
             std::fs::write(&path, object_file.object.write()?)?;
         }
         Ok(())
@@ -270,6 +280,8 @@ impl ObjectFile {
             text_section_id,
             undefined_symbols: HashMap::new(),
             topology_sections: Vec::new(),
+            pending_data_comdats: Vec::new(),
+            comdat_leaders: HashMap::new(),
         }
     }
 
@@ -288,6 +300,7 @@ impl ObjectFile {
         object.set_mangling(object::write::Mangling::None);
 
         let mut topology_sections = Vec::with_capacity(sections.len());
+        let mut pending_data_comdats = Vec::new();
         let mut data_section_id = None;
         let mut rdata_section_id = None;
         let mut bss_section_id = None;
@@ -349,13 +362,6 @@ impl ObjectFile {
                 rva: section.rva,
             });
 
-            if section.comdat_selection != ComdatSelection::None {
-                anyhow::bail!(
-                    "candidate data COMDAT section {} is not yet emitted",
-                    section.ordinal
-                );
-            }
-
             match section.storage {
                 Some(SectionStorage::Data) if data_section_id.is_none() => {
                     data_section_id = Some(id)
@@ -368,6 +374,13 @@ impl ObjectFile {
                     text_section_id = Some(id)
                 }
                 _ => {}
+            }
+            if section.storage.is_some() && section.comdat_selection != ComdatSelection::None {
+                pending_data_comdats.push(PendingDataComdat {
+                    ordinal: section.ordinal,
+                    section: id,
+                    selection: section.comdat_selection,
+                });
             }
         }
 
@@ -390,6 +403,8 @@ impl ObjectFile {
             text_section_id,
             undefined_symbols: HashMap::new(),
             topology_sections,
+            pending_data_comdats,
+            comdat_leaders: HashMap::new(),
         })
     }
 }
@@ -787,7 +802,7 @@ impl ObjectFile {
                 definition.symbol_name
             );
         }
-        self.object.add_symbol(object::write::Symbol {
+        let symbol = self.object.add_symbol(object::write::Symbol {
             name: definition.symbol_name.as_bytes().to_vec(),
             value: offset.offset,
             size: definition.size.to_u64(),
@@ -800,6 +815,46 @@ impl ObjectFile {
             section: object::write::SymbolSection::Section(offset.section_id),
             flags: object::SymbolFlags::None,
         });
+        if let Some(ordinal) = definition.section_ordinal
+            && definition.section_offset == Some(0)
+            && definition.scope == DataScope::External
+        {
+            self.comdat_leaders.entry(ordinal).or_insert(symbol);
+        }
+        Ok(())
+    }
+
+    fn finish_data_comdats(&mut self) -> anyhow::Result<()> {
+        for pending in self.pending_data_comdats.clone() {
+            let leader = self
+                .comdat_leaders
+                .get(&pending.ordinal)
+                .copied()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "candidate data COMDAT section {} has no external offset-zero leader",
+                        pending.ordinal
+                    )
+                })?;
+            let kind = match pending.selection {
+                ComdatSelection::NoDuplicates => ComdatKind::NoDuplicates,
+                ComdatSelection::Any => ComdatKind::Any,
+                ComdatSelection::SameSize => ComdatKind::SameSize,
+                ComdatSelection::ExactMatch => ComdatKind::ExactMatch,
+                ComdatSelection::Largest => ComdatKind::Largest,
+                ComdatSelection::Newest => ComdatKind::Newest,
+                ComdatSelection::Associative => anyhow::bail!(
+                    "associative data COMDAT section {} requires a leader group",
+                    pending.ordinal
+                ),
+                ComdatSelection::None => unreachable!(),
+            };
+            self.object.add_comdat(object::write::Comdat {
+                kind,
+                symbol: leader,
+                sections: vec![pending.section],
+            });
+        }
         Ok(())
     }
 
@@ -1053,7 +1108,7 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object::{Object as _, ObjectSection as _};
+    use object::{Object as _, ObjectComdat as _, ObjectSection as _, ObjectSymbol as _};
 
     fn definition(scope: DataScope, section_offset: usize) -> DataDefinition {
         DataDefinition {
@@ -1124,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_distinct_data_sections() {
+    fn emits_distinct_data_sections_and_comdat_group() {
         let sections = [
             DataSection {
                 object: b"fixture.c",
@@ -1157,8 +1212,8 @@ mod tests {
                 rva: Some(0x20),
                 size: 4,
                 alignment: 4,
-                characteristics: 0xc030_0040,
-                comdat_selection: ComdatSelection::None,
+                characteristics: 0xc030_1040,
+                comdat_selection: ComdatSelection::Any,
                 associative_ordinal: None,
                 storage: Some(SectionStorage::Data),
             },
@@ -1199,6 +1254,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        output.finish_data_comdats().unwrap();
 
         let bytes = output.object.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
@@ -1206,5 +1262,16 @@ mod tests {
         assert_eq!(parsed_sections[0].name().unwrap(), ".drectve");
         assert_eq!(parsed_sections[1].data().unwrap(), b"main");
         assert_eq!(parsed_sections[2].data().unwrap(), b"fold");
+        let comdats = object.comdats().collect::<Vec<_>>();
+        assert_eq!(comdats.len(), 1);
+        assert_eq!(comdats[0].kind(), ComdatKind::Any);
+        assert_eq!(
+            object
+                .symbol_by_index(comdats[0].symbol())
+                .unwrap()
+                .name()
+                .unwrap(),
+            "fold"
+        );
     }
 }
