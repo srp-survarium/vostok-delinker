@@ -53,6 +53,53 @@ cargo run --release -- \
 
 Run `vostok-delinker --help` for the complete option list.
 
+## Relocations without a `.reloc` section
+
+A fixed-base or stripped executable (`IMAGE_FILE_RELOCS_STRIPPED`) carries no
+base-relocation directory. Vostok still recovers relative branches from the
+instruction decoder; for the absolute relocations that the `.reloc` directory
+would have listed, pass `--rediscover-relocations-from-pdb`. It scans
+`.text`/`.rdata`/`.data` for 4-byte fields that hold the address of a known PDB
+symbol and reconstructs a relocation for each. Rediscovery is only for images
+that lack a `.reloc` directory: a present directory is already complete and
+authoritative, so passing the flag alongside it is rejected. An image that lacks
+`.reloc` and is given no recovery method is a hard error, not a silent partial
+delink.
+
+Most relocations point *inside* a symbol, not at its start (`&table[i]`,
+`&s.field`, a jump-table entry). Because PDB data symbols often lack sizes,
+`--rediscovery-interior-bound` (default 32) stands in for the symbol's extent: a
+scanned address is trusted when it lands in the half-open window `[S, S + bound)`
+of the nearest known symbol start `S`.
+
+```text
+     S (known symbol start)                 S + bound
+     |                                      |
+     |========== trusted window ===========|  . . . not trusted
+     |   accept a target in [ S, S+bound ) |
+     |                                      |
+     S+0            S+0x10                  S+bound          far off
+     exact start    interior pointer        just past        no nearby
+     -> ACCEPT      -> ACCEPT               -> REJECT         symbol
+                                                              -> REJECT
+```
+
+A larger bound catches deeper interior pointers (more recall) but trusts more
+coincidental in-range words (lower precision); `0` accepts exact starts only.
+
+This is a best-effort bootstrap. Measured against the real `.reloc` on games that
+still have one, the default captures roughly 78-86% of relocations at 98-99%
+precision (about 1-2% of the emitted relocations are false). A project past
+bootstrapping supplies an exact, reviewed relocation list instead of relying on
+the scan.
+
+A relocation the scan misses stays a raw absolute address in the emitted object,
+with no COFF relocation record for it. objdiff masks relocation fields, but since
+this field has none, the literal linked address shows through and mismatches the
+base object (which relocates that field against a symbol). So a miss costs the
+affected field's match, not the whole object, and it always surfaces as an
+absolute address in the diff.
+
 ## Data manifest
 
 The data manifest is an independent, optional input. It is useful with both an
