@@ -12,6 +12,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 use pdb2::{FallibleIterator, RawString};
 
 use object::SectionKind;
+use object::write::SymbolId;
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -23,6 +24,7 @@ pub struct ObjectFile {
     pub rdata_section_id: object::write::SectionId,
     pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: object::write::SectionId,
+    undefined_symbols: HashMap<Vec<u8>, SymbolId>,
 }
 
 #[derive(Copy, Clone)]
@@ -41,12 +43,6 @@ pub enum ObjectLocation {
 enum TargetMaterialization {
     Materialize,
     ReferenceOnly,
-}
-
-#[derive(Copy, Clone)]
-enum SymbolReuse {
-    AlwaysCreate,
-    ReuseIfDefined,
 }
 
 impl ObjectFiles<'_> {
@@ -240,6 +236,7 @@ impl ObjectFile {
             rdata_section_id,
             bss_section_id: None,
             text_section_id,
+            undefined_symbols: HashMap::new(),
         }
     }
 }
@@ -430,13 +427,7 @@ impl ObjectFile {
                 overloads: _,
                 encoding,
             } => {
-                self.add_relocation(
-                    reloc_name,
-                    ObjectLocation::Extern,
-                    reloc_offset,
-                    encoding,
-                    SymbolReuse::AlwaysCreate,
-                )?;
+                self.add_relocation(reloc_name, ObjectLocation::Extern, reloc_offset, encoding)?;
             }
 
             RelocKind::ReviewedData { .. } => {
@@ -445,7 +436,6 @@ impl ObjectFile {
                     ObjectLocation::Extern,
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::ReuseIfDefined,
                 )?;
             }
 
@@ -463,7 +453,6 @@ impl ObjectFile {
                     ObjectLocation::Extern,
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
                 )?;
             }
 
@@ -476,7 +465,6 @@ impl ObjectFile {
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
                 )?;
             }
 
@@ -493,7 +481,6 @@ impl ObjectFile {
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
                 )?;
 
                 // Cycle guard for self-referential RVAs.
@@ -525,7 +512,6 @@ impl ObjectFile {
                     ObjectLocation::Offset(static_offset_in_coff_data),
                     reloc_offset,
                     RelocationEncoding::Absolute,
-                    SymbolReuse::AlwaysCreate,
                 )?;
 
                 // Same cycle guard as the ConjuredConstant arm above.
@@ -682,53 +668,53 @@ impl ObjectFile {
         location: ObjectLocation,
         offset: ObjectOffset,
         encoding: RelocationEncoding,
-        symbol_reuse: SymbolReuse,
     ) -> anyhow::Result<()> {
-        let (value, kind, section) = match location {
-            ObjectLocation::Extern => (
-                0,
-                object::SymbolKind::Unknown,
-                object::write::SymbolSection::Undefined,
-            ),
+        // The location decides symbol identity. `Extern` is a reference: one symbol
+        // per external name, reused if this object already emitted it and resolving
+        // to a local definition when this object defines it. `Offset` is a fresh
+        // local allocation, always its own symbol.
+        let symbol = match location {
+            // Reuse the defined symbol when this object owns it, otherwise keep one
+            // undefined symbol per name. The writer indexes only defined symbols, so
+            // undefined identities live in `undefined_symbols`.
+            ObjectLocation::Extern => match self.object.symbol_id(name.as_bytes()) {
+                Some(symbol) => symbol,
+                None => {
+                    let writer = &mut self.object;
+                    *self
+                        .undefined_symbols
+                        .entry(name.as_bytes().to_vec())
+                        .or_insert_with(|| {
+                            writer.add_symbol(object::write::Symbol {
+                                name: name.as_bytes().to_vec(),
+                                value: 0,
+                                size: u64::MAX,
+                                kind: object::SymbolKind::Unknown,
+                                scope: object::SymbolScope::Linkage,
+                                weak: false,
+                                section: object::write::SymbolSection::Undefined,
+                                flags: object::SymbolFlags::None,
+                            })
+                        })
+                }
+            },
             ObjectLocation::Offset(ObjectOffset { offset, section_id }) => {
                 let kind = if section_id == self.text_section_id {
                     object::SymbolKind::Text
                 } else {
                     object::SymbolKind::Data
                 };
-                (
-                    offset,
+                self.object.add_symbol(object::write::Symbol {
+                    name: name.as_bytes().to_vec(),
+                    value: offset,
+                    size: u64::MAX,
                     kind,
-                    object::write::SymbolSection::Section(section_id),
-                )
-            }
-        };
-
-        let symbol = match symbol_reuse {
-            SymbolReuse::ReuseIfDefined => {
-                self.object.symbol_id(name.as_bytes()).unwrap_or_else(|| {
-                    self.object.add_symbol(object::write::Symbol {
-                        name: name.as_bytes().to_vec(),
-                        value,
-                        size: u64::MAX,
-                        kind,
-                        scope: object::SymbolScope::Linkage,
-                        weak: false,
-                        section,
-                        flags: object::SymbolFlags::None,
-                    })
+                    scope: object::SymbolScope::Linkage,
+                    weak: false,
+                    section: object::write::SymbolSection::Section(section_id),
+                    flags: object::SymbolFlags::None,
                 })
             }
-            SymbolReuse::AlwaysCreate => self.object.add_symbol(object::write::Symbol {
-                name: name.as_bytes().to_vec(),
-                value,
-                size: u64::MAX,
-                kind,
-                scope: object::SymbolScope::Linkage,
-                weak: false,
-                section,
-                flags: object::SymbolFlags::None,
-            }),
         };
 
         let (kind, addend) = match encoding {
@@ -910,5 +896,36 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("expected section offset 0x4, emitted 0x0"));
+    }
+
+    #[test]
+    fn repeated_external_relocations_reuse_one_undefined_symbol() {
+        let mut object = ObjectFile::empty(false);
+        let offset = object.append_section_data(object.text_section_id, &[0; 8], 0x90);
+        let name = RawString::from(&b"external"[..]);
+
+        object
+            .add_relocation(
+                name,
+                ObjectLocation::Extern,
+                offset,
+                RelocationEncoding::Absolute,
+            )
+            .unwrap();
+        object
+            .add_relocation(
+                name,
+                ObjectLocation::Extern,
+                offset + 4,
+                RelocationEncoding::Absolute,
+            )
+            .unwrap();
+
+        assert_eq!(object.undefined_symbols.len(), 1);
+        assert!(
+            object
+                .undefined_symbols
+                .contains_key(b"external".as_slice())
+        );
     }
 }
