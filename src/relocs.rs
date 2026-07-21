@@ -12,24 +12,32 @@ use std::collections::BTreeMap;
 
 #[derive(Copy, Clone, Debug)]
 pub enum RelocKind<'a> {
-    // .text
+    // .text - resolved from a PDB function symbol. Always emitted as an external
+    // reference to that function.
     Function {
         overloads: &'a [RawString<'static>],
         encoding: RelocationEncoding,
     },
 
-    // .rdata
-    ConstantString {
+    // Reviewed: the target is a definition in the `--data-manifest`. Always
+    // emitted as an external reference to that shared definition, which its
+    // owning object defines. Covers both `.rdata` and `.data` targets.
+    ReviewedData {
+        symbol: RawString<'static>,
+    },
+
+    // Conjured: the target is NOT covered by the manifest, so it is reconstructed
+    // algorithmically from a PDB symbol and materialized as a private per-TU copy
+    // (unless only a reference is wanted). One variant per source section.
+    ConjuredString {
         symbol: RawString<'static>,
         data: &'a [u8],
     },
-    Constant {
+    ConjuredConstant {
         symbol: RawString<'static>,
         target_rva: usize,
     },
-
-    // .data
-    Static {
+    ConjuredStatic {
         symbol: RawString<'static>,
         target_rva: usize,
     },
@@ -145,9 +153,8 @@ pub fn resolve_absolute_relocations<'s>(
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
                             relocs_rva.insert(
                                 reloc_rva,
-                                RelocKind::Constant {
+                                RelocKind::ReviewedData {
                                     symbol: owner.symbol_name,
-                                    target_rva,
                                 },
                             );
                         }
@@ -167,7 +174,7 @@ pub fn resolve_absolute_relocations<'s>(
 
                                     relocs_rva.insert(
                                         reloc_rva,
-                                        RelocKind::ConstantString {
+                                        RelocKind::ConjuredString {
                                             symbol: *string_mangled_name,
                                             data: string,
                                         },
@@ -189,7 +196,7 @@ pub fn resolve_absolute_relocations<'s>(
 
                                     relocs_rva.insert(
                                         reloc_rva,
-                                        RelocKind::Constant {
+                                        RelocKind::ConjuredConstant {
                                             symbol: *constant_name,
                                             target_rva,
                                         },
@@ -207,9 +214,8 @@ pub fn resolve_absolute_relocations<'s>(
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
                             relocs_rva.insert(
                                 reloc_rva,
-                                RelocKind::Static {
+                                RelocKind::ReviewedData {
                                     symbol: owner.symbol_name,
-                                    target_rva,
                                 },
                             );
                         }
@@ -237,7 +243,7 @@ pub fn resolve_absolute_relocations<'s>(
 
                             relocs_rva.insert(
                                 reloc_rva,
-                                RelocKind::Static {
+                                RelocKind::ConjuredStatic {
                                     symbol: *static_name,
                                     target_rva,
                                 },
