@@ -11,6 +11,14 @@ Vostok expects a PDB that describes the executable being delinked. An original
 PDB is not always available: a shipped executable may be stripped, may contain
 only an older embedded debug format, or may have no surviving project PDB.
 
+**PDB format.** Vostok reads the modern PDB 7.0 container introduced with Visual
+Studio .NET 2002 (MSVC 13.0). PDBs from that toolset onward are supported
+(verified through Visual Studio 2008); PDBs produced by Visual C++ 6.0 and
+earlier (MSVC 4.2, 5.0, 6.0) use the legacy format and are rejected with
+`ancient DBI header` or `UnexpectedEof`. A synthetic PDB is always written in the
+modern format, so this limit applies only when delinking against an original
+compiler PDB.
+
 A reconstruction project can generate a synthetic PDB from its recovered symbol
 inventory. This solves four immediate problems for the delinker:
 
