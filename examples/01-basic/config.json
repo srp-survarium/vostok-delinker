@@ -1,0 +1,9 @@
+{
+  "source": "basic.cpp",
+  "link": "reloc",
+  "unit_object": "basic.cpp.obj",
+  "report": { "kind": "functions" },
+  "variants": [
+    { "name": "default", "delink_args": [] }
+  ]
+}

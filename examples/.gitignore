@@ -1,0 +1,6 @@
+build/
+# Compiler/linker output is produced by build.py, never committed.
+*.obj
+*.pdb
+*.exe
+__pycache__/

@@ -1,0 +1,12 @@
+{
+  "source": "example.cpp",
+  "link": "release",
+  "link_flags": ["/NODEFAULTLIB", "/ENTRY:main", "/SUBSYSTEM:CONSOLE"],
+  "pdb": "synthetic",
+  "engine": "c:\\proj\\",
+  "unit_object": "example.cpp.obj",
+  "report": { "kind": "functions" },
+  "variants": [
+    { "name": "synthetic-pdb", "delink_args": [] }
+  ]
+}
