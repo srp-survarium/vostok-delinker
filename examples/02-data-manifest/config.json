@@ -1,0 +1,19 @@
+{
+  "source": "table.cpp",
+  "link": "reloc",
+  "unit_object": "table.cpp.obj",
+  "report": { "kind": "data_symbol_size", "symbol": "kSquares", "expect_full": 256 },
+  "variants": [
+    { "name": "without-manifest", "delink_args": [] },
+    {
+      "name": "with-manifest",
+      "data_manifest": {
+        "symbol": "kSquares",
+        "size": 256,
+        "storage": "rdata",
+        "alignment": 4,
+        "scope": "external"
+      }
+    }
+  ]
+}

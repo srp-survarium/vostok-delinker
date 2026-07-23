@@ -1,0 +1,11 @@
+{
+  "source": "absref.cpp",
+  "link": "fixed",
+  "unit_object": "absref.cpp.obj",
+  "report": { "kind": "relocations", "function": "read_value" },
+  "variants": [
+    { "name": "no-recovery", "delink_args": [], "expect_error": true },
+    { "name": "rediscover-from-pdb", "delink_args": ["--rediscover-relocations-from-pdb"] },
+    { "name": "reloc-manifest", "reloc_manifest": { "target_symbol": "g_value" } }
+  ]
+}
