@@ -1,4 +1,5 @@
 use crate::Env;
+use crate::contribution_manifest::ContributionManifest;
 use crate::data_manifest::DataManifest;
 use crate::pdb_symbols::{self, FunctionRelocationField, PdbDataSymbol};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
@@ -247,6 +248,33 @@ pub(crate) fn classify_exact_pdb_target<'s>(
     }))
 }
 
+/// The nearest preceding symbol that the target's own compiland contributed.
+///
+/// Choosing the nearest preceding symbol is a guess about which definition a
+/// reference belongs to, and a publics-only PDB cannot bound it: without sizes,
+/// `PdbDataSymbol::contains` admits every later address, so one object's last
+/// symbol absorbs the data of every object after it. Contribution intervals
+/// bound it, because the linker laid each compiland down contiguously.
+///
+/// Without a manifest every candidate is admissible and this is exactly the
+/// nearest preceding symbol.
+fn closest_contributed<'a, T>(
+    symbols: &'a BTreeMap<usize, T>,
+    contributions: &ContributionManifest,
+    target_rva: usize,
+    constrained: &mut usize,
+) -> Option<(&'a usize, &'a T)> {
+    let nearest = symbols.range(..=target_rva).next_back();
+    let contributed = symbols
+        .range(..=target_rva)
+        .rev()
+        .find(|(symbol_rva, _)| contributions.same_owner(**symbol_rva, target_rva));
+    if contributed.map(|(rva, _)| rva) != nearest.map(|(rva, _)| rva) {
+        *constrained += 1;
+    }
+    contributed
+}
+
 #[repr(C)]
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
 struct RelocHeader {
@@ -372,6 +400,7 @@ pub fn resolve_absolute_relocations<'s>(
     exe: &'static object::read::pe::PeFile32<'static>,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    contributions: &ContributionManifest,
     reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
 ) -> anyhow::Result<ResolvedRelocations<'s>> {
@@ -383,6 +412,7 @@ pub fn resolve_absolute_relocations<'s>(
     let mut observed_aliases = RelocAliasObservations::default();
     let mut skipped_sized_constants = 0usize;
     let mut skipped_sized_statics = 0usize;
+    let mut constrained_by_contribution = 0usize;
 
     let mut pos = 0;
     while pos + HEADER_SIZE <= reloc_data.len() {
@@ -523,7 +553,12 @@ pub fn resolve_absolute_relocations<'s>(
                             );
                         }
                         (ManifestCoverage::AllowPartial, None) => {
-                            match symbols.strings.range(..=target_rva).next_back() {
+                            match closest_contributed(
+                                &symbols.strings,
+                                contributions,
+                                target_rva,
+                                &mut constrained_by_contribution,
+                            ) {
                                 Some((string_rva, (string_mangled_name, string)))
                                     if target_rva - string_rva < string.len() =>
                                 {
@@ -540,10 +575,16 @@ pub fn resolve_absolute_relocations<'s>(
                                 }
 
                                 Some(_) | None => {
-                                    let Some((constant_rva, constant)) =
-                                        symbols.constants.range(..=target_rva).next_back()
-                                    else {
-                                        unreachable!("All constants must be named");
+                                    let Some((constant_rva, constant)) = closest_contributed(
+                                        &symbols.constants,
+                                        contributions,
+                                        target_rva,
+                                        &mut constrained_by_contribution,
+                                    ) else {
+                                        anyhow::bail!(
+                                            "no .rdata symbol in the contribution owning RVA \
+                                             {target_rva:#x}"
+                                        );
                                     };
 
                                     if !constant.contains(*constant_rva, target_rva) {
@@ -607,9 +648,12 @@ pub fn resolve_absolute_relocations<'s>(
                             );
                         }
                         (ManifestCoverage::AllowPartial, None) => {
-                            let Some((static_rva, static_symbol)) =
-                                symbols.statics.range(..=target_rva).next_back()
-                            else {
+                            let Some((static_rva, static_symbol)) = closest_contributed(
+                                &symbols.statics,
+                                contributions,
+                                target_rva,
+                                &mut constrained_by_contribution,
+                            ) else {
                                 let _reloc_va = reloc_rva + env.image_base.to_usize();
                                 // @TODO: There is a "single" unnamed static relocation in base, which is a
                                 // string "rb\0" used for `fopen` in `ov_fopen`.
@@ -637,6 +681,13 @@ pub fn resolve_absolute_relocations<'s>(
                 () => (),
             }
         }
+    }
+
+    if constrained_by_contribution != 0 {
+        eprintln!(
+            "[relocs] contribution manifest moved {constrained_by_contribution} data references \
+             off the nearest preceding symbol"
+        );
     }
 
     if skipped_sized_constants != 0 || skipped_sized_statics != 0 {
@@ -681,6 +732,44 @@ fn map_pe_image(exe: &object::read::pe::PeFile32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CONTRIBUTIONS: &[u8] = b"object\tstorage\trva\tsize\tsegment\tsection\tprovenance\n\
+SOURCE\\ONE.c\tdata\t0x100\t0x20\t3\t.data\ttest\n\
+SOURCE\\TWO.c\tdata\t0x120\t0x20\t3\t.data\ttest\n";
+
+    #[test]
+    fn contributed_symbol_search_skips_other_compilands() {
+        let contributions = ContributionManifest::from_manifest_bytes(CONTRIBUTIONS);
+        let mut constrained = 0;
+
+        // TWO.c defines its own symbol, so nothing changes.
+        let symbols = BTreeMap::from([(0x100usize, "one"), (0x110, "one_tail"), (0x120, "two")]);
+        assert_eq!(
+            closest_contributed(&symbols, &contributions, 0x12f, &mut constrained)
+                .map(|(rva, _)| *rva),
+            Some(0x120)
+        );
+        assert_eq!(constrained, 0);
+
+        // With no symbol of its own, the reference is left unresolved rather
+        // than attributed to the trailing symbol of the previous object.
+        let symbols = BTreeMap::from([(0x100usize, "one"), (0x110, "one_tail")]);
+        assert!(closest_contributed(&symbols, &contributions, 0x12f, &mut constrained).is_none());
+        assert_eq!(constrained, 1);
+
+        // Without a manifest the nearest preceding symbol is admissible again.
+        assert_eq!(
+            closest_contributed(
+                &symbols,
+                &ContributionManifest::default(),
+                0x12f,
+                &mut constrained
+            )
+            .map(|(rva, _)| *rva),
+            Some(0x110)
+        );
+        assert_eq!(constrained, 1);
+    }
 
     fn section() -> RawSectionExtent {
         RawSectionExtent {
