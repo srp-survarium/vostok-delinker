@@ -349,3 +349,62 @@ The manifest neither invents sites nor names.
 Recovered external function references use the COFF derived-function type for
 both relative branches and absolute function pointers. Data references remain
 untyped COFF symbols.
+
+## Contribution manifest
+
+Nearest-symbol selection assumes the symbol before an address defines it. Where
+the PDB records data symbol sizes that assumption is bounded, but a publics-only
+or synthesized PDB often records none, and an unbounded symbol admits every
+address after it — including the data of every object that follows. A reference
+into one object's array is then delinked against the previous object's last
+symbol, which links but is not what the original object file said.
+
+The optional contribution manifest bounds it with the linked image's own layout.
+The linker emitted each compiland's contribution contiguously, so an address
+identifies the object that defined it, and a reference may only be expressed
+against a symbol that same object contributed:
+
+```sh
+cargo run --release -- \
+  --pdb-path build/game.pdb \
+  --exe-path build/game.exe \
+  --output-path build/delink \
+  --engine-path 'c:\project\sources' \
+  --contribution-manifest build/contributions.tsv
+```
+
+Its first non-comment line must be this exact header:
+
+```text
+object	storage	rva	size	segment	section	provenance
+```
+
+| Field | Meaning |
+| --- | --- |
+| `object` | UTF-8 relative output object path. `/` is normalized to `\`; absolute paths and `.` or `..` components are rejected. |
+| `storage` | `text`, `rdata`, `data`, or `bss`. |
+| `rva` | Contribution start relative to the PE image base, in decimal or `0x` hexadecimal notation. |
+| `size` | Contribution extent in bytes, in decimal or `0x` hexadecimal notation. |
+| `segment` | One-based linked segment number the contribution came from; it must fit a non-zero `u16`. |
+| `section` | Linked PE section name, which must agree with `storage`. `data` and `bss` both live in `.data`. |
+| `provenance` | Free-text record of where the row came from. |
+
+Example:
+
+```text
+object	storage	rva	size	segment	section	provenance
+SOURCE\TOWNMGR.c	rdata	0x000eb058	0x20	2	.rdata	debug-module-contributions
+SOURCE\TOWNMGR.c	bss	0x00120a40	0x180	3	.data	debug-module-contributions
+```
+
+Intervals must be non-empty, non-overflowing, and non-overlapping. A project may
+derive them from debug module contributions, a linker map, or any other reviewed
+evidence; Vostok does not generate the manifest.
+
+Storage is part of ownership, so a compiland's initialized `.data` and its `.bss`
+tail do not stand in for each other even though they share a PE section. An
+address no interval covers constrains nothing, which makes a partial manifest
+useful: rows may be added for the objects that have been reviewed without
+describing the whole image. When a constraint moves a reference off the nearest
+preceding symbol, Vostok reports how many references it moved; when no admissible
+symbol remains, the reference is left unresolved rather than misattributed.
