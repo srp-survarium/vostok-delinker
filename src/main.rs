@@ -214,6 +214,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         coff_data,
         by_rva: relocs_rva,
         mut observed_aliases,
+        source: base_relocation_source,
     } = relocs::resolve_absolute_relocations(
         &env,
         exe,
@@ -225,6 +226,23 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
     )?;
+    match base_relocation_source {
+        relocs::BaseRelocationSource::Directory { rva, size } => {
+            eprintln!(
+                "[relocs] using PE base relocation directory at RVA {rva:#x}, size {size:#x}"
+            );
+        }
+        relocs::BaseRelocationSource::Stripped => {
+            eprintln!(
+                "[relocs] PE base relocation directory is absent with RELOCS_STRIPPED; absolute sites come from the recovery inputs"
+            );
+        }
+        relocs::BaseRelocationSource::Absent => {
+            eprintln!(
+                "[relocs] PE base relocation directory is absent without RELOCS_STRIPPED; absolute sites come from the recovery inputs"
+            );
+        }
+    }
 
     // Base side reconciles its folded names against the target's recorded
     // choices; the target side (and a plain run) just emits local defaults.
