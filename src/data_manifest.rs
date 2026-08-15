@@ -355,6 +355,12 @@ impl DataManifest {
                 definition.name.as_bytes(),
             )
         })?;
+        // Ranking prefers a containing definition but does not require one, so a
+        // miss still returned the nearest enrolled datum with an unbounded addend
+        // (in either direction) and beat the exact-address PDB symbol below it.
+        if !(definition.rva <= rva && rva - definition.rva < definition.size) {
+            return None;
+        }
         Some((definition, (rva as u32).wrapping_sub(definition.rva as u32)))
     }
 }
