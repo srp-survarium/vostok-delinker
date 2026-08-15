@@ -425,14 +425,23 @@ impl ObjectFile {
                     size: section.size,
                 },
             );
+            // A COMDAT holds exactly the one symbol cl.exe put in it, so it can never
+            // be the container for a definition the manifest did not place: the
+            // appended bytes, and the alignment gap in front of them, are content the
+            // candidate COMDAT does not have. Only an ordinary section may serve as
+            // the fallback - when the manifest declares none of that storage,
+            // data_section()/rdata_section() create a fresh one lazily.
+            let ordinary = section.comdat_selection == 0;
             match section.storage {
-                Some(SectionStorage::Data) if data_section_id.is_none() => {
+                Some(SectionStorage::Data) if ordinary && data_section_id.is_none() => {
                     data_section_id = Some(id)
                 }
-                Some(SectionStorage::Rdata) if rdata_section_id.is_none() => {
+                Some(SectionStorage::Rdata) if ordinary && rdata_section_id.is_none() => {
                     rdata_section_id = Some(id)
                 }
-                Some(SectionStorage::Bss) if bss_section_id.is_none() => bss_section_id = Some(id),
+                Some(SectionStorage::Bss) if ordinary && bss_section_id.is_none() => {
+                    bss_section_id = Some(id)
+                }
                 None if section.name == b".text" && text_section_id.is_none() => {
                     text_section_id = Some(id)
                 }
