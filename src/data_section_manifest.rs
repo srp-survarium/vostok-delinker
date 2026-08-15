@@ -161,21 +161,29 @@ impl DataSectionManifest {
                 );
             }
             if let Some(storage) = storage {
+                // COFF grouped sections: `.rdata$r` is a `.rdata` contribution whose
+                // suffix is only the linker's ordering key, so compare the GROUP. cl
+                // emits every RTTI record that way (`??_R1`..`??_R4` in `.rdata$r`),
+                // and a candidate section manifest states cl's own section shape.
+                let group = match name.iter().position(|byte| *byte == b'$') {
+                    Some(index) => &name[..index],
+                    None => name,
+                };
                 let (name_matches, required, forbidden) = match storage {
                     SectionStorage::Data => (
-                        name == b".data" || name.starts_with(b".CRT$"),
+                        group == b".data" || group == b".CRT",
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA,
                     ),
                     SectionStorage::Rdata => (
-                        name == b".rdata",
+                        group == b".rdata",
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                     ),
                     SectionStorage::Bss => (
-                        name == b".bss",
+                        group == b".bss",
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
