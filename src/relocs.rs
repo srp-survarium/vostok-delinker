@@ -57,6 +57,15 @@ const HEADER_SIZE: usize = std::mem::size_of::<RelocHeader>();
 
 const DATA_ALIAS_PREFIX: &[u8] = b"__homm2_data_alias$";
 
+// The PDB synthesizer seeds a FENCE symbol at every relocation target no real
+// name reaches, spelled by its referencing-band split: `DAT_<va>` marks
+// library-internal data deliberately left synthetic (emitted as-is), while
+// `UNPROVISIONED_<va>` marks a game-referenced identity that MUST be provided.
+// The fence exists so nearest-symbol recovery can never silently misattribute
+// the address to a neighboring datum; EMITTING an `UNPROVISIONED_` one would
+// invent an identity, so fail instead and demand provisioning.
+const UNPROVISIONED_DATA_PREFIX: &[u8] = b"UNPROVISIONED_";
+
 /// The linker's incremental-link thunk table (ILT).
 ///
 /// `link.exe /INCREMENTAL` emits, at the very start of `.text`, a contiguous
@@ -232,6 +241,19 @@ fn resolve_manifest_alias(
         anyhow::bail!("relocation alias owner/addend does not resolve to target");
     }
     Ok(Some((alias.addend, *owner, *owner_rva)))
+}
+
+/// Refuse to emit an `UNPROVISIONED_` fence as a relocation referent: the
+/// synthesizer marked this game-referenced identity as missing, and naming
+/// the fence in a COFF relocation would invent an identity. `DAT_` fences
+/// (library-internal, deliberately synthetic) pass through unchanged.
+fn refuse_unprovisioned(reloc_name: RawString<'_>, target_rva: usize) -> anyhow::Result<()> {
+    if reloc_name.as_bytes().starts_with(UNPROVISIONED_DATA_PREFIX) {
+        anyhow::bail!(
+            "data relocation target {target_rva:#x} resolves only to the fence {reloc_name} - the identity is not provided (claim it, or add its exact spelling to the reloc-alias manifest)"
+        );
+    }
+    Ok(())
 }
 
 fn closest_data_symbol<'a>(
@@ -514,6 +536,7 @@ pub fn resolve_absolute_relocations<'s>(
                                     (u32::try_from(target_rva - *constant_rva)?, *constant_name)
                                 }
                             };
+                            refuse_unprovisioned(reloc_name, target_rva)?;
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                             relocs_rva.insert(
@@ -635,10 +658,12 @@ pub fn resolve_absolute_relocations<'s>(
                     let Some((static_rva, static_name)) =
                         closest_data_symbol(&symbols.statics, target_rva, storage, contributions)
                     else {
-                        let _reloc_va = reloc_rva + env.image_base.to_usize();
-                        // @TODO: There is a "single" unnamed static relocation in base, which is a
-                        // string "rb\0" used for `fopen` in `ov_fopen`.
-                        continue;
+                        // A `continue` here would silently DROP the relocation
+                        // from the emitted object; refuse instead, exactly as
+                        // an unprovided fence is refused.
+                        anyhow::bail!(
+                            "writable relocation target {target_rva:#x} (site {reloc_rva:#x}) has no data symbol in its contribution - the identity is not provided (claim it, or add its exact spelling to the reloc-alias manifest)"
+                        );
                     };
 
                     let (diff, reloc_name) = match resolve_data_alias(
@@ -652,6 +677,7 @@ pub fn resolve_absolute_relocations<'s>(
                         Some((addend, owner)) => (addend, owner),
                         None => (u32::try_from(target_rva - *static_rva)?, *static_name),
                     };
+                    refuse_unprovisioned(reloc_name, target_rva)?;
                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
                     relocs_rva.insert(
@@ -715,6 +741,19 @@ mod tests {
         assert_eq!(classify(0x217), Some(ContributionStorage::Data));
         assert_eq!(classify(0x218), Some(ContributionStorage::Bss));
         assert_eq!(classify(0x240), None);
+    }
+
+    #[test]
+    fn unprovisioned_fence_is_refused_but_synthetic_and_real_names_pass() {
+        let fence: RawString<'static> = b"UNPROVISIONED_00653c34".as_slice().into();
+        let err = refuse_unprovisioned(fence, 0x253c34).unwrap_err().to_string();
+        assert!(err.contains("0x253c34"), "{err}");
+        assert!(err.contains("UNPROVISIONED_00653c34"), "{err}");
+
+        let synthetic: RawString<'static> = b"DAT_005f0af0".as_slice().into();
+        assert!(refuse_unprovisioned(synthetic, 0x1f0af0).is_ok());
+        let real: RawString<'static> = b"?g_cmdBitTable@@3PBGB".as_slice().into();
+        assert!(refuse_unprovisioned(real, 0x1e9608).is_ok());
     }
 
     #[test]
