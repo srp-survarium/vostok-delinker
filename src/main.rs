@@ -28,8 +28,17 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub output_path: std::path::PathBuf,
 
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub engine_path: String,
+    /// Source-tree prefix to strip from PDB file paths. REPEATABLE: a build can
+    /// draw compilands from more than one tree - the engine's own `sources/`, and
+    /// the Scaleform GFx SDK, which sits outside it (the retail PDB records it as
+    /// `C:\w\<hash>\Scaleform\Releases\GFx_4.2.21\`, ours as the local SDK
+    /// checkout). With a single prefix, every compiland from the other tree was
+    /// silently dropped on BOTH sides, so ~1.3k GFx sources produced no records
+    /// and their functions could never pair. Prefixes are tried in order; the
+    /// first that matches wins, and what remains is the recorded path - so give
+    /// each tree the prefix that leaves the SAME relative path on both sides.
+    #[arg(long, value_hint = clap::ValueHint::FilePath, required = true)]
+    pub engine_path: Vec<String>,
 
     /// Pad each empty object's `.rdata` with 4 bytes. objdiff treats two
     /// allocations as matching when their name OR their offset into the reloc
@@ -120,10 +129,16 @@ fn main() -> anyhow::Result<()> {
     let pdb = std::io::Cursor::new(pdb);
     let pdb = pdb2::PDB::open(pdb)?;
 
-    let mut engine_path = engine_path.to_lowercase().replace('/', "\\");
-    if !engine_path.ends_with('\\') {
-        engine_path.push('\\');
-    }
+    let engine_paths: Vec<Vec<u8>> = engine_path
+        .iter()
+        .map(|path| {
+            let mut path = path.to_lowercase().replace('/', "\\");
+            if !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path.into_bytes()
+        })
+        .collect();
     let manifest_coverage = if strict {
         relocs::ManifestCoverage::RequireComplete
     } else {
@@ -133,7 +148,7 @@ fn main() -> anyhow::Result<()> {
     process_executable(
         exe,
         pdb,
-        engine_path.as_bytes(),
+        &engine_paths,
         pad_empty_rdata,
         output_path.as_path(),
         write_symbol_map.as_deref(),
@@ -151,7 +166,7 @@ fn main() -> anyhow::Result<()> {
 fn process_executable<S: pdb2::Source<'static> + 'static>(
     exe: &'static object::read::pe::PeFile32<'static>,
     mut pdb: pdb2::PDB<'static, S>,
-    engine_path: &[u8],
+    engine_paths: &[Vec<u8>],
     pad_empty_rdata: bool,
     output_path: &std::path::Path,
     write_symbol_map: Option<&std::path::Path>,
@@ -198,7 +213,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &pdb_symbols,
         &coff_data,
         relocs_rva,
-        engine_path,
+        engine_paths,
         pad_empty_rdata,
         &matcher,
         &data_manifest,
