@@ -1,6 +1,7 @@
 use crate::Env;
 use crate::data_manifest::DataManifest;
 use crate::pdb_symbols;
+use crate::reloc_alias_manifest::RelocAliasManifest;
 use crate::reloc_manifest::RelocManifest;
 use crate::utils::ToUsize;
 
@@ -56,6 +57,44 @@ pub enum ManifestCoverage {
     RequireComplete,
 }
 
+fn resolve_manifest_alias(
+    aliases: &RelocAliasManifest,
+    symbols: &BTreeMap<usize, RawString<'static>>,
+    functions: &BTreeMap<usize, Vec<RawString<'static>>>,
+    observed: &mut BTreeMap<(usize, usize), usize>,
+    reloc_rva: usize,
+    target_rva: usize,
+) -> anyhow::Result<Option<(u32, RawString<'static>)>> {
+    let Some((function_rva, _)) = functions.range(..=reloc_rva).next_back() else {
+        return Ok(None);
+    };
+    let Some(alias) = aliases.get(*function_rva, target_rva) else {
+        return Ok(None);
+    };
+
+    let mut owners = symbols
+        .iter()
+        .filter(|(_, symbol_name)| **symbol_name == alias.owner);
+    let Some((owner_rva, _)) = owners.next() else {
+        anyhow::bail!(
+            "relocation alias owner is absent from the PDB: {}",
+            alias.owner
+        );
+    };
+    if owners.next().is_some() {
+        anyhow::bail!(
+            "relocation alias owner is ambiguous in the PDB: {}",
+            alias.owner
+        );
+    }
+    if (*owner_rva as u32).wrapping_add(alias.addend) != target_rva as u32 {
+        anyhow::bail!("relocation alias owner/addend does not resolve to target");
+    }
+
+    *observed.entry((*function_rva, target_rva)).or_default() += 1;
+    Ok(Some((alias.addend, alias.owner)))
+}
+
 #[repr(C)]
 #[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
 struct RelocHeader {
@@ -75,6 +114,7 @@ pub fn resolve_absolute_relocations<'s>(
     exe: &'static object::read::pe::PeFile32<'static>,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
     reloc_manifest: Option<&RelocManifest>,
     rediscover_from_pdb: bool,
@@ -83,6 +123,7 @@ pub fn resolve_absolute_relocations<'s>(
     let exe_data = map_pe_image(exe);
     let mut coff_data = exe_data.clone();
     let mut relocs_rva = BTreeMap::<usize, RelocKind>::new();
+    let mut observed_aliases = BTreeMap::<(usize, usize), usize>::new();
 
     // Absolute sites come from the `.reloc` directory, or -- for a stripped image
     // that has none -- from a reviewed reloc manifest and/or PDB rediscovery. A
@@ -96,10 +137,12 @@ pub fn resolve_absolute_relocations<'s>(
                 env,
                 symbols,
                 data_manifest,
+                reloc_aliases,
                 manifest_coverage,
                 &exe_data,
                 &mut coff_data,
                 &mut relocs_rva,
+                &mut observed_aliases,
             )?;
         }
         (None, true) => {
@@ -110,10 +153,12 @@ pub fn resolve_absolute_relocations<'s>(
                     env,
                     symbols,
                     data_manifest,
+                    reloc_aliases,
                     manifest_coverage,
                     &exe_data,
                     &mut coff_data,
                     &mut relocs_rva,
+                    &mut observed_aliases,
                 )?;
             }
             if rediscover_from_pdb {
@@ -121,10 +166,12 @@ pub fn resolve_absolute_relocations<'s>(
                     env,
                     symbols,
                     data_manifest,
+                    reloc_aliases,
                     manifest_coverage,
                     &exe_data,
                     &mut coff_data,
                     &mut relocs_rva,
+                    &mut observed_aliases,
                     rediscovery_interior_bound,
                 )?;
             }
@@ -140,6 +187,7 @@ pub fn resolve_absolute_relocations<'s>(
         ),
     };
 
+    reloc_aliases.validate_occurrences(&observed_aliases)?;
     Ok((coff_data, relocs_rva))
 }
 
@@ -150,10 +198,12 @@ fn resolve_reloc_directory<'s>(
     env: &Env,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
 ) -> anyhow::Result<()> {
     let mut pos = 0;
     while pos + HEADER_SIZE <= reloc_data.len() {
@@ -178,10 +228,12 @@ fn resolve_reloc_directory<'s>(
                 env,
                 symbols,
                 data_manifest,
+                reloc_aliases,
                 manifest_coverage,
                 exe_data,
                 coff_data,
                 relocs_rva,
+                observed_aliases,
                 reloc_rva,
             )?;
         }
@@ -196,10 +248,12 @@ fn resolve_manifest_sites<'s>(
     env: &Env,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
 ) -> anyhow::Result<()> {
     for &site in reloc_manifest.sites() {
         if site + 4 > exe_data.len() {
@@ -209,10 +263,12 @@ fn resolve_manifest_sites<'s>(
             env,
             symbols,
             data_manifest,
+            reloc_aliases,
             manifest_coverage,
             exe_data,
             coff_data,
             relocs_rva,
+            observed_aliases,
             site,
         )?;
     }
@@ -227,10 +283,12 @@ fn rediscover_absolute_sites_from_pdb<'s>(
     env: &Env,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
     interior_bound: usize,
 ) -> anyhow::Result<()> {
     let image_base = env.image_base.to_usize();
@@ -262,10 +320,12 @@ fn rediscover_absolute_sites_from_pdb<'s>(
                     env,
                     symbols,
                     data_manifest,
+                    reloc_aliases,
                     manifest_coverage,
                     exe_data,
                     coff_data,
                     relocs_rva,
+                    observed_aliases,
                     site,
                 )?;
             }
@@ -283,10 +343,12 @@ fn resolve_absolute_site<'s>(
     env: &Env,
     symbols: &'s pdb_symbols::PdbSymbols,
     data_manifest: &DataManifest,
+    reloc_aliases: &RelocAliasManifest,
     manifest_coverage: ManifestCoverage,
     exe_data: &[u8],
     coff_data: &mut [u8],
     relocs_rva: &mut BTreeMap<usize, RelocKind<'s>>,
+    observed_aliases: &mut BTreeMap<(usize, usize), usize>,
     reloc_rva: usize,
 ) -> anyhow::Result<()> {
     let target_va = bytemuck::pod_read_unaligned::<u32>(&exe_data[reloc_rva..reloc_rva + 4]);
@@ -314,6 +376,26 @@ fn resolve_absolute_site<'s>(
             );
         }
         () if (env.rdata.rva..env.rdata.rva + env.rdata.size).contains(&target_rva) => {
+            if (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
+                && let Some((addend, owner)) = resolve_manifest_alias(
+                    reloc_aliases,
+                    &symbols.constants,
+                    &symbols.functions,
+                    observed_aliases,
+                    reloc_rva,
+                    target_rva,
+                )?
+            {
+                coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                relocs_rva.insert(
+                    reloc_rva,
+                    RelocKind::ConjuredConstant {
+                        symbol: owner,
+                        target_rva,
+                    },
+                );
+                return Ok(());
+            }
             let owner = data_manifest.owner_and_addend_for_rva(target_rva);
             match (manifest_coverage, owner) {
                 (_, Some((owner, addend))) => {
@@ -375,6 +457,26 @@ fn resolve_absolute_site<'s>(
             }
         }
         () if (env.data.rva..env.data.rva + env.data.size).contains(&target_rva) => {
+            if (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
+                && let Some((addend, owner)) = resolve_manifest_alias(
+                    reloc_aliases,
+                    &symbols.statics,
+                    &symbols.functions,
+                    observed_aliases,
+                    reloc_rva,
+                    target_rva,
+                )?
+            {
+                coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
+                relocs_rva.insert(
+                    reloc_rva,
+                    RelocKind::ConjuredStatic {
+                        symbol: owner,
+                        target_rva,
+                    },
+                );
+                return Ok(());
+            }
             let owner = data_manifest.owner_and_addend_for_rva(target_rva);
             match (manifest_coverage, owner) {
                 (_, Some((owner, addend))) => {

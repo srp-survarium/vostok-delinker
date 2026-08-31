@@ -4,6 +4,7 @@ mod data_manifest;
 mod data_section_manifest;
 mod object_files;
 mod pdb_symbols;
+mod reloc_alias_manifest;
 mod reloc_manifest;
 mod relocs;
 mod symbol_matcher;
@@ -59,6 +60,11 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_section_manifest: Option<std::path::PathBuf>,
 
+    /// Reviewed function/target pairs whose retained absolute relocations use
+    /// a specific existing PDB owner symbol and addend.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub reloc_alias_manifest: Option<std::path::PathBuf>,
+
     /// Require every PE base relocation targeting `.data` or `.rdata` to
     /// resolve to a definition in `--data-manifest`.
     #[arg(long, requires = "data_manifest")]
@@ -112,6 +118,7 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map,
         data_manifest,
         data_section_manifest,
+        reloc_alias_manifest,
         strict,
         reloc_manifest,
         rediscover_relocations_from_pdb,
@@ -146,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
         data_section_manifest.as_deref(),
+        reloc_alias_manifest.as_deref(),
         manifest_coverage,
         reloc_manifest.as_deref(),
         rediscover_relocations_from_pdb,
@@ -165,6 +173,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
     data_section_manifest_path: Option<&std::path::Path>,
+    reloc_alias_manifest_path: Option<&std::path::Path>,
     manifest_coverage: relocs::ManifestCoverage,
     reloc_manifest_path: Option<&std::path::Path>,
     rediscover_relocations_from_pdb: bool,
@@ -177,11 +186,14 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     let reloc_manifest = reloc_manifest::RelocManifest::load(reloc_manifest_path)?;
     let data_section_manifest =
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
+    let reloc_alias_manifest =
+        reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
     let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
         &env,
         exe,
         &pdb_symbols,
         &data_manifest,
+        &reloc_alias_manifest,
         manifest_coverage,
         reloc_manifest.as_ref(),
         rediscover_relocations_from_pdb,
