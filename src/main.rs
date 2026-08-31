@@ -65,8 +65,8 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub reloc_alias_manifest: Option<std::path::PathBuf>,
 
-    /// Require every PE base relocation targeting `.data` or `.rdata` to
-    /// resolve to a definition in `--data-manifest`.
+    /// Require every retained or recovered absolute relocation targeting
+    /// `.data` or `.rdata` to resolve to a definition in `--data-manifest`.
     #[arg(long, requires = "data_manifest")]
     pub strict: bool,
 
@@ -226,6 +226,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
     )?;
+    let code_relocation_recovery = base_relocation_source.code_relocation_recovery();
     match base_relocation_source {
         relocs::BaseRelocationSource::Directory { rva, size } => {
             eprintln!(
@@ -234,7 +235,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         }
         relocs::BaseRelocationSource::Stripped => {
             eprintln!(
-                "[relocs] PE base relocation directory is absent with RELOCS_STRIPPED; absolute sites come from the recovery inputs"
+                "[relocs] PE base relocation directory is absent with RELOCS_STRIPPED; recovering exact PDB instruction-operand relocations"
             );
         }
         relocs::BaseRelocationSource::Absent => {
@@ -271,6 +272,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &data_section_manifest,
         &reloc_alias_manifest,
         &mut observed_aliases,
+        manifest_coverage,
+        code_relocation_recovery,
     )?;
     reloc_alias_manifest.validate_occurrences(&observed_aliases)?;
     object_files.write(output_path)?;
