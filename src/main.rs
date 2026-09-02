@@ -1,6 +1,7 @@
 #![feature(os_string_truncate)]
 
 mod contribution_manifest;
+mod data_index;
 mod data_manifest;
 mod data_section_manifest;
 mod object_files;
@@ -27,11 +28,15 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub exe_path: std::path::PathBuf,
 
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub output_path: std::path::PathBuf,
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        required_unless_present = "write_data_index"
+    )]
+    pub output_path: Option<std::path::PathBuf>,
 
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub engine_path: String,
+    pub engine_path: Vec<String>,
 
     /// Pad each empty object's `.rdata` with 4 bytes. objdiff treats two
     /// allocations as matching when their name OR their offset into the reloc
@@ -84,6 +89,11 @@ pub struct Cli {
     /// alias is retained.
     #[arg(long)]
     pub coalesce_common_functions: bool,
+
+    /// Export PDB-backed data identities and type-derived extents, then exit
+    /// without producing delinked objects.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub write_data_index: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -119,6 +129,7 @@ fn main() -> anyhow::Result<()> {
         unresolved_data_manifest,
         recover_data_relocs_from_pdb,
         coalesce_common_functions,
+        write_data_index,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -129,17 +140,23 @@ fn main() -> anyhow::Result<()> {
     let pdb = std::io::Cursor::new(pdb);
     let pdb = pdb2::PDB::open(pdb)?;
 
-    let mut engine_path = engine_path.to_lowercase().replace('/', "\\");
-    if !engine_path.ends_with('\\') {
-        engine_path.push('\\');
-    }
+    let engine_paths = engine_path
+        .into_iter()
+        .map(|path| {
+            let mut path = path.to_lowercase().replace('/', "\\");
+            if !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path.into_bytes()
+        })
+        .collect::<Vec<_>>();
 
     process_executable(
         exe,
         pdb,
-        engine_path.as_bytes(),
+        &engine_paths,
         pad_empty_rdata,
-        output_path.as_path(),
+        output_path.as_deref(),
         write_symbol_map.as_deref(),
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
@@ -149,6 +166,7 @@ fn main() -> anyhow::Result<()> {
         unresolved_data_manifest.as_deref(),
         recover_data_relocs_from_pdb,
         coalesce_common_functions,
+        write_data_index.as_deref(),
     )?;
 
     Ok(())
@@ -157,9 +175,9 @@ fn main() -> anyhow::Result<()> {
 fn process_executable<S: pdb2::Source<'static> + 'static>(
     exe: &'static object::read::pe::PeFile32<'static>,
     mut pdb: pdb2::PDB<'static, S>,
-    engine_path: &[u8],
+    engine_paths: &[Vec<u8>],
     pad_empty_rdata: bool,
-    output_path: &std::path::Path,
+    output_path: Option<&std::path::Path>,
     write_symbol_map: Option<&std::path::Path>,
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
@@ -169,10 +187,18 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     unresolved_data_manifest_path: Option<&std::path::Path>,
     recover_data_relocs_from_pdb: bool,
     coalesce_common_functions: bool,
+    write_data_index: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb, coalesce_common_functions)?;
+    if let Some(path) = write_data_index {
+        data_index::write(&env, &mut pdb, path)?;
+        return Ok(());
+    }
+    let output_path = output_path.ok_or_else(|| {
+        anyhow::anyhow!("--output-path is required unless --write-data-index is used")
+    })?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path)?;
     let data_section_manifest =
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
@@ -218,7 +244,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &pdb_symbols,
         &coff_data,
         relocs_rva,
-        engine_path,
+        engine_paths,
         pad_empty_rdata,
         &matcher,
         &data_manifest,
@@ -302,14 +328,17 @@ impl Env<'_> {
         let Some(data_sec) = exe.section_by_name(".data") else {
             anyhow::bail!("Missing .data section");
         };
-        let Some(idata_sec) = exe.section_by_name(".idata") else {
-            anyhow::bail!("Missing .idata section");
-        };
-
         let text = build_sec_info(text_sec)?;
         let rdata = build_sec_info(rdata_sec)?;
         let data = build_sec_info(data_sec)?;
-        let idata = build_sec_info(idata_sec)?;
+        // MSVC's non-incremental Vostok link merges the IAT into `.rdata` and
+        // therefore has no standalone `.idata` PE section. PDB offsets then
+        // identify those slots as `.rdata`; an empty sentinel keeps the
+        // dedicated-section checks inactive without changing their meaning.
+        let idata = match exe.section_by_name(".idata") {
+            Some(section) => build_sec_info(section)?,
+            None => SecInfo::default(),
+        };
 
         Ok(Self {
             image_base,
