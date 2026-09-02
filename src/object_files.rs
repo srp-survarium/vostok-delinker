@@ -65,7 +65,7 @@ impl ObjectFiles<'_> {
         coff_data: &[u8],
         mut relocs_rva: BTreeMap<usize, RelocKind<'s>>,
 
-        engine_path: &[u8],
+        engine_paths: &[Vec<u8>],
         pad_empty_rdata: bool,
         matcher: &SymbolMatcher,
         data_manifest: &DataManifest,
@@ -179,7 +179,7 @@ impl ObjectFiles<'_> {
                     env.string_table,
                     fun_name,
                     fun_offset,
-                    engine_path,
+                    engine_paths,
                 )?
                 else {
                     continue;
@@ -481,7 +481,7 @@ fn get_function_location(
     fun_name: RawString<'static>,
     fun_offset: pdb2::PdbInternalSectionOffset,
 
-    engine_path: &[u8],
+    engine_paths: &[Vec<u8>],
 ) -> anyhow::Result<Option<&'static [u8]>> {
     let mut filename = None;
 
@@ -493,10 +493,16 @@ fn get_function_location(
     }
 
     let location: &'static [u8] = match filename {
-        Some(filename) => match filename.as_bytes().strip_prefix(engine_path) {
-            Some(filename) => filename,
-            None => return Ok(None),
-        },
+        Some(filename) => {
+            let bytes = filename.as_bytes();
+            match engine_paths
+                .iter()
+                .find_map(|prefix| bytes.strip_prefix(prefix.as_slice()))
+            {
+                Some(filename) => filename,
+                None => return Ok(None),
+            }
+        }
         None => match fun_name.as_bytes() {
             name if !contains(name, b"::") && !name.contains(&b' ') => b"_msvc_internal\\c_lang",
             name => {
