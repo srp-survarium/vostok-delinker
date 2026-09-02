@@ -1,6 +1,6 @@
 use pdb2::{FallibleIterator, RawString};
 
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 use crate::Env;
 use crate::utils::{ToUsize, leak};
@@ -8,6 +8,9 @@ use crate::utils::{ToUsize, leak};
 #[derive(Default)]
 pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
+    pub function_sizes: BTreeMap<usize, usize>,
+    pub symbol_starts: BTreeSet<usize>,
+    pub modules: Vec<(String, String)>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
     pub constants: BTreeMap<usize, RawString<'static>>,
@@ -61,6 +64,7 @@ impl PdbSymbols {
                 _ => continue,
             };
 
+            self.symbol_starts.insert(symbol_rva);
             match symbol {
                 // @NOTE: There are more symbols in `.text`, which are not functions.
                 // Seem to be useless though:
@@ -157,6 +161,10 @@ impl PdbSymbols {
         let mut modules = env.dbi.modules()?;
 
         while let Some(module) = modules.next()? {
+            self.modules.push((
+                module.module_name().into_owned(),
+                module.object_file_name().into_owned(),
+            ));
             let Some(module_info) = pdb.module_info(&module)? else {
                 continue;
             };
@@ -198,6 +206,7 @@ impl PdbSymbols {
                             _ => continue,
                         };
 
+                        self.symbol_starts.insert(symbol_rva);
                         match () {
                             () if offset.section == env.rdata.id => {
                                 let _old_symbol = self.constants.insert(symbol_rva, name);
@@ -213,6 +222,13 @@ impl PdbSymbols {
                             }
                             _ => continue,
                         };
+                    }
+
+                    Ok(pdb2::SymbolData::Label(pdb2::LabelSymbol { offset, .. })) => {
+                        if offset.section == env.text.id {
+                            self.symbol_starts
+                                .insert(env.text.rva + offset.offset.to_usize());
+                        }
                     }
 
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })) => {
@@ -241,6 +257,11 @@ impl PdbSymbols {
         let fun_offset_in_text = offset.offset.to_usize();
         let fun_body = &env.text.data[fun_offset_in_text..fun_offset_in_text + size.to_usize()];
 
+        self.function_sizes
+            .entry(symbol_rva)
+            .and_modify(|existing| *existing = (*existing).max(size.to_usize()))
+            .or_insert(size.to_usize());
+        self.symbol_starts.insert(symbol_rva);
         self.add_function_at_rva(symbol_rva, name, fun_body, coalesce_common_functions);
     }
 

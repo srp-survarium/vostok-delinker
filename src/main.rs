@@ -6,6 +6,7 @@ mod data_manifest;
 mod data_section_manifest;
 mod object_files;
 mod pdb_symbols;
+mod missing_data_index;
 mod reloc_alias_manifest;
 mod relocs;
 mod symbol_matcher;
@@ -31,7 +32,7 @@ pub struct Cli {
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
-        required_unless_present = "write_data_index"
+        required_unless_present_any = ["write_data_index", "write_missing_data_index"]
     )]
     pub output_path: Option<std::path::PathBuf>,
 
@@ -94,6 +95,11 @@ pub struct Cli {
     /// without producing delinked objects.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub write_data_index: Option<std::path::PathBuf>,
+
+    /// Export only PE HIGHLOW referents the PDB cannot name or contain,
+    /// then exit without producing delinked objects.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub write_missing_data_index: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -130,6 +136,7 @@ fn main() -> anyhow::Result<()> {
         recover_data_relocs_from_pdb,
         coalesce_common_functions,
         write_data_index,
+        write_missing_data_index,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -167,6 +174,7 @@ fn main() -> anyhow::Result<()> {
         recover_data_relocs_from_pdb,
         coalesce_common_functions,
         write_data_index.as_deref(),
+        write_missing_data_index.as_deref(),
     )?;
 
     Ok(())
@@ -188,6 +196,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     recover_data_relocs_from_pdb: bool,
     coalesce_common_functions: bool,
     write_data_index: Option<&std::path::Path>,
+    write_missing_data_index: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let env = Env::build(exe, &mut pdb)?;
 
@@ -196,8 +205,12 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         data_index::write(&env, &mut pdb, path)?;
         return Ok(());
     }
+    if let Some(path) = write_missing_data_index {
+        missing_data_index::write(&env, exe, &pdb_symbols, path)?;
+        return Ok(());
+    }
     let output_path = output_path.ok_or_else(|| {
-        anyhow::anyhow!("--output-path is required unless --write-data-index is used")
+        anyhow::anyhow!("--output-path is required unless an index-export mode is used")
     })?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path)?;
     let data_section_manifest =
