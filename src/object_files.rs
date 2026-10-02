@@ -1,7 +1,8 @@
 use crate::Env;
 use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
 use crate::data_section_manifest::{
-    ComdatSelection, DataSection, DataSectionManifest, SectionStorage, SectionTopology,
+    ComdatSelection, DataSection, DataSectionManifest, SectionChecksums, SectionStorage,
+    SectionTopology,
 };
 use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
@@ -23,6 +24,7 @@ use object::{SectionFlags, SectionKind};
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
+    section_checksums: SectionChecksums,
 }
 
 pub struct ObjectFile {
@@ -110,6 +112,7 @@ impl ObjectFiles<'_> {
         let topology = data_section_manifest.topology();
         let mut this = Self {
             objects: HashMap::new(),
+            section_checksums: data_section_manifest.checksums(),
         };
         let empty_object = || ObjectFile::empty_with_topology(pad_empty_rdata, topology);
 
@@ -283,7 +286,17 @@ impl ObjectFiles<'_> {
 
             std::fs::create_dir_all(path.parent().unwrap())?;
             let mut bytes = object_file.object.write()?;
-            apply_reviewed_section_checksums(&mut bytes, &object_file.reviewed_section_checksums)?;
+            match self.section_checksums {
+                SectionChecksums::Reviewed => {
+                    apply_reviewed_section_checksums(
+                        &mut bytes,
+                        &object_file.reviewed_section_checksums,
+                    )?;
+                }
+                SectionChecksums::Zero => {
+                    zero_section_checksums(&mut bytes)?;
+                }
+            }
             std::fs::write(&path, bytes)?;
         }
         Ok(())
@@ -1383,10 +1396,14 @@ fn append_with_padding(
     offset
 }
 
-fn apply_reviewed_section_checksums(
-    bytes: &mut [u8],
-    reviewed: &[([u8; 8], u32)],
-) -> anyhow::Result<usize> {
+/// The checksum field of one section-definition auxiliary record.
+struct SectionChecksumField {
+    section_number: usize,
+    section_name: [u8; 8],
+    offset: usize,
+}
+
+fn section_checksum_fields(bytes: &[u8]) -> anyhow::Result<Vec<SectionChecksumField>> {
     use object::endian::LittleEndian;
     use object::read::SectionIndex;
 
@@ -1395,13 +1412,11 @@ fn apply_reviewed_section_checksums(
     let sections = coff.coff_section_table();
     let symbols = coff.coff_symbol_table();
     let checksum_in_aux = std::mem::offset_of!(object::pe::ImageAuxSymbolSection, check_sum);
-    let mut seen = vec![false; reviewed.len()];
-    let mut writes = Vec::with_capacity(reviewed.len());
+    let mut fields = Vec::new();
 
     for (index, symbol) in symbols.iter() {
         let section_number = symbol.section_number.get(LittleEndian) as usize;
-        if section_number > reviewed.len()
-            || symbol.storage_class != object::pe::IMAGE_SYM_CLASS_STATIC
+        if symbol.storage_class != object::pe::IMAGE_SYM_CLASS_STATIC
             || symbol.number_of_aux_symbols != 1
             || symbol.value.get(LittleEndian) != 0
             || symbol.typ.get(LittleEndian) != object::pe::IMAGE_SYM_TYPE_NULL
@@ -1413,13 +1428,6 @@ fn apply_reviewed_section_checksums(
         let section = sections.section(SectionIndex(section_number))?;
         if symbol.name != section.name {
             continue;
-        }
-        let (expected_name, checksum) = reviewed[section_number - 1];
-        if section.name != expected_name {
-            anyhow::bail!("reviewed section checksum order/name mismatch");
-        }
-        if std::mem::replace(&mut seen[section_number - 1], true) {
-            anyhow::bail!("duplicate COFF section-definition symbol");
         }
         symbols.aux_section(index)?;
         let offset = symbol_table_offset
@@ -1433,7 +1441,33 @@ fn apply_reviewed_section_checksums(
         bytes
             .get(offset..offset + std::mem::size_of::<u32>())
             .ok_or_else(|| anyhow::anyhow!("COFF section checksum is outside the symbol table"))?;
-        writes.push((offset, checksum));
+        fields.push(SectionChecksumField {
+            section_number,
+            section_name: section.name,
+            offset,
+        });
+    }
+    Ok(fields)
+}
+
+fn apply_reviewed_section_checksums(
+    bytes: &mut [u8],
+    reviewed: &[([u8; 8], u32)],
+) -> anyhow::Result<usize> {
+    let mut seen = vec![false; reviewed.len()];
+    let mut writes = Vec::with_capacity(reviewed.len());
+    for field in section_checksum_fields(bytes)? {
+        if field.section_number > reviewed.len() {
+            continue;
+        }
+        let (expected_name, checksum) = reviewed[field.section_number - 1];
+        if field.section_name != expected_name {
+            anyhow::bail!("reviewed section checksum order/name mismatch");
+        }
+        if std::mem::replace(&mut seen[field.section_number - 1], true) {
+            anyhow::bail!("duplicate COFF section-definition symbol");
+        }
+        writes.push((field.offset, checksum));
     }
     if seen.iter().any(|seen| !seen) {
         anyhow::bail!("reviewed COFF section has no section-definition symbol");
@@ -1442,6 +1476,14 @@ fn apply_reviewed_section_checksums(
         bytes[offset..offset + std::mem::size_of::<u32>()].copy_from_slice(&checksum.to_le_bytes());
     }
     Ok(seen.len())
+}
+
+fn zero_section_checksums(bytes: &mut [u8]) -> anyhow::Result<usize> {
+    let fields = section_checksum_fields(bytes)?;
+    for field in &fields {
+        bytes[field.offset..field.offset + std::mem::size_of::<u32>()].fill(0);
+    }
+    Ok(fields.len())
 }
 
 //
@@ -2095,6 +2137,9 @@ mod tests {
             section_definition_checksums(&bytes),
             [0x1234_5678, lazy_generated]
         );
+
+        assert_eq!(zero_section_checksums(&mut bytes).unwrap(), 2);
+        assert_eq!(section_definition_checksums(&bytes), [0, 0]);
     }
 
     #[test]

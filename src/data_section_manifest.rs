@@ -8,7 +8,28 @@ use nom::{IResult, Parser};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-const HEADER: &[u8] = b"object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tchecksum\tcomdat_selection\tassociative_ordinal\tstorage";
+/// Each row states the section-definition checksum to replay.
+const CHECKSUM_HEADER: &[u8] = b"object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tchecksum\tcomdat_selection\tassociative_ordinal\tstorage";
+
+/// Each row states its evidence instead of a checksum; every section-definition
+/// checksum of an object is then written as zero.
+const PROVENANCE_HEADER: &[u8] = b"object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tcomdat_selection\tassociative_ordinal\tstorage\tprovenance";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Schema {
+    Checksum,
+    Provenance,
+}
+
+impl Schema {
+    fn from_header(line: &[u8]) -> Option<Self> {
+        match line {
+            CHECKSUM_HEADER => Some(Self::Checksum),
+            PROVENANCE_HEADER => Some(Self::Provenance),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
@@ -19,10 +40,11 @@ struct ManifestRow<'a> {
     size: &'a [u8],
     alignment: &'a [u8],
     characteristics: &'a [u8],
-    checksum: &'a [u8],
+    checksum: Option<&'a [u8]>,
     comdat_selection: &'a [u8],
     associative_ordinal: &'a [u8],
     storage: &'a [u8],
+    provenance: Option<&'a [u8]>,
 }
 
 fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
@@ -37,35 +59,56 @@ fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
     take_till(|byte| byte == b'\t').parse(input)
 }
 
-fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
-    let (input, fields) = (
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        field,
+fn column(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    terminated(field, tag(&b"\t"[..])).parse(input)
+}
+
+fn checksum_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+    let (input, (object, ordinal, name, rva, size, alignment, characteristics, checksum)) = (
+        column, column, column, column, column, column, column, column,
     )
         .parse(input)?;
+    let (input, (comdat_selection, associative_ordinal, storage)) =
+        (column, column, field).parse(input)?;
     Ok((
         input,
         ManifestRow {
-            object: fields.0,
-            ordinal: fields.1,
-            name: fields.2,
-            rva: fields.3,
-            size: fields.4,
-            alignment: fields.5,
-            characteristics: fields.6,
-            checksum: fields.7,
-            comdat_selection: fields.8,
-            associative_ordinal: fields.9,
-            storage: fields.10,
+            object,
+            ordinal,
+            name,
+            rva,
+            size,
+            alignment,
+            characteristics,
+            checksum: Some(checksum),
+            comdat_selection,
+            associative_ordinal,
+            storage,
+            provenance: None,
+        },
+    ))
+}
+
+fn provenance_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+    let (input, (object, ordinal, name, rva, size, alignment, characteristics)) =
+        (column, column, column, column, column, column, column).parse(input)?;
+    let (input, (comdat_selection, associative_ordinal, storage, provenance)) =
+        (column, column, column, field).parse(input)?;
+    Ok((
+        input,
+        ManifestRow {
+            object,
+            ordinal,
+            name,
+            rva,
+            size,
+            alignment,
+            characteristics,
+            checksum: None,
+            comdat_selection,
+            associative_ordinal,
+            storage,
+            provenance: Some(provenance),
         },
     ))
 }
@@ -117,10 +160,21 @@ pub enum SectionTopology {
     Exact,
 }
 
+/// How the section-definition checksums of emitted objects are written.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SectionChecksums {
+    /// The writer's own checksum, except where a manifest row states one.
+    #[default]
+    Reviewed,
+    /// Zero in every section definition of every object.
+    Zero,
+}
+
 #[derive(Default)]
 pub struct DataSectionManifest {
     sections: Vec<DataSection>,
     topology: SectionTopology,
+    checksums: SectionChecksums,
 }
 
 impl DataSectionManifest {
@@ -137,38 +191,51 @@ impl DataSectionManifest {
             .map_err(|_| anyhow::anyhow!("{}: invalid line ending", path.display()))?;
         let mut sections = Vec::new();
         let mut ordinals = HashSet::new();
-        let mut saw_header = false;
+        let mut schema = None;
 
         for (line_index, line) in lines.into_iter().enumerate() {
             let line_number = line_index + 1;
             if line.is_empty() || line.starts_with(b"#") {
                 continue;
             }
-            if !saw_header {
-                if line != HEADER {
-                    anyhow::bail!(
+            let Some(schema) = schema else {
+                schema = Some(Schema::from_header(line).ok_or_else(|| {
+                    anyhow::anyhow!(
                         "{}:{}: invalid data section manifest header",
                         path.display(),
                         line_number
-                    );
-                }
-                saw_header = true;
+                    )
+                })?);
                 continue;
-            }
-            if line == HEADER {
+            };
+            if Schema::from_header(line).is_some() {
                 anyhow::bail!(
                     "{}:{}: duplicate data section manifest header",
                     path.display(),
                     line_number
                 );
             }
-            let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
+            let row = match schema {
+                Schema::Checksum => all_consuming(checksum_row).parse(line),
+                Schema::Provenance => all_consuming(provenance_row).parse(line),
+            }
+            .map(|(_, row)| row)
+            .map_err(|_| {
                 anyhow::anyhow!(
                     "{}:{}: expected exactly eleven tab-separated columns",
                     path.display(),
                     line_number
                 )
             })?;
+            if let Some(provenance) = row.provenance
+                && (provenance.is_empty() || provenance.iter().any(|byte| byte.is_ascii_control()))
+            {
+                anyhow::bail!(
+                    "{}:{}: provenance must be non-empty printable text",
+                    path.display(),
+                    line_number
+                );
+            }
             let object = normalize_object(row.object, path, line_number)?;
             let ordinal = parse_number(row.ordinal)?;
             if ordinal == 0 || !ordinals.insert((object, ordinal)) {
@@ -199,7 +266,10 @@ impl DataSectionManifest {
                 );
             }
             let characteristics = u32::try_from(parse_number(row.characteristics)?)?;
-            let checksum = u32::try_from(parse_number(row.checksum)?)?;
+            let checksum = match row.checksum {
+                Some(checksum) => u32::try_from(parse_number(checksum)?)?,
+                None => 0,
+            };
             let comdat_selection = match parse_number(row.comdat_selection)? {
                 0 => ComdatSelection::None,
                 1 => ComdatSelection::NoDuplicates,
@@ -315,9 +385,9 @@ impl DataSectionManifest {
                 storage,
             });
         }
-        if !saw_header {
+        let Some(schema) = schema else {
             anyhow::bail!("{}: missing data section manifest header", path.display());
-        }
+        };
 
         sections.sort_unstable_by_key(|section| (section.object, section.ordinal));
         let mut by_object = HashMap::<&[u8], Vec<&DataSection>>::new();
@@ -378,6 +448,10 @@ impl DataSectionManifest {
         Ok(Self {
             sections,
             topology: SectionTopology::Exact,
+            checksums: match schema {
+                Schema::Checksum => SectionChecksums::Reviewed,
+                Schema::Provenance => SectionChecksums::Zero,
+            },
         })
     }
 
@@ -387,6 +461,10 @@ impl DataSectionManifest {
 
     pub fn topology(&self) -> SectionTopology {
         self.topology
+    }
+
+    pub fn checksums(&self) -> SectionChecksums {
+        self.checksums
     }
 }
 
@@ -471,6 +549,54 @@ mod tests {
             ComdatSelection::Any
         );
         assert_eq!(manifest.sections()[1].storage, Some(SectionStorage::Data));
+    }
+
+    const PROVENANCE_HEADER_TEXT: &str = "object\tordinal\tname\trva\tsize\talignment\tcharacteristics\tcomdat_selection\tassociative_ordinal\tstorage\tprovenance\n";
+
+    fn parse_provenance(rows: &str) -> anyhow::Result<DataSectionManifest> {
+        DataSectionManifest::parse(
+            format!("{PROVENANCE_HEADER_TEXT}{rows}").as_bytes(),
+            Path::new("test.tsv"),
+        )
+    }
+
+    #[test]
+    fn header_selects_the_checksum_policy() {
+        assert_eq!(
+            DataSectionManifest::default().checksums(),
+            SectionChecksums::Reviewed
+        );
+        assert_eq!(parse("").unwrap().checksums(), SectionChecksums::Reviewed);
+
+        let manifest = parse_provenance(
+            "u.c\t1\t.data\t0x100\t0x48\t8\t0xc0401040\t2\t-\tdata\tcandidate-COFF-section\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.checksums(), SectionChecksums::Zero);
+        assert_eq!(manifest.sections()[0].checksum, 0);
+        assert_eq!(
+            manifest.sections()[0].comdat_selection,
+            ComdatSelection::Any
+        );
+        assert_eq!(manifest.topology(), SectionTopology::Exact);
+    }
+
+    #[test]
+    fn provenance_rows_require_printable_evidence() {
+        for provenance in ["", "bad\x01"] {
+            let error = parse_provenance(&format!(
+                "u.c\t1\t.data\t0x100\t4\t4\t0xc0300040\t0\t-\tdata\t{provenance}\n"
+            ))
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("provenance"), "{error}");
+        }
+        let error = parse_provenance("u.c\t1\t.data\t0x100\t4\t4\t0xc0300040\t0\t-\tdata\n")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("eleven"), "{error}");
     }
 
     #[test]
