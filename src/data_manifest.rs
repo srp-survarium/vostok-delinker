@@ -196,7 +196,8 @@ pub struct DataManifest {
     definitions: Vec<DataDefinition>,
     /// Proven rows sorted by RVA; only folded copies share an extent.
     owners: Vec<DataDefinition>,
-    names: HashSet<&'static [u8]>,
+    /// Every definition's start and scope, by name.
+    names: HashMap<&'static [u8], Vec<(usize, DataScope)>>,
 }
 
 impl DataManifest {
@@ -469,10 +470,13 @@ impl DataManifest {
             }
         }
         definitions.sort_by_key(DataDefinition::emission_key);
-        let names = definitions
-            .iter()
-            .map(|definition| definition.symbol_name.as_bytes())
-            .collect();
+        let mut names = HashMap::<_, Vec<_>>::new();
+        for definition in &definitions {
+            names
+                .entry(definition.symbol_name.as_bytes())
+                .or_default()
+                .push((definition.rva, definition.scope));
+        }
         Ok(Self {
             definitions,
             owners,
@@ -491,9 +495,13 @@ impl DataManifest {
         &self.definitions
     }
 
-    /// Whether some row defines `name`, in any object.
-    pub fn defines(&self, name: &[u8]) -> bool {
-        self.names.contains(name)
+    /// Whether a row defines `name` as an external, or at `rva` in any scope.
+    pub fn defines(&self, name: &[u8], rva: usize) -> bool {
+        self.names.get(name).is_some_and(|definitions| {
+            definitions
+                .iter()
+                .any(|(start, scope)| *scope == DataScope::External || *start == rva)
+        })
     }
 
     /// The proven definition containing `rva`. Among folded copies the first in
@@ -799,8 +807,10 @@ mod tests {
         );
         assert_eq!(definitions[0].section_ordinal, Some(2));
         assert_eq!(definitions[1].symbol_name.as_bytes(), b"g_local");
-        assert!(parsed.defines(b"g_local"));
-        assert!(!parsed.defines(b"table"));
+        assert!(parsed.defines(b"g_local", 0x910));
+        assert!(!parsed.defines(b"g_local", 0x4000));
+        assert!(parsed.defines(b"??_C@_05FOO@foo?$AA@", 0x4000));
+        assert!(!parsed.defines(b"table", 0x100));
         for row in [
             "\tu.c\t0x900\t4\tdata\t4\t-\t-\texternal\treviewed\n",
             "x\tu.c\t0x900\t4\tdata\t4\t-\t-\texternal\t\n",

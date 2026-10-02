@@ -296,7 +296,11 @@ pub(crate) fn classify_exact_pdb_target<'s>(
                 target_rva,
             }
         };
-        return Ok(Some((referenced_if_defined(data_manifest, kind), addend)));
+        let owner_rva = (target_rva as u32).wrapping_sub(addend) as usize;
+        return Ok(Some((
+            referenced_if_defined(data_manifest, owner_rva, kind),
+            addend,
+        )));
     }
 
     if let Some((owner, addend)) = data_manifest
@@ -334,7 +338,10 @@ pub(crate) fn classify_exact_pdb_target<'s>(
             storage,
         },
     };
-    Ok(Some((referenced_if_defined(data_manifest, kind), 0)))
+    Ok(Some((
+        referenced_if_defined(data_manifest, target_rva, kind),
+        0,
+    )))
 }
 
 /// A PDB synthesizer can place a fence symbol named `UNPROVISIONED_...` at a
@@ -358,13 +365,19 @@ fn refuse_unprovisioned(
     Ok(())
 }
 
-/// A conjured target spelled with a name the data manifest defines refers to
-/// that definition, in whichever object owns it, instead of becoming a private
-/// copy in the referencing object.
-fn referenced_if_defined<'s>(data_manifest: &DataManifest, kind: RelocKind<'s>) -> RelocKind<'s> {
+/// A conjured target spelled with the name of a data manifest definition refers
+/// to that definition, in whichever object owns it, instead of becoming a
+/// private copy in the referencing object. The definition must be the PDB
+/// symbol's own (it starts at `symbol_rva`) or external: a local of the same
+/// name elsewhere is another variable.
+fn referenced_if_defined<'s>(
+    data_manifest: &DataManifest,
+    symbol_rva: usize,
+    kind: RelocKind<'s>,
+) -> RelocKind<'s> {
     match kind {
         RelocKind::ConjuredConstant { symbol, .. } | RelocKind::ConjuredStatic { symbol, .. }
-            if data_manifest.defines(symbol.as_bytes()) =>
+            if data_manifest.defines(symbol.as_bytes(), symbol_rva) =>
         {
             RelocKind::ReviewedData { symbol }
         }
@@ -862,6 +875,7 @@ fn resolve_absolute_site<'s>(
                     reloc_rva,
                     referenced_if_defined(
                         data_manifest,
+                        (target_rva as u32).wrapping_sub(addend) as usize,
                         RelocKind::ConjuredConstant {
                             symbol: owner,
                             target_rva,
@@ -928,6 +942,7 @@ fn resolve_absolute_site<'s>(
                                 reloc_rva,
                                 referenced_if_defined(
                                     data_manifest,
+                                    *constant_rva,
                                     RelocKind::ConjuredConstant {
                                         symbol: constant.name,
                                         target_rva,
@@ -955,6 +970,7 @@ fn resolve_absolute_site<'s>(
                     reloc_rva,
                     referenced_if_defined(
                         data_manifest,
+                        (target_rva as u32).wrapping_sub(addend) as usize,
                         RelocKind::ConjuredStatic {
                             symbol: owner,
                             target_rva,
@@ -1013,6 +1029,7 @@ fn resolve_absolute_site<'s>(
                         reloc_rva,
                         referenced_if_defined(
                             data_manifest,
+                            *static_rva,
                             RelocKind::ConjuredStatic {
                                 symbol: static_symbol.name,
                                 target_rva,
