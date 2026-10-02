@@ -289,6 +289,7 @@ impl ObjectFiles<'_> {
     pub fn write(self, base: &std::path::Path) -> anyhow::Result<()> {
         let base_len = base.as_os_str().as_encoded_bytes().len();
         let mut path = base.to_path_buf();
+        let mut symbolless_objects = Vec::new();
 
         for (prefix, object_file) in self.objects {
             path.as_mut_os_string().truncate(base_len);
@@ -306,6 +307,10 @@ impl ObjectFiles<'_> {
 
             std::fs::create_dir_all(path.parent().unwrap())?;
             let mut bytes = object_file.object.write()?;
+            let symbolless = symbolless_comdats(&bytes)?;
+            if symbolless != 0 {
+                symbolless_objects.push((path.clone(), symbolless));
+            }
             match self.section_checksums {
                 SectionChecksums::Reviewed => {
                     apply_reviewed_section_checksums(
@@ -318,6 +323,15 @@ impl ObjectFiles<'_> {
                 }
             }
             std::fs::write(&path, bytes)?;
+        }
+        if let Some((example, count)) = symbolless_objects.first() {
+            eprintln!(
+                "[comdat] {} object(s) carry COMDAT sections that define no symbol \
+                 (e.g. {count} in {}); object readers ignore such a COMDAT and link.exe \
+                 rejects it",
+                symbolless_objects.len(),
+                example.display()
+            );
         }
         Ok(())
     }
@@ -1617,6 +1631,44 @@ fn append_with_padding(
     offset
 }
 
+/// The number of non-associative COMDAT sections without a symbol after their
+/// section symbol. That symbol is the COMDAT symbol: link.exe requires it and
+/// object readers find the group through it. A manifest can declare a COMDAT
+/// that nothing is placed into, such as a second `.text` COMDAT while every
+/// function lands in the first `.text` section.
+fn symbolless_comdats(bytes: &[u8]) -> anyhow::Result<usize> {
+    use object::read::coff::ImageSymbol as _;
+    use object::{Object as _, ObjectComdat as _, ObjectSection as _};
+
+    let file = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(bytes)?;
+    let grouped = file
+        .comdats()
+        .filter_map(|comdat| comdat.sections().next())
+        .collect::<HashSet<_>>();
+    let mut symbolless = 0;
+    for section in file.sections() {
+        let object::SectionFlags::Coff { characteristics } = section.flags() else {
+            continue;
+        };
+        let selection = file
+            .coff_symbol_table()
+            .iter()
+            .find(|(_, symbol)| {
+                symbol.has_aux_section()
+                    && symbol.section_number.get(object::LittleEndian) as usize == section.index().0
+            })
+            .and_then(|(index, _)| file.coff_symbol_table().aux_section(index).ok())
+            .map_or(0, |aux| aux.selection);
+        if characteristics & object::pe::IMAGE_SCN_LNK_COMDAT != 0
+            && selection != object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE
+            && !grouped.contains(&section.index())
+        {
+            symbolless += 1;
+        }
+    }
+    Ok(symbolless)
+}
+
 /// The checksum field of one section-definition auxiliary record.
 struct SectionChecksumField {
     section_number: usize,
@@ -2596,6 +2648,11 @@ mod tests {
             data: &[],
         };
         let mut output = ObjectFile::with_sections(&sections, rdata, empty, &image, false).unwrap();
+        // Before any definition, neither COMDAT has a symbol of its own.
+        assert_eq!(
+            symbolless_comdats(&output.object.write().unwrap()).unwrap(),
+            2
+        );
         for (name, rva, ordinal) in [
             (&b"??_R4x@@6B@"[..], 0x20, 2),
             (&b"??_7x@@6B@"[..], 0x30, 3),
@@ -2631,6 +2688,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         comdats.sort_by_key(|(_, sections)| sections[0]);
+        assert_eq!(symbolless_comdats(&bytes).unwrap(), 0);
         assert_eq!(
             comdats,
             [
