@@ -18,6 +18,7 @@ use object::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// A section of a plan, by its position.
@@ -376,6 +377,50 @@ pub fn write_objects<'a>(
     Ok(())
 }
 
+/// Write each plan as `<directory>/<object>.plan`.
+pub fn write_plans<'a>(
+    plans: impl IntoIterator<Item = (&'a [u8], &'a ObjectPlan)>,
+    directory: &Path,
+) -> anyhow::Result<()> {
+    for (object, plan) in plans {
+        let path = object_path(directory, object, "plan");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, plan.to_text()?)?;
+    }
+    Ok(())
+}
+
+/// Every `.plan` file under `directory`, keyed by its object path.
+pub fn read_plans(directory: &Path) -> anyhow::Result<Vec<(Vec<u8>, ObjectPlan)>> {
+    let mut plans = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", dir.display()))?;
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "plan") {
+                continue;
+            }
+            let relative = path.strip_prefix(directory)?.with_extension("");
+            let object = relative
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("{}: path is not UTF-8", path.display()))?
+                .replace('/', "\\");
+            let text = std::fs::read_to_string(&path)?;
+            let plan = ObjectPlan::parse(&text)
+                .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+            plans.push((object.into_bytes(), plan));
+        }
+    }
+    plans.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(plans)
+}
+
 fn object_path(directory: &Path, object: &[u8], extension: &str) -> PathBuf {
     let object = object
         .iter()
@@ -520,9 +565,397 @@ pub(crate) fn zero_section_checksums(bytes: &mut [u8]) -> anyhow::Result<usize> 
     Ok(fields.len())
 }
 
+// On-disk form
+//
+// One text file per object, one record per line, fields separated by tabs.
+// Names escape `\` and bytes outside printable ASCII as `\xHH`; section data
+// is lowercase hex. Sections and symbols are numbered by their order in the
+// file.
+//
+//     vostok-object-plan	1
+//     checksums	reviewed|zero
+//     checksum	<section name>	<value>                          (reviewed only)
+//     section	<name>	<kind>	<characteristics|->	<align>	data	<hex>
+//     section	<name>	<kind>	<characteristics|->	<align>	bss	<size>
+//     symbol	<name>	<value>	<size|->	<kind>	<scope>	<weak>	<section>
+//     reloc	<section>	<offset>	<symbol>	<absolute|relative>
+//     comdat	<selection>	<symbol>	<section>[,<section>...]
+
+const PLAN_HEADER: &str = "vostok-object-plan\t1";
+
+fn escape(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'\\' => text.push_str("\\\\"),
+            0x20..=0x7e => text.push(char::from(byte)),
+            _ => write!(text, "\\x{byte:02x}").unwrap(),
+        }
+    }
+    text
+}
+
+fn unescape(text: &str) -> anyhow::Result<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match (bytes[index], bytes.get(index + 1)) {
+            (b'\\', Some(b'\\')) => {
+                out.push(b'\\');
+                index += 2;
+            }
+            (b'\\', Some(b'x')) => {
+                let hex = text
+                    .get(index + 2..index + 4)
+                    .ok_or_else(|| anyhow::anyhow!("truncated escape in {text:?}"))?;
+                out.push(u8::from_str_radix(hex, 16)?);
+                index += 4;
+            }
+            (b'\\', _) => anyhow::bail!("invalid escape in {text:?}"),
+            (byte, _) => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+const SECTION_KINDS: &[(SectionKind, &str)] = &[
+    (SectionKind::Text, "text"),
+    (SectionKind::Data, "data"),
+    (SectionKind::ReadOnlyData, "rdata"),
+    (SectionKind::UninitializedData, "bss"),
+    (SectionKind::Other, "other"),
+];
+
+const SYMBOL_KINDS: &[(SymbolKind, &str)] = &[
+    (SymbolKind::Text, "text"),
+    (SymbolKind::Data, "data"),
+    (SymbolKind::Unknown, "unknown"),
+    (SymbolKind::Section, "section"),
+];
+
+const SYMBOL_SCOPES: &[(SymbolScope, &str)] = &[
+    (SymbolScope::Linkage, "linkage"),
+    (SymbolScope::Compilation, "compilation"),
+];
+
+const RELOCATION_KINDS: &[(RelocationKind, &str)] = &[
+    (RelocationKind::Absolute, "absolute"),
+    (RelocationKind::Relative, "relative"),
+];
+
+const COMDAT_KINDS: &[(ComdatKind, &str)] = &[
+    (ComdatKind::NoDuplicates, "noduplicates"),
+    (ComdatKind::Any, "any"),
+    (ComdatKind::SameSize, "samesize"),
+    (ComdatKind::ExactMatch, "exactmatch"),
+    (ComdatKind::Largest, "largest"),
+    (ComdatKind::Newest, "newest"),
+];
+
+fn spell<T: PartialEq + std::fmt::Debug>(
+    table: &[(T, &'static str)],
+    value: T,
+) -> anyhow::Result<&'static str> {
+    table
+        .iter()
+        .find(|(known, _)| *known == value)
+        .map(|(_, name)| *name)
+        .ok_or_else(|| anyhow::anyhow!("{value:?} has no object plan spelling"))
+}
+
+fn unspell<T: Copy>(table: &[(T, &str)], name: &str, what: &str) -> anyhow::Result<T> {
+    table
+        .iter()
+        .find(|(_, known)| *known == name)
+        .map(|(value, _)| *value)
+        .ok_or_else(|| anyhow::anyhow!("unknown {what} {name}"))
+}
+
+impl ObjectPlan {
+    pub fn to_text(&self) -> anyhow::Result<String> {
+        let mut text = String::new();
+        writeln!(text, "{PLAN_HEADER}")?;
+        match &self.checksums {
+            PlanChecksums::Zero => writeln!(text, "checksums\tzero")?,
+            PlanChecksums::Reviewed(rows) => {
+                writeln!(text, "checksums\treviewed")?;
+                for (name, value) in rows {
+                    let length = name.iter().position(|&byte| byte == 0).unwrap_or(8);
+                    writeln!(text, "checksum\t{}\t{value:#x}", escape(&name[..length]))?;
+                }
+            }
+        }
+        for section in &self.sections {
+            let characteristics = section
+                .characteristics
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:#x}"));
+            write!(
+                text,
+                "section\t{}\t{}\t{characteristics}\t{:#x}\t",
+                escape(&section.name),
+                spell(SECTION_KINDS, section.kind)?,
+                section.align
+            )?;
+            match &section.contents {
+                SectionContents::Data(data) => {
+                    text.push_str("data\t");
+                    for byte in data {
+                        write!(text, "{byte:02x}")?;
+                    }
+                    text.push('\n');
+                }
+                SectionContents::Bss(size) => writeln!(text, "bss\t{size:#x}")?,
+            }
+        }
+        for symbol in &self.symbols {
+            let size = match symbol.size {
+                u64::MAX => "-".to_owned(),
+                size => format!("{size:#x}"),
+            };
+            let section = match symbol.section {
+                SymbolSection::Undefined => "undefined".to_owned(),
+                SymbolSection::Common => "common".to_owned(),
+                SymbolSection::Section(id) => id.0.to_string(),
+            };
+            writeln!(
+                text,
+                "symbol\t{}\t{:#x}\t{size}\t{}\t{}\t{}\t{section}",
+                escape(&symbol.name),
+                symbol.value,
+                spell(SYMBOL_KINDS, symbol.kind)?,
+                spell(SYMBOL_SCOPES, symbol.scope)?,
+                u8::from(symbol.weak),
+            )?;
+        }
+        for (index, section) in self.sections.iter().enumerate() {
+            for relocation in &section.relocations {
+                writeln!(
+                    text,
+                    "reloc\t{index}\t{:#x}\t{}\t{}",
+                    relocation.offset,
+                    relocation.symbol.0,
+                    spell(RELOCATION_KINDS, relocation.kind)?
+                )?;
+            }
+        }
+        for comdat in &self.comdats {
+            let sections = comdat
+                .sections
+                .iter()
+                .map(|section| section.0.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                text,
+                "comdat\t{}\t{}\t{sections}",
+                spell(COMDAT_KINDS, comdat.kind)?,
+                comdat.symbol.0
+            )?;
+        }
+        Ok(text)
+    }
+
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut lines = text.lines().enumerate();
+        anyhow::ensure!(
+            lines.next().map(|(_, line)| line) == Some(PLAN_HEADER),
+            "missing object plan header"
+        );
+        let mut plan = Self::default();
+        for (index, line) in lines {
+            plan.parse_record(line)
+                .map_err(|error| anyhow::anyhow!("line {}: {error}", index + 1))?;
+        }
+        Ok(plan)
+    }
+
+    fn parse_record(&mut self, line: &str) -> anyhow::Result<()> {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let expect = |count: usize| {
+            anyhow::ensure!(fields.len() == count, "expected {count} fields");
+            Ok(())
+        };
+        let section_index = |text: &str, count: usize| -> anyhow::Result<SectionId> {
+            let index: usize = text.parse()?;
+            anyhow::ensure!(index < count, "section {index} is out of range");
+            Ok(SectionId(index))
+        };
+        let symbol_index = |text: &str, count: usize| -> anyhow::Result<SymbolId> {
+            let index: usize = text.parse()?;
+            anyhow::ensure!(index < count, "symbol {index} is out of range");
+            Ok(SymbolId(index))
+        };
+        match fields[0] {
+            "checksums" => {
+                expect(2)?;
+                self.checksums = match fields[1] {
+                    "reviewed" => PlanChecksums::Reviewed(Vec::new()),
+                    "zero" => PlanChecksums::Zero,
+                    policy => anyhow::bail!("unknown checksum policy {policy}"),
+                };
+            }
+            "checksum" => {
+                expect(3)?;
+                let PlanChecksums::Reviewed(rows) = &mut self.checksums else {
+                    anyhow::bail!("checksum outside a reviewed policy");
+                };
+                let name = unescape(fields[1])?;
+                anyhow::ensure!(name.len() <= 8, "section name is longer than eight bytes");
+                let mut padded = [0; 8];
+                padded[..name.len()].copy_from_slice(&name);
+                rows.push((padded, u32::try_from(parse_u64(fields[2])?)?));
+            }
+            "section" => {
+                expect(7)?;
+                let kind = unspell(SECTION_KINDS, fields[2], "section kind")?;
+                let id = self.add_section(unescape(fields[1])?, kind);
+                if fields[3] != "-" {
+                    self.set_characteristics(id, u32::try_from(parse_u64(fields[3])?)?);
+                }
+                let align = parse_u64(fields[4])?;
+                anyhow::ensure!(align.is_power_of_two(), "alignment is not a power of two");
+                let contents = match (fields[5], kind) {
+                    ("bss", SectionKind::UninitializedData) => {
+                        SectionContents::Bss(parse_u64(fields[6])?)
+                    }
+                    ("data", kind) if kind != SectionKind::UninitializedData => {
+                        SectionContents::Data(parse_hex(fields[6])?)
+                    }
+                    (contents, _) => anyhow::bail!("{contents} contents disagree with the kind"),
+                };
+                let section = &mut self.sections[id.0];
+                section.contents = contents;
+                section.align = align;
+            }
+            "symbol" => {
+                expect(8)?;
+                let section = match fields[7] {
+                    "undefined" => SymbolSection::Undefined,
+                    "common" => SymbolSection::Common,
+                    index => SymbolSection::Section(section_index(index, self.sections.len())?),
+                };
+                let size = match fields[3] {
+                    "-" => u64::MAX,
+                    size => parse_u64(size)?,
+                };
+                let id = self.add_symbol(Symbol {
+                    name: unescape(fields[1])?,
+                    value: parse_u64(fields[2])?,
+                    size,
+                    kind: unspell(SYMBOL_KINDS, fields[4], "symbol kind")?,
+                    scope: unspell(SYMBOL_SCOPES, fields[5], "symbol scope")?,
+                    weak: match fields[6] {
+                        "0" => false,
+                        "1" => true,
+                        weak => anyhow::bail!("invalid weak flag {weak}"),
+                    },
+                    section,
+                });
+                anyhow::ensure!(
+                    id.0 + 1 == self.symbols.len(),
+                    "a section's symbol must be its first"
+                );
+            }
+            "reloc" => {
+                expect(5)?;
+                let section = section_index(fields[1], self.sections.len())?;
+                self.sections[section.0].relocations.push(PlanRelocation {
+                    offset: parse_u64(fields[2])?,
+                    symbol: symbol_index(fields[3], self.symbols.len())?,
+                    kind: unspell(RELOCATION_KINDS, fields[4], "relocation kind")?,
+                });
+            }
+            "comdat" => {
+                expect(4)?;
+                let comdat = PlanComdat {
+                    kind: unspell(COMDAT_KINDS, fields[1], "COMDAT selection")?,
+                    symbol: symbol_index(fields[2], self.symbols.len())?,
+                    sections: fields[3]
+                        .split(',')
+                        .map(|index| section_index(index, self.sections.len()))
+                        .collect::<anyhow::Result<_>>()?,
+                };
+                self.add_comdat(comdat);
+            }
+            record => anyhow::bail!("unknown record {record}"),
+        }
+        Ok(())
+    }
+}
+
+fn parse_u64(text: &str) -> anyhow::Result<u64> {
+    Ok(match text.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16)?,
+        None => text.parse()?,
+    })
+}
+
+fn parse_hex(text: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(text.len() % 2 == 0, "section data has an odd hex length");
+    (0..text.len())
+        .step_by(2)
+        .map(|index| Ok(u8::from_str_radix(&text[index..index + 2], 16)?))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample() -> ObjectPlan {
+        let mut plan = ObjectPlan::default();
+        let text = plan.add_section(b".text".to_vec(), SectionKind::Text);
+        let data = plan.add_section(b".data$r".to_vec(), SectionKind::Data);
+        let bss = plan.add_section(b".bss".to_vec(), SectionKind::UninitializedData);
+        plan.set_characteristics(data, 0xc000_0040);
+        plan.append_section_data(text, &[0xe8, 0, 0, 0, 0, 0xc3], 16);
+        plan.append_section_data(data, &[1, 2, 3, 4], 4);
+        plan.append_section_bss(bss, 12, 8);
+        plan.section_symbol(text);
+        let leader = plan.section_symbol(data);
+        let callee = plan.add_symbol(Symbol {
+            name: b"_callee\\\x01".to_vec(),
+            value: 0,
+            size: u64::MAX,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Undefined,
+        });
+        plan.add_symbol(Symbol {
+            name: b"_table".to_vec(),
+            value: 0,
+            size: 4,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(data),
+        });
+        plan.add_relocation(text, 1, callee, RelocationKind::Relative, -4)
+            .unwrap();
+        plan.add_relocation(data, 0, leader, RelocationKind::Absolute, 0)
+            .unwrap();
+        plan.add_comdat(PlanComdat {
+            kind: ComdatKind::Any,
+            symbol: leader,
+            sections: vec![data],
+        });
+        plan.checksums = PlanChecksums::Reviewed(vec![(*b".text\0\0\0", 0x1234)]);
+        plan
+    }
+
+    #[test]
+    fn text_form_round_trips_to_the_same_object() {
+        let plan = sample();
+        let text = plan.to_text().unwrap();
+        let parsed = ObjectPlan::parse(&text).unwrap();
+        assert_eq!(parsed.to_text().unwrap(), text);
+        assert_eq!(parsed.write().unwrap(), plan.write().unwrap());
+    }
 
     #[test]
     fn replay_matches_building_the_object_directly() {
@@ -573,5 +1006,35 @@ mod tests {
         // A REL32 addend of zero is stored as +4 in the field.
         assert_eq!(plan.section_data_mut(text)[1..5], 4u32.to_le_bytes());
         assert_eq!(plan.write().unwrap(), object.write().unwrap());
+    }
+
+    #[test]
+    fn rejects_malformed_plans() {
+        let text = sample().to_text().unwrap();
+        for (from, to, error) in [
+            ("vostok-object-plan\t1", "vostok-object-plan\t2", "header"),
+            (
+                "reloc\t0\t0x1\t",
+                "reloc\t9\t0x1\t",
+                "section 9 is out of range",
+            ),
+            (
+                "\tbss\t0xc",
+                "\tdata\t0xc",
+                "data contents disagree with the kind",
+            ),
+            ("\tdata\t", "\tdata\t0", "odd hex length"),
+            (
+                "checksums\treviewed",
+                "checksums\tsome",
+                "unknown checksum policy",
+            ),
+        ] {
+            assert!(text.contains(from), "{from}");
+            let message = ObjectPlan::parse(&text.replacen(from, to, 1))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(error), "{message}");
+        }
     }
 }
