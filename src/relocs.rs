@@ -50,7 +50,42 @@ pub enum RelocKind<'a> {
     ConjuredStatic {
         symbol: RawString<'static>,
         target_rva: usize,
+        storage: DataStorage,
     },
+}
+
+/// Where retail `.data` stops holding initialized bytes; beyond lies the
+/// linker's zero-fill (`.bss`) tail.
+#[derive(Copy, Clone, Debug)]
+pub struct WritableExtent {
+    rva: usize,
+    initialized_size: usize,
+}
+
+impl WritableExtent {
+    pub fn of(env: &Env) -> Self {
+        Self {
+            rva: env.data.rva,
+            initialized_size: env.data.data.len(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn all_initialized() -> Self {
+        Self {
+            rva: 0,
+            initialized_size: usize::MAX,
+        }
+    }
+
+    /// Storage of a target inside retail `.data`.
+    pub fn storage(self, target_rva: usize) -> DataStorage {
+        if target_rva - self.rva < self.initialized_size {
+            DataStorage::Data
+        } else {
+            DataStorage::Bss
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -184,6 +219,7 @@ pub(crate) fn classify_exact_pdb_target<'s>(
     reloc_aliases: &RelocAliasManifest,
     observed_aliases: &mut RelocAliasObservations,
     manifest_coverage: ManifestCoverage,
+    writable: WritableExtent,
     owner_function_rva: usize,
     reloc_rva: usize,
     target_rva: usize,
@@ -231,11 +267,11 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         return Ok(None);
     };
 
-    let (owners, is_static) = match exact {
+    let (owners, storage) = match exact {
         ExactPdbDataTarget::ConstantString { .. } | ExactPdbDataTarget::Constant { .. } => {
-            (&symbols.constants, false)
+            (&symbols.constants, DataStorage::Rdata)
         }
-        ExactPdbDataTarget::Static { .. } => (&symbols.statics, true),
+        ExactPdbDataTarget::Static { .. } => (&symbols.statics, writable.storage(target_rva)),
     };
     if let Some((addend, owner)) = resolve_manifest_alias(
         reloc_aliases,
@@ -245,10 +281,11 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         reloc_rva,
         target_rva,
     )? {
-        let kind = if is_static {
+        let kind = if storage != DataStorage::Rdata {
             RelocKind::ConjuredStatic {
                 symbol: owner,
                 target_rva,
+                storage,
             }
         } else {
             RelocKind::ConjuredConstant {
@@ -259,19 +296,9 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         return Ok(Some((referenced_if_defined(data_manifest, kind), addend)));
     }
 
-    let storages: &[DataStorage] = if is_static {
-        &[DataStorage::Data, DataStorage::Bss]
-    } else {
-        &[DataStorage::Rdata]
-    };
-    if let Some((owner, addend)) =
-        data_manifest
-            .owner_and_addend_for_rva(target_rva)
-            .or_else(|| {
-                storages.iter().find_map(|storage| {
-                    data_manifest.provisional_owner_and_addend_for_rva(target_rva, *storage)
-                })
-            })
+    if let Some((owner, addend)) = data_manifest
+        .owner_and_addend_for_rva(target_rva)
+        .or_else(|| data_manifest.provisional_owner_and_addend_for_rva(target_rva, storage))
     {
         let addend = u32::try_from(addend)?;
         return Ok(Some((
@@ -295,7 +322,11 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         ExactPdbDataTarget::Constant { symbol } => {
             RelocKind::ConjuredConstant { symbol, target_rva }
         }
-        ExactPdbDataTarget::Static { symbol } => RelocKind::ConjuredStatic { symbol, target_rva },
+        ExactPdbDataTarget::Static { symbol } => RelocKind::ConjuredStatic {
+            symbol,
+            target_rva,
+            storage,
+        },
     };
     Ok(Some((referenced_if_defined(data_manifest, kind), 0)))
 }
@@ -311,16 +342,6 @@ fn referenced_if_defined<'s>(data_manifest: &DataManifest, kind: RelocKind<'s>) 
             RelocKind::ReviewedData { symbol }
         }
         kind => kind,
-    }
-}
-
-/// Retail storage of a writable target: `.data` past its raw-initialized bytes
-/// is the linker's zero-fill (`.bss`) tail.
-fn writable_storage(env: &Env, target_rva: usize) -> DataStorage {
-    if target_rva - env.data.rva < env.data.data.len() {
-        DataStorage::Data
-    } else {
-        DataStorage::Bss
     }
 }
 
@@ -882,6 +903,10 @@ fn resolve_absolute_site<'s>(
                         RelocKind::ConjuredStatic {
                             symbol: owner,
                             target_rva,
+                            // The owner's storage, which an end-of-array target
+                            // past its extent need not share.
+                            storage: WritableExtent::of(env)
+                                .storage((target_rva as u32).wrapping_sub(addend) as usize),
                         },
                     ),
                 );
@@ -892,7 +917,7 @@ fn resolve_absolute_site<'s>(
                 .or_else(|| {
                     data_manifest.provisional_owner_and_addend_for_rva(
                         target_rva,
-                        writable_storage(env, target_rva),
+                        WritableExtent::of(env).storage(target_rva),
                     )
                 });
             match (manifest_coverage, owner) {
@@ -935,6 +960,7 @@ fn resolve_absolute_site<'s>(
                             RelocKind::ConjuredStatic {
                                 symbol: static_symbol.name,
                                 target_rva,
+                                storage: WritableExtent::of(env).storage(target_rva),
                             },
                         ),
                     );
@@ -1066,6 +1092,7 @@ mod tests {
             &aliases,
             &mut observed,
             ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
             0x1000,
             0x1010,
             0x2000,
@@ -1078,6 +1105,7 @@ mod tests {
             &aliases,
             &mut observed,
             ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
             0x1000,
             0x1012,
             0x1800,
@@ -1094,6 +1122,7 @@ mod tests {
             &aliases,
             &mut observed,
             ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
             0x1000,
             0x1014,
             0x3000,
@@ -1107,6 +1136,7 @@ mod tests {
                 &aliases,
                 &mut observed,
                 ManifestCoverage::AllowPartial,
+                WritableExtent::all_initialized(),
                 0x1000,
                 0x1018,
                 0x2001,
@@ -1178,6 +1208,7 @@ mod tests {
             &RelocAliasManifest::default(),
             &mut RelocAliasObservations::default(),
             ManifestCoverage::RequireComplete,
+            WritableExtent::all_initialized(),
             0x1000,
             0x1010,
             0x4000,

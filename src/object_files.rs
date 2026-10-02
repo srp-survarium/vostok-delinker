@@ -7,7 +7,7 @@ use crate::data_section_manifest::{
 use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::relocs::{
-    CodeRelocationRecovery, ManifestCoverage, RelocKind, RelocationEncoding,
+    CodeRelocationRecovery, ManifestCoverage, RelocKind, RelocationEncoding, WritableExtent,
     classify_exact_pdb_target,
 };
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
@@ -238,6 +238,7 @@ impl ObjectFiles<'_> {
                     observed_aliases,
                     data_manifest,
                     manifest_coverage,
+                    WritableExtent::of(env),
                     code_relocation_recovery,
                 )?;
 
@@ -317,6 +318,13 @@ impl ObjectFile {
         *self.data_section_id.get_or_insert_with(|| {
             self.object
                 .add_section(Vec::new(), b".data".into(), SectionKind::Data)
+        })
+    }
+
+    fn bss_section(&mut self) -> object::write::SectionId {
+        *self.bss_section_id.get_or_insert_with(|| {
+            self.object
+                .add_section(Vec::new(), b".bss".into(), SectionKind::UninitializedData)
         })
     }
 
@@ -687,6 +695,7 @@ fn resolve_code_relocations<'s>(
     observed_aliases: &mut RelocAliasObservations,
     data_manifest: &DataManifest,
     manifest_coverage: ManifestCoverage,
+    writable: WritableExtent,
     code_relocation_recovery: CodeRelocationRecovery,
 ) -> anyhow::Result<Vec<u8>> {
     let fun_va = image_base.to_usize() + fun_rva;
@@ -732,6 +741,7 @@ fn resolve_code_relocations<'s>(
                         reloc_aliases,
                         observed_aliases,
                         manifest_coverage,
+                        writable,
                         fun_rva,
                         reloc_rva,
                         target_rva,
@@ -845,7 +855,9 @@ impl ObjectFile {
             (
                 TargetMaterialization::Materialize,
                 RelocKind::ConjuredConstant { symbol, target_rva }
-                | RelocKind::ConjuredStatic { symbol, target_rva },
+                | RelocKind::ConjuredStatic {
+                    symbol, target_rva, ..
+                },
             ) => Some(ConjuredCopy {
                 symbol: symbol.as_bytes().to_vec(),
                 target_rva: Some(target_rva),
@@ -959,8 +971,23 @@ impl ObjectFile {
             }
 
             RelocKind::ConjuredStatic {
+                storage: DataStorage::Bss,
+                ..
+            } => {
+                // Zero-fill storage has no bytes or relocations to copy, and a
+                // copy would only grow this object's own `.bss`.
+                self.add_relocation(
+                    reloc_name,
+                    ObjectLocation::Extern(reloc_kind.external_symbol_kind()),
+                    reloc_offset,
+                    RelocationEncoding::Absolute,
+                )?;
+            }
+
+            RelocKind::ConjuredStatic {
                 symbol: _,
                 target_rva,
+                storage: _,
             } => {
                 let new_data =
                     bytemuck::pod_read_unaligned::<[u8; 4]>(&coff_data[target_rva..target_rva + 4]);
@@ -1092,13 +1119,7 @@ impl ObjectFile {
                     }
                 }
                 DataStorage::Bss => {
-                    let section_id = *self.bss_section_id.get_or_insert_with(|| {
-                        self.object.add_section(
-                            Vec::new(),
-                            b".bss".into(),
-                            SectionKind::UninitializedData,
-                        )
-                    });
+                    let section_id = self.bss_section();
                     let offset = self.object.append_section_bss(
                         section_id,
                         definition.size.to_u64(),
@@ -1427,10 +1448,7 @@ impl<'a> RelocKind<'a> {
                 symbol,
                 target_rva: _,
             } => Name::Borrowed(symbol),
-            Self::ConjuredStatic {
-                symbol,
-                target_rva: _,
-            } => Name::Borrowed(symbol),
+            Self::ConjuredStatic { symbol, .. } => Name::Borrowed(symbol),
         }
     }
 }
@@ -1676,6 +1694,7 @@ mod tests {
             &mut RelocAliasObservations::default(),
             &data_manifest,
             ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
             crate::relocs::BaseRelocationSource::Absent.code_relocation_recovery(),
         )
         .unwrap();
@@ -1694,6 +1713,7 @@ mod tests {
             &mut RelocAliasObservations::default(),
             &data_manifest,
             ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
             crate::relocs::BaseRelocationSource::Stripped.code_relocation_recovery(),
         )
         .unwrap();
@@ -1745,6 +1765,7 @@ mod tests {
             &mut RelocAliasObservations::default(),
             &DataManifest::default(),
             ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
             CodeRelocationRecovery::RetainedOnly,
         )
         .unwrap();
@@ -1917,6 +1938,68 @@ mod tests {
         );
         let bytes = object.object.write().unwrap();
         assert_eq!(short_coff_symbol_type(&bytes, b"external"), 0);
+    }
+
+    #[test]
+    fn conjured_targets_get_one_copy_each_and_zero_fill_is_referenced() {
+        let mut object = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let text_section_id = object.text_section();
+        let field = object.append_section_data(text_section_id, &[0; 16], 0x90);
+        let mut image = vec![0_u8; 0x40];
+        image[0x10..0x14].copy_from_slice(b"word");
+        let relocs = BTreeMap::new();
+        let reference = |object: &mut ObjectFile, kind, at| {
+            object
+                .add_relocation_at(
+                    kind,
+                    field + at,
+                    &SymbolMatcher::off(),
+                    &image,
+                    &relocs,
+                    &mut HashSet::new(),
+                    TargetMaterialization::Materialize,
+                )
+                .unwrap();
+        };
+        let initialized = RelocKind::ConjuredStatic {
+            symbol: RawString::from(&b"g_word"[..]),
+            target_rva: 0x10,
+            storage: DataStorage::Data,
+        };
+        let zero_fill = RelocKind::ConjuredStatic {
+            symbol: RawString::from(&b"g_zero"[..]),
+            target_rva: 0x30,
+            storage: DataStorage::Bss,
+        };
+        reference(&mut object, initialized, 0);
+        reference(&mut object, zero_fill, 4);
+        reference(&mut object, initialized, 8);
+        reference(&mut object, zero_fill, 12);
+
+        let bytes = object.object.write().unwrap();
+        let parsed = object::File::parse(bytes.as_slice()).unwrap();
+        let copies = parsed
+            .symbols()
+            .filter(|symbol| symbol.is_definition())
+            .map(|symbol| {
+                let section = parsed
+                    .section_by_index(symbol.section_index().unwrap())
+                    .unwrap();
+                (
+                    symbol.name().unwrap().to_owned(),
+                    section.name().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copies, [("g_word".to_owned(), ".data".to_owned())]);
+        assert_eq!(parsed.section_by_name(".data").unwrap().size(), 4);
+        assert!(parsed.section_by_name(".bss").is_none());
+        let zero_fill = parsed
+            .symbols()
+            .filter(|symbol| symbol.name() == Ok("g_zero"))
+            .collect::<Vec<_>>();
+        assert_eq!(zero_fill.len(), 1);
+        assert!(zero_fill[0].is_undefined());
     }
 
     #[test]
@@ -2506,6 +2589,7 @@ mod tests {
             RelocKind::ConjuredStatic {
                 symbol: RawString::from(&b"external"[..]),
                 target_rva: 0x40,
+                storage: DataStorage::Data,
             },
         );
         output
@@ -2657,6 +2741,7 @@ mod tests {
             RelocKind::ConjuredStatic {
                 symbol: RawString::from(&b"external"[..]),
                 target_rva: 0x18,
+                storage: DataStorage::Data,
             },
         );
         output
