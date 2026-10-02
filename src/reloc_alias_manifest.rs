@@ -8,7 +8,7 @@ use pdb2::RawString;
 
 use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const HEADER: &[u8] = b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences";
@@ -107,7 +107,9 @@ impl RelocAlias {
 
 #[derive(Default)]
 pub struct RelocAliasObservations {
-    counts: BTreeMap<RelocAliasKey, usize>,
+    /// The distinct relocation sites each row selected: a body that several
+    /// objects own is decoded once per owner, but its sites count once.
+    sites: BTreeMap<RelocAliasKey, BTreeSet<usize>>,
 }
 
 #[derive(Default)]
@@ -265,7 +267,7 @@ impl RelocAliasManifest {
         observed: &mut RelocAliasObservations,
     ) -> Option<RelocAlias> {
         let (key, alias) = self.select(function_rva, target_rva, site_rva)?;
-        *observed.counts.entry(key).or_default() += 1;
+        observed.sites.entry(key).or_default().insert(site_rva);
         Some(alias)
     }
 
@@ -325,7 +327,7 @@ impl RelocAliasManifest {
 
     pub fn validate_occurrences(&self, observed: &RelocAliasObservations) -> anyhow::Result<()> {
         for (key, alias) in &self.aliases {
-            let count = observed.counts.get(key).copied().unwrap_or(0);
+            let count = observed.sites.get(key).map_or(0, BTreeSet::len);
             if count != alias.occurrences {
                 let site = key
                     .site_rva
@@ -560,6 +562,12 @@ mod tests {
         manifest.resolve(0x2000, 0x1000, 0x2008, &mut observed);
         manifest.resolve(0x2000, 0x1000, 0x2010, &mut observed);
         assert!(manifest.validate_occurrences(&observed).is_err());
+
+        // A site seen again, by another owner decoding the same body, counts once.
+        manifest.resolve(0x2000, 0x1000, 0x2008, &mut observed);
+        assert!(manifest.validate_occurrences(&observed).is_err());
+        manifest.resolve(0x2000, 0x1000, 0x200c, &mut observed);
+        manifest.validate_occurrences(&observed).unwrap();
     }
 
     #[test]
