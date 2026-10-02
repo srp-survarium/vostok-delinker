@@ -1,5 +1,5 @@
 use crate::Env;
-use crate::data_manifest::DataManifest;
+use crate::data_manifest::{DataManifest, DataStorage};
 use crate::pdb_symbols::{self, FunctionRelocationField, PdbDataSymbol};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::reloc_manifest::RelocManifest;
@@ -231,10 +231,23 @@ pub(crate) fn classify_exact_pdb_target<'s>(
                 target_rva,
             }
         };
-        return Ok(Some((kind, addend)));
+        return Ok(Some((referenced_if_defined(data_manifest, kind), addend)));
     }
 
-    if let Some((owner, addend)) = data_manifest.owner_and_addend_for_rva(target_rva) {
+    let storages: &[DataStorage] = if is_static {
+        &[DataStorage::Data, DataStorage::Bss]
+    } else {
+        &[DataStorage::Rdata]
+    };
+    if let Some((owner, addend)) =
+        data_manifest
+            .owner_and_addend_for_rva(target_rva)
+            .or_else(|| {
+                storages.iter().find_map(|storage| {
+                    data_manifest.provisional_owner_and_addend_for_rva(target_rva, *storage)
+                })
+            })
+    {
         let addend = u32::try_from(addend)?;
         return Ok(Some((
             RelocKind::ReviewedData {
@@ -250,17 +263,40 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         );
     }
 
-    Ok(Some(match exact {
+    let kind = match exact {
         ExactPdbDataTarget::ConstantString { symbol, data } => {
-            (RelocKind::ConjuredString { symbol, data }, 0)
+            RelocKind::ConjuredString { symbol, data }
         }
         ExactPdbDataTarget::Constant { symbol } => {
-            (RelocKind::ConjuredConstant { symbol, target_rva }, 0)
+            RelocKind::ConjuredConstant { symbol, target_rva }
         }
-        ExactPdbDataTarget::Static { symbol } => {
-            (RelocKind::ConjuredStatic { symbol, target_rva }, 0)
+        ExactPdbDataTarget::Static { symbol } => RelocKind::ConjuredStatic { symbol, target_rva },
+    };
+    Ok(Some((referenced_if_defined(data_manifest, kind), 0)))
+}
+
+/// A conjured target spelled with a name the data manifest defines refers to
+/// that definition, in whichever object owns it, instead of becoming a private
+/// copy in the referencing object.
+fn referenced_if_defined<'s>(data_manifest: &DataManifest, kind: RelocKind<'s>) -> RelocKind<'s> {
+    match kind {
+        RelocKind::ConjuredConstant { symbol, .. } | RelocKind::ConjuredStatic { symbol, .. }
+            if data_manifest.defines(symbol.as_bytes()) =>
+        {
+            RelocKind::ReviewedData { symbol }
         }
-    }))
+        kind => kind,
+    }
+}
+
+/// Retail storage of a writable target: `.data` past its raw-initialized bytes
+/// is the linker's zero-fill (`.bss`) tail.
+fn writable_storage(env: &Env, target_rva: usize) -> DataStorage {
+    if target_rva - env.data.rva < env.data.data.len() {
+        DataStorage::Data
+    } else {
+        DataStorage::Bss
+    }
 }
 
 #[repr(C)]
@@ -724,14 +760,22 @@ fn resolve_absolute_site<'s>(
                 coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
                 relocs_rva.insert(
                     reloc_rva,
-                    RelocKind::ConjuredConstant {
-                        symbol: owner,
-                        target_rva,
-                    },
+                    referenced_if_defined(
+                        data_manifest,
+                        RelocKind::ConjuredConstant {
+                            symbol: owner,
+                            target_rva,
+                        },
+                    ),
                 );
                 return Ok(());
             }
-            let owner = data_manifest.owner_and_addend_for_rva(target_rva);
+            let owner = data_manifest
+                .owner_and_addend_for_rva(target_rva)
+                .or_else(|| {
+                    data_manifest
+                        .provisional_owner_and_addend_for_rva(target_rva, DataStorage::Rdata)
+                });
             match (manifest_coverage, owner) {
                 (_, Some((owner, addend))) => {
                     let diff = u32::try_from(addend)?;
@@ -781,10 +825,13 @@ fn resolve_absolute_site<'s>(
 
                             relocs_rva.insert(
                                 reloc_rva,
-                                RelocKind::ConjuredConstant {
-                                    symbol: constant.name,
-                                    target_rva,
-                                },
+                                referenced_if_defined(
+                                    data_manifest,
+                                    RelocKind::ConjuredConstant {
+                                        symbol: constant.name,
+                                        target_rva,
+                                    },
+                                ),
                             );
                         }
                     };
@@ -805,14 +852,24 @@ fn resolve_absolute_site<'s>(
                 coff_data_reloc.copy_from_slice(&addend.to_le_bytes());
                 relocs_rva.insert(
                     reloc_rva,
-                    RelocKind::ConjuredStatic {
-                        symbol: owner,
-                        target_rva,
-                    },
+                    referenced_if_defined(
+                        data_manifest,
+                        RelocKind::ConjuredStatic {
+                            symbol: owner,
+                            target_rva,
+                        },
+                    ),
                 );
                 return Ok(());
             }
-            let owner = data_manifest.owner_and_addend_for_rva(target_rva);
+            let owner = data_manifest
+                .owner_and_addend_for_rva(target_rva)
+                .or_else(|| {
+                    data_manifest.provisional_owner_and_addend_for_rva(
+                        target_rva,
+                        writable_storage(env, target_rva),
+                    )
+                });
             match (manifest_coverage, owner) {
                 (_, Some((owner, addend))) => {
                     let diff = u32::try_from(addend)?;
@@ -848,10 +905,13 @@ fn resolve_absolute_site<'s>(
 
                     relocs_rva.insert(
                         reloc_rva,
-                        RelocKind::ConjuredStatic {
-                            symbol: static_symbol.name,
-                            target_rva,
-                        },
+                        referenced_if_defined(
+                            data_manifest,
+                            RelocKind::ConjuredStatic {
+                                symbol: static_symbol.name,
+                                target_rva,
+                            },
+                        ),
                     );
                 }
             }

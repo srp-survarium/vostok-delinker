@@ -135,13 +135,15 @@ impl ObjectFiles<'_> {
 
         let definitions = data_manifest.definitions_in_emission_order();
 
-        for definition in &definitions {
+        for definition in definitions {
             let definition_end = definition.rva.checked_add(definition.size).unwrap();
             let section = match definition.storage {
                 DataStorage::Rdata => env.rdata,
                 DataStorage::Data | DataStorage::Bss => env.data,
             };
-            if definition.rva < section.rva || definition_end > section.rva + section.size {
+            if !definition.provisional
+                && (definition.rva < section.rva || definition_end > section.rva + section.size)
+            {
                 anyhow::bail!(
                     "data manifest definition `{}` in {} (storage {:?}, RVA {:#x}..{:#x}) \
                      does not fit its PE section (RVA {:#x}..{:#x})",
@@ -163,7 +165,7 @@ impl ObjectFiles<'_> {
         for object_file in this.objects.values_mut() {
             object_file.add_topology_section_relocations(matcher, coff_data, &relocs_rva)?;
         }
-        for definition in &definitions {
+        for definition in definitions {
             let object_file = this.objects.get_mut(definition.object).unwrap();
             if !object_file.definition_uses_affine_topology(*definition) {
                 object_file.add_data_relocations(*definition, matcher, coff_data, &relocs_rva)?;
@@ -1033,7 +1035,7 @@ impl ObjectFile {
             .is_some()
         {
             anyhow::bail!(
-                "duplicate PDB data symbol {} in owner object",
+                "duplicate data symbol {} in owner object",
                 definition.symbol_name
             );
         }
@@ -1111,10 +1113,10 @@ impl ObjectFile {
         let symbol_id = self
             .object
             .symbol_id(definition.symbol_name.as_bytes())
-            .ok_or_else(|| anyhow::anyhow!("missing emitted PDB data symbol"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing emitted data symbol"))?;
         let symbol = self.object.symbol(symbol_id);
         let object::write::SymbolSection::Section(section_id) = symbol.section else {
-            anyhow::bail!("emitted PDB data symbol has no output section");
+            anyhow::bail!("emitted data symbol has no output section");
         };
         let offset = ObjectOffset {
             offset: symbol.value,
@@ -1729,6 +1731,7 @@ mod tests {
             section_ordinal: None,
             section_offset: Some(section_offset),
             scope,
+            provisional: false,
         }
     }
 
@@ -1993,6 +1996,7 @@ mod tests {
                         section_ordinal: Some(ordinal),
                         section_offset: Some(0),
                         scope: DataScope::External,
+                        provisional: false,
                     },
                     &image,
                 )
@@ -2137,6 +2141,7 @@ mod tests {
                 section_ordinal: Some(1),
                 section_offset: Some(0),
                 scope: DataScope::External,
+                provisional: false,
             },
             DataDefinition {
                 symbol_name: RawString::from(&b"right"[..]),
@@ -2148,6 +2153,7 @@ mod tests {
                 section_ordinal: Some(1),
                 section_offset: Some(8),
                 scope: DataScope::External,
+                provisional: false,
             },
         ];
         let mut output = ObjectFile::with_sections(&sections, empty, data, &image, false).unwrap();
@@ -2229,6 +2235,7 @@ mod tests {
             section_ordinal: Some(1),
             section_offset: Some(offset),
             scope: DataScope::Local,
+            provisional: false,
         };
         output
             .add_data_definition(definition(b"first", 0x10, 0), &image)
@@ -2298,6 +2305,7 @@ mod tests {
                         section_ordinal: Some(ordinal),
                         section_offset: Some(0),
                         scope: DataScope::External,
+                        provisional: false,
                     },
                     &image,
                 )
@@ -2380,6 +2388,7 @@ mod tests {
                     section_ordinal: Some(1),
                     section_offset: Some(0),
                     scope: DataScope::External,
+                    provisional: false,
                 },
                 &image,
             )

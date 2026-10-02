@@ -8,14 +8,48 @@ use nom::sequence::terminated;
 use nom::{IResult, Parser};
 use pdb2::RawString;
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-const HEADER: &[u8] =
+/// Identities come from the PDB: each row names the PDB data symbol that starts
+/// at its RVA.
+const PDB_HEADER: &[u8] =
     b"object\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope";
+
+/// Identities come from the manifest itself, for images whose PDB is synthetic
+/// or incomplete. `provenance` is free text, except that a value starting with
+/// `provisional-` marks the row as an extent hypothesis (see `DataDefinition`).
+const NAMED_HEADER: &[u8] = b"name\tobject\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope\tprovenance";
+
+const PROVISIONAL_PREFIX: &[u8] = b"provisional-";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Schema {
+    Pdb,
+    Named,
+}
+
+impl Schema {
+    fn from_header(line: &[u8]) -> Option<Self> {
+        match line {
+            PDB_HEADER => Some(Self::Pdb),
+            NAMED_HEADER => Some(Self::Named),
+            _ => None,
+        }
+    }
+
+    fn column_count(self) -> &'static str {
+        match self {
+            Self::Pdb => "eight",
+            Self::Named => "ten",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
+    name: Option<&'a [u8]>,
     object: &'a [u8],
     rva: &'a [u8],
     size: &'a [u8],
@@ -24,6 +58,7 @@ struct ManifestRow<'a> {
     section_ordinal: &'a [u8],
     section_offset: &'a [u8],
     scope: &'a [u8],
+    provenance: Option<&'a [u8]>,
 }
 
 fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
@@ -38,23 +73,21 @@ fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
     take_till(|byte| byte == b'\t').parse(input)
 }
 
-fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+fn column(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    terminated(field, tag(&b"\t"[..])).parse(input)
+}
+
+fn pdb_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
     let (input, (object, rva, size, storage, alignment, section_ordinal, section_offset, scope)) =
         (
-            terminated(field, tag(&b"\t"[..])),
-            terminated(field, tag(&b"\t"[..])),
-            terminated(field, tag(&b"\t"[..])),
-            terminated(field, tag(&b"\t"[..])),
-            terminated(field, tag(&b"\t"[..])),
-            terminated(field, tag(&b"\t"[..])),
-            terminated(field, tag(&b"\t"[..])),
-            field,
+            column, column, column, column, column, column, column, field,
         )
             .parse(input)?;
 
     Ok((
         input,
         ManifestRow {
+            name: None,
             object,
             rva,
             size,
@@ -63,11 +96,36 @@ fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
             section_ordinal,
             section_offset,
             scope,
+            provenance: None,
         },
     ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+fn named_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+    let (input, (name, object, rva, size, storage, alignment, section_ordinal, section_offset)) = (
+        column, column, column, column, column, column, column, column,
+    )
+        .parse(input)?;
+    let (input, (scope, provenance)) = (column, field).parse(input)?;
+
+    Ok((
+        input,
+        ManifestRow {
+            name: Some(name),
+            object,
+            rva,
+            size,
+            storage,
+            alignment,
+            section_ordinal,
+            section_offset,
+            scope,
+            provenance: Some(provenance),
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DataStorage {
     Data,
     Rdata,
@@ -94,11 +152,51 @@ pub struct DataDefinition {
     pub section_ordinal: Option<usize>,
     pub section_offset: Option<usize>,
     pub scope: DataScope,
+    /// An extent hypothesis rather than proven ownership. It is still emitted,
+    /// but it may overlap other rows, it never answers `owner_and_addend_for_rva`,
+    /// and it only names a relocation target that no proven row contains.
+    pub provisional: bool,
 }
+
+impl DataDefinition {
+    fn contains(&self, rva: usize) -> bool {
+        self.rva <= rva && rva - self.rva < self.size
+    }
+
+    fn emission_key(&self) -> (&'static [u8], DataStorage, usize, usize, usize) {
+        (
+            self.object,
+            self.storage,
+            self.section_ordinal.unwrap_or(0),
+            self.section_offset.unwrap_or(self.rva),
+            self.rva,
+        )
+    }
+
+    /// One COMDAT that the compiler emitted into several objects and the linker
+    /// folded onto one RVA: every column but the object agrees. This is the
+    /// definition-level analogue of `compatible_folded_comdat_alias` for sections.
+    fn is_folded_copy_of(&self, other: &Self) -> bool {
+        self.object != other.object
+            && self.symbol_name == other.symbol_name
+            && self.rva == other.rva
+            && self.size == other.size
+            && self.storage == other.storage
+            && self.alignment == other.alignment
+            && self.scope == DataScope::External
+            && other.scope == DataScope::External
+    }
+}
+
+type FoldedComdatKey = (&'static [u8], usize, usize, DataStorage, u64);
 
 #[derive(Default)]
 pub struct DataManifest {
+    /// Every row, in emission order.
     definitions: Vec<DataDefinition>,
+    /// Proven rows sorted by RVA; only folded copies share an extent.
+    owners: Vec<DataDefinition>,
+    names: HashSet<&'static [u8]>,
 }
 
 impl DataManifest {
@@ -112,7 +210,10 @@ impl DataManifest {
     fn parse(bytes: &[u8], path: &Path, symbols: &PdbSymbols) -> anyhow::Result<Self> {
         let mut definitions = Vec::new();
         let mut rvas = HashSet::new();
-        let mut saw_header = false;
+        let mut external_names = HashSet::new();
+        let mut local_names = HashSet::new();
+        let mut folded_comdat_owners = HashMap::<FoldedComdatKey, HashSet<&[u8]>>::new();
+        let mut schema = None;
 
         let (_, lines) = all_consuming(manifest_lines)
             .parse(bytes)
@@ -123,18 +224,17 @@ impl DataManifest {
             if line.is_empty() || line.starts_with(b"#") {
                 continue;
             }
-            if !saw_header {
-                if line != HEADER {
-                    anyhow::bail!(
+            let Some(schema) = schema else {
+                schema = Some(Schema::from_header(line).ok_or_else(|| {
+                    anyhow::anyhow!(
                         "{}:{}: invalid data manifest header",
                         path.display(),
                         line_number
-                    );
-                }
-                saw_header = true;
+                    )
+                })?);
                 continue;
-            }
-            if line == HEADER {
+            };
+            if Schema::from_header(line).is_some() {
                 anyhow::bail!(
                     "{}:{}: duplicate data manifest header",
                     path.display(),
@@ -142,11 +242,17 @@ impl DataManifest {
                 );
             }
 
-            let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
+            let row = match schema {
+                Schema::Pdb => all_consuming(pdb_row).parse(line),
+                Schema::Named => all_consuming(named_row).parse(line),
+            }
+            .map(|(_, row)| row)
+            .map_err(|_| {
                 anyhow::anyhow!(
-                    "{}:{}: expected exactly eight tab-separated columns",
+                    "{}:{}: expected exactly {} tab-separated columns",
                     path.display(),
-                    line_number
+                    line_number,
+                    schema.column_count()
                 )
             })?;
             validate_text(path, line_number, "object", row.object)?;
@@ -156,6 +262,19 @@ impl DataManifest {
                     path.display(),
                     line_number
                 );
+            }
+            for (field, value) in [("name", row.name), ("provenance", row.provenance)] {
+                let Some(value) = value else {
+                    continue;
+                };
+                validate_text(path, line_number, field, value)?;
+                if value.is_empty() {
+                    anyhow::bail!(
+                        "{}:{}: {field} must be non-empty",
+                        path.display(),
+                        line_number
+                    );
+                }
             }
             let object = std::str::from_utf8(row.object)?.replace('/', "\\");
             if object.contains(':')
@@ -248,29 +367,70 @@ impl DataManifest {
                     String::from_utf8_lossy(value)
                 ),
             };
-            if !rvas.insert(rva) {
-                anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
-            }
+            let provisional = row
+                .provenance
+                .is_some_and(|provenance| provenance.starts_with(PROVISIONAL_PREFIX));
 
-            let symbol_name = match storage {
-                DataStorage::Data | DataStorage::Bss => {
-                    symbols.statics.get(&rva).map(|symbol| symbol.name)
+            let symbol_name = match row.name {
+                Some(name) => RawString::from(&*name.to_vec().leak()),
+                None => match storage {
+                    DataStorage::Data | DataStorage::Bss => {
+                        symbols.statics.get(&rva).map(|symbol| symbol.name)
+                    }
+                    DataStorage::Rdata => symbols
+                        .constants
+                        .get(&rva)
+                        .map(|symbol| symbol.name)
+                        .or_else(|| symbols.strings.get(&rva).map(|(name, _)| *name)),
                 }
-                DataStorage::Rdata => symbols
-                    .constants
-                    .get(&rva)
-                    .map(|symbol| symbol.name)
-                    .or_else(|| symbols.strings.get(&rva).map(|(name, _)| *name)),
-            }
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{}:{}: no compatible PDB data symbol starts at RVA {rva:#x}",
-                    path.display(),
-                    line_number
-                )
-            })?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}:{}: no compatible PDB data symbol starts at RVA {rva:#x}",
+                        path.display(),
+                        line_number
+                    )
+                })?,
+            };
+            let name: &'static [u8] = symbol_name.as_bytes();
 
             let object: &'static [u8] = object.into_bytes().leak();
+            let folded_copy = scope == DataScope::External
+                && match folded_comdat_owners.entry((name, rva, size, storage, alignment)) {
+                    Entry::Occupied(mut owners) => {
+                        if !owners.get_mut().insert(object) {
+                            anyhow::bail!(
+                                "{}:{}: duplicate data definition in one object",
+                                path.display(),
+                                line_number
+                            );
+                        }
+                        true
+                    }
+                    Entry::Vacant(entry) => {
+                        entry.insert(HashSet::from([object]));
+                        false
+                    }
+                };
+            if !provisional && !folded_copy && !rvas.insert(rva) {
+                anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
+            }
+            let unique_name = match scope {
+                DataScope::External => folded_copy || external_names.insert(name),
+                DataScope::Local => local_names.insert((object, name)),
+            };
+            if !unique_name {
+                anyhow::bail!(
+                    "{}:{}: duplicate {} data name {}",
+                    path.display(),
+                    line_number,
+                    match scope {
+                        DataScope::External => "external",
+                        DataScope::Local => "local",
+                    },
+                    symbol_name
+                );
+            }
+
             definitions.push(DataDefinition {
                 symbol_name,
                 object,
@@ -281,47 +441,98 @@ impl DataManifest {
                 section_ordinal,
                 section_offset,
                 scope,
+                provisional,
             });
         }
-        if !saw_header {
+        if schema.is_none() {
             anyhow::bail!("{}: missing data manifest header", path.display());
         }
 
-        definitions.sort_unstable_by_key(|definition| definition.rva);
-        for pair in definitions.windows(2) {
-            if pair[0].rva.checked_add(pair[0].size).unwrap() > pair[1].rva {
-                anyhow::bail!("overlapping data manifest definitions");
+        let mut owners = definitions
+            .iter()
+            .filter(|definition| !definition.provisional)
+            .copied()
+            .collect::<Vec<_>>();
+        owners.sort_by_key(|definition| (definition.rva, definition.emission_key()));
+        for pair in owners.windows(2) {
+            if pair[0].rva.checked_add(pair[0].size).unwrap() > pair[1].rva
+                && !pair[1].is_folded_copy_of(&pair[0])
+            {
+                anyhow::bail!(
+                    "{}: overlapping data manifest definitions {} at {:#x} and {} at {:#x}",
+                    path.display(),
+                    pair[0].symbol_name,
+                    pair[0].rva,
+                    pair[1].symbol_name,
+                    pair[1].rva
+                );
             }
         }
-        Ok(Self { definitions })
+        definitions.sort_by_key(DataDefinition::emission_key);
+        let names = definitions
+            .iter()
+            .map(|definition| definition.symbol_name.as_bytes())
+            .collect();
+        Ok(Self {
+            definitions,
+            owners,
+            names,
+        })
     }
 
     #[cfg(test)]
-    pub fn definitions(&self) -> &[DataDefinition] {
-        &self.definitions
-    }
-
-    pub fn definitions_in_emission_order(&self) -> Vec<DataDefinition> {
+    pub fn definitions(&self) -> Vec<DataDefinition> {
         let mut definitions = self.definitions.clone();
-        definitions.sort_unstable_by_key(|definition| {
-            (
-                definition.object,
-                definition.storage,
-                definition.section_ordinal.unwrap_or(0),
-                definition.section_offset.unwrap_or(definition.rva),
-                definition.rva,
-            )
-        });
+        definitions.sort_by_key(|definition| (definition.rva, definition.emission_key()));
         definitions
     }
 
+    pub fn definitions_in_emission_order(&self) -> &[DataDefinition] {
+        &self.definitions
+    }
+
+    /// Whether some row defines `name`, in any object.
+    pub fn defines(&self, name: &[u8]) -> bool {
+        self.names.contains(name)
+    }
+
+    /// The proven definition containing `rva`. Among folded copies the first in
+    /// emission order answers; they share every column but the object.
     pub fn owner_and_addend_for_rva(&self, rva: usize) -> Option<(DataDefinition, usize)> {
-        let index = self
+        let mut index = self
+            .owners
+            .partition_point(|definition| definition.rva <= rva)
+            .checked_sub(1)?;
+        while index > 0 && self.owners[index - 1].rva == self.owners[index].rva {
+            index -= 1;
+        }
+        let definition = self.owners[index];
+        definition
+            .contains(rva)
+            .then_some((definition, rva - definition.rva))
+    }
+
+    /// The provisional definition of `storage` containing `rva`, for a target no
+    /// proven row owns: the nearest start wins, then the lower candidate offset.
+    pub fn provisional_owner_and_addend_for_rva(
+        &self,
+        rva: usize,
+        storage: DataStorage,
+    ) -> Option<(DataDefinition, usize)> {
+        let definition = self
             .definitions
-            .partition_point(|definition| definition.rva <= rva);
-        let definition = *self.definitions.get(index.checked_sub(1)?)?;
-        let addend = rva - definition.rva;
-        (addend < definition.size).then_some((definition, addend))
+            .iter()
+            .filter(|definition| {
+                definition.provisional && definition.storage == storage && definition.contains(rva)
+            })
+            .min_by_key(|definition| {
+                (
+                    rva - definition.rva,
+                    definition.section_offset.unwrap_or(definition.rva),
+                    definition.symbol_name.as_bytes(),
+                )
+            })?;
+        Some((*definition, rva - definition.rva))
     }
 }
 
@@ -409,7 +620,7 @@ mod tests {
         assert_eq!(parsed.definitions().len(), 3);
         let table = parsed
             .definitions()
-            .iter()
+            .into_iter()
             .find(|row| row.symbol_name.as_bytes() == b"table")
             .unwrap();
         assert_eq!(table.object, b"engine\\world.c");
@@ -424,7 +635,7 @@ mod tests {
         );
         let constant = parsed
             .definitions()
-            .iter()
+            .into_iter()
             .find(|row| row.symbol_name.as_bytes() == b"constant")
             .unwrap();
         assert_eq!(constant.section_offset, None);
@@ -433,7 +644,7 @@ mod tests {
 
     #[test]
     fn accepts_missing_final_line_ending_and_uses_raw_pdb_symbol_bytes() {
-        let mut bytes = HEADER.to_vec();
+        let mut bytes = PDB_HEADER.to_vec();
         bytes.extend_from_slice(b"\nu.c\t0x180\t4\tdata\t4\t-\t0\texternal");
         let parsed = DataManifest::parse(&bytes, Path::new("test.tsv"), &symbols()).unwrap();
         assert_eq!(parsed.definitions()[0].symbol_name.as_bytes(), b"\x80raw");
@@ -441,7 +652,7 @@ mod tests {
 
     #[test]
     fn rejects_bare_carriage_return_line_endings() {
-        let mut bytes = HEADER.to_vec();
+        let mut bytes = PDB_HEADER.to_vec();
         bytes.extend_from_slice(b"\ru.c\t0x100\t4\tdata\t4\t-\t0\texternal");
         let error = DataManifest::parse(&bytes, Path::new("test.tsv"), &symbols())
             .err()
@@ -524,16 +735,170 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_rvas() {
+        for second in [
+            "two.c\t0x100\t8\tdata\t4\t-\t0\texternal",
+            "two.c\t0x100\t4\tdata\t8\t-\t0\texternal",
+            "two.c\t0x100\t4\tdata\t4\t-\t0\tlocal",
+        ] {
+            let text = format!("{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t-\t0\texternal\n{second}\n");
+            assert!(
+                parse(&text)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("duplicate data RVA"),
+                "accepted {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_one_folded_comdat_claimed_by_several_objects() {
         let text = format!(
-            "{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t-\t0\texternal\ntwo.c\t0x100\t4\tdata\t4\t-\t0\texternal\n"
+            "{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t-\t0\texternal\n\
+             two.c\t0x100\t4\tdata\t4\t-\t0\texternal\n\
+             three.c\t0x100\t4\tdata\t4\t-\t0\texternal\n"
+        );
+        let parsed = parse(&text).unwrap();
+        assert_eq!(parsed.definitions().len(), 3);
+        let (owner, addend) = parsed.owner_and_addend_for_rva(0x102).unwrap();
+        assert_eq!(owner.symbol_name.as_bytes(), b"table");
+        assert_eq!(owner.object, b"one.c");
+        assert_eq!(addend, 2);
+
+        let repeated = format!(
+            "{HEADER_TEXT}one.c\t0x100\t4\tdata\t4\t-\t0\texternal\n\
+             one.c\t0x100\t4\tdata\t4\t-\t0\texternal\n"
         );
         assert!(
-            parse(&text)
+            parse(&repeated)
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("duplicate data RVA")
+                .contains("duplicate data definition in one object")
         );
+    }
+
+    const NAMED_HEADER_TEXT: &str = "name\tobject\trva\tsize\tstorage\talignment\tsection_ordinal\tsection_offset\tscope\tprovenance\n";
+
+    fn named(rows: &str) -> anyhow::Result<DataManifest> {
+        parse(&format!("{NAMED_HEADER_TEXT}{rows}"))
+    }
+
+    #[test]
+    fn named_rows_carry_their_own_identities() {
+        let parsed = named(
+            "??_C@_05FOO@foo?$AA@\tu.c\t0x900\t6\trdata\t1\t2\t0\texternal\tcandidate\n\
+             g_local\tu.c\t0x910\t4\tbss\t4\t-\t-\tlocal\treviewed\n",
+        )
+        .unwrap();
+        let definitions = parsed.definitions();
+        assert_eq!(
+            definitions[0].symbol_name.as_bytes(),
+            b"??_C@_05FOO@foo?$AA@"
+        );
+        assert_eq!(definitions[0].section_ordinal, Some(2));
+        assert_eq!(definitions[1].symbol_name.as_bytes(), b"g_local");
+        assert!(parsed.defines(b"g_local"));
+        assert!(!parsed.defines(b"table"));
+        for row in [
+            "\tu.c\t0x900\t4\tdata\t4\t-\t-\texternal\treviewed\n",
+            "x\tu.c\t0x900\t4\tdata\t4\t-\t-\texternal\t\n",
+        ] {
+            assert!(named(row).err().unwrap().to_string().contains("non-empty"));
+        }
+        assert!(
+            named("x\tu.c\t0x900\t4\tdata\t4\t-\t-\texternal\n")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("exactly ten")
+        );
+    }
+
+    #[test]
+    fn named_external_names_are_unique_and_local_names_unique_per_object() {
+        assert!(
+            named(
+                "x\tone.c\t0x900\t4\tdata\t4\t-\t-\texternal\treviewed\n\
+                 x\ttwo.c\t0x910\t4\tdata\t4\t-\t-\texternal\treviewed\n"
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("duplicate external data name x")
+        );
+        assert_eq!(
+            named(
+                "s\tone.c\t0x900\t4\tdata\t4\t-\t-\tlocal\treviewed\n\
+                 s\ttwo.c\t0x910\t4\tdata\t4\t-\t-\tlocal\treviewed\n"
+            )
+            .unwrap()
+            .definitions()
+            .len(),
+            2
+        );
+        assert!(
+            named(
+                "s\tone.c\t0x900\t4\tdata\t4\t-\t-\tlocal\treviewed\n\
+                 s\tone.c\t0x910\t4\tdata\t4\t-\t-\tlocal\treviewed\n"
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("duplicate local data name s")
+        );
+    }
+
+    #[test]
+    fn provisional_rows_are_emitted_but_own_only_uncovered_targets() {
+        let parsed = named(
+            "gap\tone.c\t0x900\t0x20\tdata\t4\t-\t-\texternal\tprovisional-band-gap\n\
+             proved\ttwo.c\t0x910\t4\tdata\t4\t-\t-\texternal\treviewed\n\
+             near\tthree.c\t0x908\t0x10\tdata\t4\t-\t-\texternal\tprovisional-band-gap\n\
+             zero\tfour.c\t0x908\t4\tbss\t4\t-\t-\texternal\tprovisional-band-gap\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.definitions_in_emission_order().len(), 4);
+        assert_eq!(
+            parsed.owner_and_addend_for_rva(0x912).unwrap().0.object,
+            b"two.c"
+        );
+        assert!(parsed.owner_and_addend_for_rva(0x904).is_none());
+        let (owner, addend) = parsed
+            .provisional_owner_and_addend_for_rva(0x90c, DataStorage::Data)
+            .unwrap();
+        assert_eq!((owner.symbol_name.as_bytes(), addend), (&b"near"[..], 4));
+        let (owner, addend) = parsed
+            .provisional_owner_and_addend_for_rva(0x904, DataStorage::Data)
+            .unwrap();
+        assert_eq!((owner.symbol_name.as_bytes(), addend), (&b"gap"[..], 4));
+        assert_eq!(
+            parsed
+                .provisional_owner_and_addend_for_rva(0x908, DataStorage::Bss)
+                .unwrap()
+                .0
+                .object,
+            b"four.c"
+        );
+        assert!(
+            parsed
+                .provisional_owner_and_addend_for_rva(0x920, DataStorage::Data)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn proven_rows_may_not_overlap_through_a_provisional_row() {
+        let error = named(
+            "a\tone.c\t0x900\t0x20\tdata\t4\t-\t-\texternal\treviewed\n\
+             p\ttwo.c\t0x904\t4\tdata\t4\t-\t-\texternal\tprovisional-band-gap\n\
+             b\tthree.c\t0x910\t4\tdata\t4\t-\t-\texternal\treviewed\n",
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("overlapping data manifest definitions a at 0x900 and b at 0x910"));
     }
 
     #[test]
