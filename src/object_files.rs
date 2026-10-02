@@ -1091,9 +1091,9 @@ impl ObjectFile {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
 
-        // A static this object declares COMMON owns no bytes to copy; the
-        // reference binds to the COMMON symbol.
-        if let RelocKind::ConjuredStatic { .. } = reloc_kind
+        // A conjured word named like a COMMON symbol of this object owns no bytes
+        // to copy; the reference binds to the COMMON symbol.
+        if let RelocKind::ConjuredStatic { .. } | RelocKind::ConjuredConstant { .. } = reloc_kind
             && self.common_symbols.contains(reloc_name.as_bytes())
         {
             self.add_relocation(
@@ -1118,7 +1118,9 @@ impl ObjectFile {
                 TargetMaterialization::Materialize,
                 RelocKind::ConjuredConstant { symbol, target_rva }
                 | RelocKind::ConjuredStatic {
-                    symbol, target_rva, ..
+                    symbol,
+                    target_rva,
+                    storage: DataStorage::Data | DataStorage::Rdata,
                 },
             ) => Some(ConjuredCopy {
                 symbol: symbol.as_bytes().to_vec(),
