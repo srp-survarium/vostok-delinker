@@ -13,7 +13,7 @@ use crate::relocs::{
 use crate::symbol_matcher::{SymbolMatcher, canonical_name};
 use crate::utils::{ToU64, ToUsize, contains, leak};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Register};
 
@@ -681,6 +681,46 @@ fn decoded_absolute_operand_fields(
     [displacement, immediate[0], immediate[1]]
 }
 
+/// Inline jump table entries of a function, by offset: retained absolute
+/// relocation fields that hold a label of the function itself. The absolute
+/// pass has already rewritten each to the label's offset from the function
+/// start. An operand that addresses data inside the function lands here too,
+/// so the decoder treats an entry as data only when it reaches it at an
+/// instruction boundary.
+fn inline_jump_table_entries(
+    fun_rva: usize,
+    fun_size: usize,
+    symbols: &PdbSymbols,
+    coff_data: &[u8],
+    relocs_rva: &BTreeMap<usize, RelocKind>,
+) -> BTreeMap<usize, usize> {
+    let Some(own) = symbols.functions.get(&fun_rva) else {
+        return BTreeMap::new();
+    };
+    let fun_end = fun_rva + fun_size;
+    relocs_rva
+        .range(fun_rva..fun_end)
+        .filter_map(|(&site_rva, kind)| {
+            let RelocKind::Function {
+                overloads,
+                encoding: RelocationEncoding::Absolute,
+                ..
+            } = kind
+            else {
+                return None;
+            };
+            if !std::ptr::eq(overloads.as_ptr(), own.as_ptr())
+                || site_rva + std::mem::size_of::<u32>() > fun_end
+            {
+                return None;
+            }
+            let entry =
+                bytemuck::pod_read_unaligned::<u32>(&coff_data[site_rva..site_rva + 4]).to_usize();
+            (entry < fun_size).then_some((site_rva - fun_rva, entry))
+        })
+        .collect()
+}
+
 fn resolve_code_relocations<'s>(
     image_base: u32,
 
@@ -707,7 +747,32 @@ fn resolve_code_relocations<'s>(
     let mut decoder = Decoder::with_ip(32, code, fun_va as u64, DecoderOptions::NONE);
     let mut ix = Instruction::default();
 
+    let table_entries =
+        inline_jump_table_entries(fun_rva, fun_size, symbols, coff_data, relocs_rva);
+    // Offsets that code is known to start at: jump table entries and the
+    // targets of internal branches decoded so far.
+    let mut labels = BTreeSet::new();
+
     while decoder.can_decode() {
+        let position = decoder.position();
+        if table_entries.contains_key(&position) {
+            // A linear sweep must not decode a jump table as code: its last
+            // bytes can swallow the opcode of the next instruction and hide
+            // that instruction's relocation. Skip the table, and any byte
+            // index table after it, to the next label.
+            let mut end = position;
+            while let Some(entry) = table_entries.get(&end) {
+                labels.insert(*entry);
+                end += std::mem::size_of::<u32>();
+            }
+            let resume = labels.range(end..).next().copied().unwrap_or(end);
+            if resume >= fun_size {
+                break;
+            }
+            decoder.set_position(resume)?;
+            decoder.set_ip((fun_va + resume) as u64);
+            continue;
+        }
         decoder.decode_out(&mut ix);
 
         match code_relocation_recovery {
@@ -777,9 +842,15 @@ fn resolve_code_relocations<'s>(
             .resolve_incremental_trampoline(linked_target_rva.to_usize())
             .to_u64();
 
+        // A call to the function's own entry is a recursive call, which the
+        // compiler relocates against the function symbol.
+        let recursive_call =
+            ix.flow_control() == FlowControl::Call && target_rva.to_usize() == fun_rva;
         let internal_branch = linked_target_rva == target_rva
+            && !recursive_call
             && (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
         if internal_branch {
+            labels.insert(target_rva.to_usize() - fun_rva);
             continue;
         }
 
@@ -1780,6 +1851,101 @@ mod tests {
             panic!("expected a relative function relocation");
         };
         assert_eq!(overloads[0].as_bytes(), b"body");
+    }
+
+    fn resolve_fixture<'s>(
+        function_rva: usize,
+        code: &[u8],
+        symbols: &'s PdbSymbols,
+        relocations: &mut BTreeMap<usize, RelocKind<'s>>,
+    ) -> Vec<u8> {
+        let mut coff_data = vec![0; function_rva + code.len()];
+        coff_data[function_rva..].copy_from_slice(code);
+        resolve_code_relocations(
+            0x0040_0000,
+            function_rva,
+            code.len(),
+            symbols,
+            &coff_data,
+            relocations,
+            &RelocAliasManifest::default(),
+            &mut RelocAliasObservations::default(),
+            &DataManifest::default(),
+            ManifestCoverage::AllowPartial,
+            WritableExtent::all_initialized(),
+            CodeRelocationRecovery::RetainedOnly,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inline_jump_table_does_not_swallow_the_next_call() {
+        let function_rva = 0x1000;
+        let callee_rva = 0x2000;
+        // ret; a one-entry jump table holding label 5 (already rewritten to
+        // the label's offset); call callee; ret. Decoded as code, the entry
+        // `05 00 00 00` is `add eax, imm32` and swallows the call's opcode.
+        let code = [
+            0xc3, 0x05, 0x00, 0x00, 0x00, 0xe8, 0xf6, 0x0f, 0x00, 0x00, 0xc3,
+        ];
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(code.len()),
+            )
+            .unwrap();
+        symbols
+            .add_function_at_rva(callee_rva, RawString::from(&b"callee"[..]), Some(1))
+            .unwrap();
+        let mut relocations = BTreeMap::new();
+        relocations.insert(
+            function_rva + 1,
+            RelocKind::Function {
+                overloads: symbols.functions[&function_rva].as_slice(),
+                symbol: None,
+                encoding: RelocationEncoding::Absolute,
+            },
+        );
+
+        let resolved = resolve_fixture(function_rva, &code, &symbols, &mut relocations);
+        assert_eq!(&resolved[5..10], [0xe8, 0, 0, 0, 0]);
+        let RelocKind::Function {
+            overloads,
+            encoding: RelocationEncoding::Relative,
+            ..
+        } = relocations[&(function_rva + 6)]
+        else {
+            panic!("expected the call to be relocated");
+        };
+        assert_eq!(overloads[0].as_bytes(), b"callee");
+    }
+
+    #[test]
+    fn recursive_call_is_relocated_against_its_own_function() {
+        let function_rva = 0x1000;
+        // call self; ret
+        let code = [0xe8, 0xfb, 0xff, 0xff, 0xff, 0xc3];
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"recurse"[..]),
+                Some(code.len()),
+            )
+            .unwrap();
+        let mut relocations = BTreeMap::new();
+
+        let resolved = resolve_fixture(function_rva, &code, &symbols, &mut relocations);
+        assert_eq!(resolved, [0xe8, 0, 0, 0, 0, 0xc3]);
+        assert!(matches!(
+            relocations[&(function_rva + 1)],
+            RelocKind::Function {
+                encoding: RelocationEncoding::Relative,
+                ..
+            }
+        ));
     }
 
     #[test]
