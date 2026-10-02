@@ -1,4 +1,5 @@
 use crate::Env;
+use crate::common_symbol_manifest::CommonSymbolManifest;
 use crate::data_manifest::{DataDefinition, DataManifest, DataScope, DataStorage};
 use crate::data_section_manifest::{
     ComdatSelection, DataSection, DataSectionManifest, SectionChecksums, SectionStorage,
@@ -34,6 +35,7 @@ pub struct ObjectFile {
     pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: Option<object::write::SectionId>,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
+    common_symbols: HashSet<Vec<u8>>,
     conjured_copies: HashMap<ConjuredCopy, SymbolId>,
     topology_sections: Vec<EmittedTopologySection>,
     definition_ranges: Vec<Vec<(usize, usize)>>,
@@ -110,6 +112,7 @@ impl ObjectFiles<'_> {
         matcher: &SymbolMatcher,
         data_manifest: &DataManifest,
         data_section_manifest: &DataSectionManifest,
+        common_symbol_manifest: &CommonSymbolManifest,
         reloc_aliases: &RelocAliasManifest,
         observed_aliases: &mut RelocAliasObservations,
         manifest_coverage: ManifestCoverage,
@@ -143,6 +146,13 @@ impl ObjectFiles<'_> {
                     pad_empty_rdata,
                 )?,
             );
+        }
+
+        for common in common_symbol_manifest.symbols() {
+            this.objects
+                .entry(common.object)
+                .or_insert_with(empty_object)
+                .add_common_symbol(common.name, common.size)?;
         }
 
         let definitions = data_manifest.definitions_in_emission_order();
@@ -375,6 +385,7 @@ impl ObjectFile {
             bss_section_id: None,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            common_symbols: HashSet::new(),
             conjured_copies: HashMap::new(),
             topology_sections: Vec::new(),
             definition_ranges: Vec::new(),
@@ -539,6 +550,7 @@ impl ObjectFile {
             bss_section_id,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            common_symbols: HashSet::new(),
             conjured_copies: HashMap::new(),
             topology_sections,
             definition_ranges: vec![Vec::new(); sections.len()],
@@ -899,6 +911,27 @@ fn resolve_code_relocations<'s>(
 }
 
 impl ObjectFile {
+    fn add_common_symbol(&mut self, name: &[u8], size: u64) -> anyhow::Result<()> {
+        if self.object.symbol_id(name).is_some() {
+            anyhow::bail!(
+                "COMMON symbol {} is already a symbol of its object",
+                String::from_utf8_lossy(name)
+            );
+        }
+        self.object.add_symbol(object::write::Symbol {
+            name: name.to_vec(),
+            value: 0,
+            size,
+            kind: object::SymbolKind::Data,
+            scope: object::SymbolScope::Linkage,
+            weak: false,
+            section: object::write::SymbolSection::Common,
+            flags: object::SymbolFlags::None,
+        });
+        self.common_symbols.insert(name.to_vec());
+        Ok(())
+    }
+
     fn add_relocation_at(
         &mut self,
         reloc_kind: RelocKind,
@@ -913,6 +946,20 @@ impl ObjectFile {
     ) -> anyhow::Result<()> {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
+
+        // A static this object declares COMMON owns no bytes to copy; the
+        // reference binds to the COMMON symbol.
+        if let RelocKind::ConjuredStatic { .. } = reloc_kind
+            && self.common_symbols.contains(reloc_name.as_bytes())
+        {
+            self.add_relocation(
+                reloc_name,
+                ObjectLocation::Extern(object::SymbolKind::Data),
+                reloc_offset,
+                RelocationEncoding::Absolute,
+            )?;
+            return Ok(());
+        }
 
         // An object holds one private copy per conjured target; every further
         // reference binds to it, as the compiler's single definition would.
@@ -2166,6 +2213,51 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(zero_fill.len(), 1);
         assert!(zero_fill[0].is_undefined());
+    }
+
+    #[test]
+    fn conjured_static_binds_to_a_common_symbol_of_its_object() {
+        let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        output.add_common_symbol(b"guard", 1).unwrap();
+        assert!(output.add_common_symbol(b"guard", 1).is_err());
+        let text_section_id = output.text_section();
+        let field = output.append_section_data(text_section_id, &[0; 4], 0x90);
+        output
+            .add_relocation_at(
+                RelocKind::ConjuredStatic {
+                    symbol: RawString::from(&b"guard"[..]),
+                    target_rva: 0x100,
+                    storage: DataStorage::Data,
+                },
+                field,
+                &SymbolMatcher::off(),
+                &[0; 0x104],
+                &BTreeMap::new(),
+                &mut HashSet::new(),
+                TargetMaterialization::Materialize,
+            )
+            .unwrap();
+
+        let bytes = output.object.write().unwrap();
+        let parsed = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.section_by_name(".data").unwrap().size(), 0);
+        let guard = parsed
+            .symbols()
+            .filter(|symbol| symbol.name() == Ok("guard"))
+            .collect::<Vec<_>>();
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].section(), object::SymbolSection::Common);
+        assert_eq!(guard[0].size(), 1);
+        let (_, relocation) = parsed
+            .section_by_name(".text")
+            .unwrap()
+            .relocations()
+            .next()
+            .unwrap();
+        assert_eq!(
+            relocation.target(),
+            object::RelocationTarget::Symbol(guard[0].index())
+        );
     }
 
     #[test]

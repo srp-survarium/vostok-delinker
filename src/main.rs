@@ -1,5 +1,6 @@
 #![feature(os_string_truncate)]
 
+mod common_symbol_manifest;
 mod data_index;
 mod data_manifest;
 mod data_section_manifest;
@@ -74,6 +75,11 @@ pub struct Cli {
     /// Project-supplied candidate COFF section table and COMDAT topology.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_section_manifest: Option<std::path::PathBuf>,
+
+    /// Project-supplied TSV of COMMON symbols (`object`, `name`, `size`) that an
+    /// object declares instead of defining storage.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub common_symbol_manifest: Option<std::path::PathBuf>,
 
     /// Reviewed function/target/site selections whose data or function
     /// relocations use a specific existing PDB owner symbol and addend.
@@ -179,6 +185,7 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map,
         data_manifest,
         data_section_manifest,
+        common_symbol_manifest,
         reloc_alias_manifest,
         strict,
         recover_data_relocs_from_pdb: _,
@@ -234,6 +241,7 @@ fn main() -> anyhow::Result<()> {
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
         data_section_manifest.as_deref(),
+        common_symbol_manifest.as_deref(),
         reloc_alias_manifest.as_deref(),
         manifest_coverage,
         reloc_manifest.as_deref(),
@@ -254,6 +262,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
     data_section_manifest_path: Option<&std::path::Path>,
+    common_symbol_manifest_path: Option<&std::path::Path>,
     reloc_alias_manifest_path: Option<&std::path::Path>,
     manifest_coverage: relocs::ManifestCoverage,
     reloc_manifest_path: Option<&std::path::Path>,
@@ -267,6 +276,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     let reloc_manifest = reloc_manifest::RelocManifest::load(reloc_manifest_path)?;
     let data_section_manifest =
         data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
+    let common_symbol_manifest =
+        common_symbol_manifest::CommonSymbolManifest::load(common_symbol_manifest_path)?;
     let reloc_alias_manifest =
         reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
     reloc_alias_manifest.validate_site_membership(&pdb_symbols)?;
@@ -330,6 +341,7 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &matcher,
         &data_manifest,
         &data_section_manifest,
+        &common_symbol_manifest,
         &reloc_alias_manifest,
         &mut observed_aliases,
         manifest_coverage,
