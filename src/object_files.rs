@@ -98,6 +98,31 @@ impl<'a> FunctionClaims<'a> {
     }
 }
 
+/// The candidate sections with a linked range, sorted by RVA.
+struct PlacedSections<'a> {
+    sections: Vec<(usize, usize, &'a DataSection)>,
+}
+
+impl<'a> PlacedSections<'a> {
+    fn new(sections: &'a [DataSection]) -> Self {
+        let mut sections = sections
+            .iter()
+            .filter_map(|section| Some((section.rva?, section.rva? + section.size, section)))
+            .collect::<Vec<_>>();
+        sections.sort_unstable_by_key(|(start, ..)| *start);
+        Self { sections }
+    }
+
+    fn overlapping(&self, start: usize, end: usize) -> Option<&'a DataSection> {
+        let candidates = self.sections.partition_point(|(rva, ..)| *rva < end);
+        self.sections[..candidates]
+            .iter()
+            .rev()
+            .find(|(_, section_end, _)| *section_end > start)
+            .map(|(.., section)| *section)
+    }
+}
+
 impl ObjectFiles<'_> {
     pub fn parse<'s, S>(
         env: &Env,
@@ -157,15 +182,31 @@ impl ObjectFiles<'_> {
 
         let definitions = data_manifest.definitions_in_emission_order();
 
+        // A definition that no candidate section places is appended to its
+        // object's storage section. One inside a placed section's linked range
+        // would emit its bytes and relocations a second time.
+        let placed = PlacedSections::new(data_section_manifest.sections());
         for definition in definitions {
             let definition_end = definition.rva.checked_add(definition.size).unwrap();
+            if definition.section_ordinal.is_none()
+                && let Some(section) = placed.overlapping(definition.rva, definition_end)
+            {
+                anyhow::bail!(
+                    "data manifest definition `{}` in {} (RVA {:#x}..{:#x}) has no section \
+                     ordinal but lies in section {} of {}",
+                    definition.symbol_name,
+                    String::from_utf8_lossy(definition.object),
+                    definition.rva,
+                    definition_end,
+                    section.ordinal,
+                    String::from_utf8_lossy(section.object),
+                );
+            }
             let section = match definition.storage {
                 DataStorage::Rdata => env.rdata,
                 DataStorage::Data | DataStorage::Bss => env.data,
             };
-            if !definition.provisional
-                && (definition.rva < section.rva || definition_end > section.rva + section.size)
-            {
+            if definition.rva < section.rva || definition_end > section.rva + section.size {
                 anyhow::bail!(
                     "data manifest definition `{}` in {} (storage {:?}, RVA {:#x}..{:#x}) \
                      does not fit its PE section (RVA {:#x}..{:#x})",
@@ -2578,6 +2619,34 @@ mod tests {
         assert_eq!(parsed_sections[0].name().unwrap(), ".drectve");
         assert_eq!(parsed_sections[1].data().unwrap(), b"main");
         assert_eq!(parsed_sections[2].data().unwrap(), b"fold");
+    }
+
+    #[test]
+    fn placed_sections_find_any_overlap() {
+        let section = |ordinal, rva, size| DataSection {
+            object: b"fixture.c",
+            ordinal,
+            name: b".data",
+            rva,
+            size,
+            alignment: 4,
+            characteristics: 0xc030_0040,
+            checksum: 0,
+            comdat_selection: ComdatSelection::None,
+            associative_ordinal: None,
+            storage: Some(SectionStorage::Data),
+        };
+        let sections = [
+            section(1, Some(0x100), 0x100),
+            section(2, Some(0x210), 0x10),
+            section(3, None, 0x40),
+        ];
+        let placed = PlacedSections::new(&sections);
+        assert_eq!(placed.overlapping(0x1fc, 0x204).unwrap().ordinal, 1);
+        assert_eq!(placed.overlapping(0x20c, 0x214).unwrap().ordinal, 2);
+        assert!(placed.overlapping(0x200, 0x210).is_none());
+        assert!(placed.overlapping(0x0, 0x100).is_none());
+        assert!(placed.overlapping(0x220, 0x300).is_none());
     }
 
     #[test]
