@@ -11,6 +11,8 @@ pub struct PdbSymbols {
     function_extents: BTreeMap<usize, usize>,
     incremental_trampolines: BTreeMap<usize, PdbIncrementalTrampoline>,
     pub imports: BTreeMap<usize, RawString<'static>>,
+    /// Data records the PDB places in `.text`, by RVA.
+    pub text_data: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
     pub constants: BTreeMap<usize, PdbDataSymbol>,
@@ -163,6 +165,12 @@ impl PdbSymbols {
                     assert_eq!(old_symbol, None, "Static symbols cannot repeat");
                 }
 
+                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                    if offset.section == env.text.id =>
+                {
+                    self.text_data.entry(symbol_rva).or_insert(name);
+                }
+
                 // Unmangled data symbols to cover missing spots.
                 pdb2::SymbolData::Data(pdb2::DataSymbol { type_index, .. })
                     if offset.section == env.rdata.id =>
@@ -250,6 +258,11 @@ impl PdbSymbols {
                     })) => {
                         if let Some(symbol_rva) = env.iat_rva(offset) {
                             self.imports.entry(symbol_rva).or_insert(name);
+                            continue;
+                        }
+                        if offset.section == env.text.id {
+                            self.text_data
+                                .insert(env.text.rva + offset.offset.to_usize(), name);
                             continue;
                         }
                         let symbol_rva = match () {
@@ -442,6 +455,23 @@ impl PdbSymbols {
 
     pub fn is_incremental_trampoline(&self, rva: usize) -> bool {
         self.incremental_trampolines.contains_key(&rva)
+    }
+
+    /// The `.text` data record starting at `rva`, unless a function's extent
+    /// covers it: a record inside a function (a switch table, a case label) is
+    /// part of that function's code.
+    pub fn data_outside_functions(&self, rva: usize) -> Option<RawString<'static>> {
+        let symbol = *self.text_data.get(&rva)?;
+        let inside = self
+            .functions
+            .range(..=rva)
+            .next_back()
+            .is_some_and(|(start, _)| {
+                self.function_extents
+                    .get(start)
+                    .is_some_and(|size| rva - start < *size)
+            });
+        (!inside).then_some(symbol)
     }
 
     /// The Procedure/Thunk length recorded for the function starting at `rva`.

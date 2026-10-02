@@ -29,9 +29,9 @@ pub enum RelocKind<'a> {
         encoding: RelocationEncoding,
     },
 
-    // Reviewed: the target is a definition in the `--data-manifest`. Always
-    // emitted as an external reference to that shared definition, which its
-    // owning object defines. Covers both `.rdata` and `.data` targets.
+    // Reviewed: the target is a named definition that some object owns: one in
+    // the `--data-manifest`, or a PDB data record in `.text`. Always emitted as
+    // an external reference to it.
     ReviewedData {
         symbol: RawString<'static>,
     },
@@ -224,6 +224,9 @@ pub(crate) fn classify_exact_pdb_target<'s>(
     reloc_rva: usize,
     target_rva: usize,
 ) -> anyhow::Result<Option<(RelocKind<'s>, u32)>> {
+    if let Some(symbol) = symbols.data_outside_functions(target_rva) {
+        return Ok(Some((RelocKind::ReviewedData { symbol }, 0)));
+    }
     let target_rva = symbols.resolve_incremental_trampoline(target_rva);
     if let Some(symbol) = symbols.imports.get(&target_rva) {
         return Ok(Some((RelocKind::Import { symbol: *symbol }, 0)));
@@ -798,6 +801,12 @@ fn resolve_absolute_site<'s>(
                 },
             );
         }
+        // An explicit data record in code outranks the function before it.
+        // Only its exact start is known: an untyped record has no extent.
+        () if let Some(symbol) = symbols.data_outside_functions(linked_target_rva) => {
+            coff_data_reloc.copy_from_slice(&0_u32.to_le_bytes());
+            relocs_rva.insert(reloc_rva, RelocKind::ReviewedData { symbol });
+        }
         () if (env.text.rva..env.text.rva + env.text.size).contains(&target_rva) => {
             let (function_rva, function_overloads) = symbols
                 .functions
@@ -1240,6 +1249,42 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("absent"), "{error}");
+    }
+
+    #[test]
+    fn data_record_in_code_outranks_the_function_before_it() {
+        let mut symbols = pdb_symbols::PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"owner"[..]), Some(0x20))
+            .unwrap();
+        symbols
+            .text_data
+            .insert(0x1020, RawString::from(&b"_s_table"[..]));
+        // A switch table inside the function stays part of its code.
+        symbols
+            .text_data
+            .insert(0x1010, RawString::from(&b"const_00401010"[..]));
+        let classify = |target_rva| {
+            classify_exact_pdb_target(
+                &symbols,
+                &DataManifest::default(),
+                &RelocAliasManifest::default(),
+                &mut RelocAliasObservations::default(),
+                ManifestCoverage::RequireComplete,
+                WritableExtent::all_initialized(),
+                0x1000,
+                0x1010,
+                target_rva,
+            )
+            .unwrap()
+        };
+        assert!(matches!(
+            classify(0x1020),
+            Some((RelocKind::ReviewedData { symbol }, 0)) if symbol.as_bytes() == b"_s_table"
+        ));
+        assert!(classify(0x1024).is_none());
+        assert!(classify(0x1010).is_none());
+        assert!(symbols.data_outside_functions(0x1010).is_none());
     }
 
     #[test]
