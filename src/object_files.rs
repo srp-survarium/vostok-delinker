@@ -804,6 +804,80 @@ fn inline_jump_table_entries(
         .collect()
 }
 
+/// Offsets where a function's code is known to start: the entries of every
+/// jump table a sweep that skips the tables reaches, and every internal branch
+/// target it decodes. The sweep repeats until no label is added, since a label
+/// found late can mark code that an earlier sweep skipped as part of a table.
+///
+/// Only a table reached at an instruction boundary gives labels: an entry that
+/// is the operand of an instruction holds a data address, such as the byte
+/// index table after a jump table, and resuming there would decode data.
+fn code_labels(
+    code: &[u8],
+    fun_va: u64,
+    table_entries: &BTreeMap<usize, usize>,
+) -> anyhow::Result<BTreeSet<usize>> {
+    let mut labels = BTreeSet::new();
+    loop {
+        let known = labels.len();
+        let mut decoder = Decoder::with_ip(32, code, fun_va, DecoderOptions::NONE);
+        let mut ix = Instruction::default();
+        while decoder.can_decode() {
+            let position = decoder.position();
+            if table_entries.contains_key(&position) {
+                let mut end = position;
+                while let Some(entry) = table_entries.get(&end) {
+                    labels.insert(*entry);
+                    end += std::mem::size_of::<u32>();
+                }
+                let resume = code_after_table(position, table_entries, &labels);
+                if resume >= code.len() {
+                    break;
+                }
+                decoder.set_position(resume)?;
+                decoder.set_ip(fun_va + resume as u64);
+                continue;
+            }
+            decoder.decode_out(&mut ix);
+            if !matches!(
+                ix.flow_control(),
+                FlowControl::ConditionalBranch
+                    | FlowControl::UnconditionalBranch
+                    | FlowControl::Call
+            ) {
+                continue;
+            }
+            let target = match ix.op0_kind() {
+                OpKind::NearBranch16 => u64::from(ix.near_branch16()),
+                OpKind::NearBranch32 => u64::from(ix.near_branch32()),
+                _ => continue,
+            };
+            if let Some(offset) = target.checked_sub(fun_va)
+                && (offset as usize) < code.len()
+            {
+                labels.insert(offset as usize);
+            }
+        }
+        if labels.len() == known {
+            return Ok(labels);
+        }
+    }
+}
+
+/// Where code resumes after the jump table at `position`: past its entries,
+/// and past any byte index table that follows, at the next label.
+fn code_after_table(
+    position: usize,
+    table_entries: &BTreeMap<usize, usize>,
+    labels: &BTreeSet<usize>,
+) -> usize {
+    let mut end = position;
+    while table_entries.contains_key(&end) {
+        end += std::mem::size_of::<u32>();
+    }
+    labels.range(end..).next().copied().unwrap_or(end)
+}
+
 fn resolve_code_relocations<'s>(
     image_base: u32,
 
@@ -835,23 +909,15 @@ fn resolve_code_relocations<'s>(
 
     let table_entries =
         inline_jump_table_entries(fun_rva, fun_size, symbols, coff_data, relocs_rva);
-    // Offsets that code is known to start at: jump table entries and the
-    // targets of internal branches decoded so far.
-    let mut labels = BTreeSet::new();
+    let labels = code_labels(code, fun_va as u64, &table_entries)?;
 
     while decoder.can_decode() {
         let position = decoder.position();
         if table_entries.contains_key(&position) {
             // A linear sweep must not decode a jump table as code: its last
             // bytes can swallow the opcode of the next instruction and hide
-            // that instruction's relocation. Skip the table, and any byte
-            // index table after it, to the next label.
-            let mut end = position;
-            while let Some(entry) = table_entries.get(&end) {
-                labels.insert(*entry);
-                end += std::mem::size_of::<u32>();
-            }
-            let resume = labels.range(end..).next().copied().unwrap_or(end);
+            // that instruction's relocation.
+            let resume = code_after_table(position, &table_entries, &labels);
             if resume >= fun_size {
                 break;
             }
@@ -941,7 +1007,6 @@ fn resolve_code_relocations<'s>(
             && !recursive_call
             && (fun_rva..fun_rva + fun_size).contains(&(target_rva.to_usize()));
         if internal_branch {
-            labels.insert(target_rva.to_usize() - fun_rva);
             continue;
         }
 
@@ -2112,6 +2177,93 @@ mod tests {
             panic!("expected the call to be relocated");
         };
         assert_eq!(overloads[0].as_bytes(), b"callee");
+    }
+
+    #[test]
+    fn code_after_a_jump_table_reached_by_a_later_branch_is_decoded() {
+        let function_rva = 0x1000;
+        let callee_rva = 0x2000;
+        // jmp 0xc; table [0xc]; 6: call callee; ret; c: jmp 6; ret. Only the
+        // branch after the table shows that offset 6 is code.
+        let code = [
+            0xeb, 0x0a, 0x0c, 0x00, 0x00, 0x00, 0xe8, 0xf5, 0x0f, 0x00, 0x00, 0xc3, 0xeb, 0xf8,
+            0xc3,
+        ];
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(code.len()),
+            )
+            .unwrap();
+        symbols
+            .add_function_at_rva(callee_rva, RawString::from(&b"callee"[..]), Some(1))
+            .unwrap();
+        let mut relocations = BTreeMap::new();
+        relocations.insert(
+            function_rva + 2,
+            RelocKind::Function {
+                overloads: symbols.functions[&function_rva].as_slice(),
+                symbol: None,
+                encoding: RelocationEncoding::Absolute,
+            },
+        );
+
+        let resolved = resolve_fixture(function_rva, &code, &symbols, &mut relocations);
+        assert_eq!(&resolved[6..11], [0xe8, 0, 0, 0, 0]);
+        assert!(matches!(
+            relocations[&(function_rva + 7)],
+            RelocKind::Function {
+                encoding: RelocationEncoding::Relative,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_operand_addressing_the_index_table_is_not_a_label() {
+        let function_rva = 0x1000;
+        let callee_rva = 0x2000;
+        // 0: mov cl, [eax+0x11]; 6: jmp [ecx*4+0xd]; d: table [0x12];
+        // 11: index table [0x2d]; 12: call callee; ret. Resuming at the index
+        // table would decode `sub eax, imm32` over the call.
+        let code = [
+            0x8a, 0x88, 0x11, 0x00, 0x00, 0x00, 0xff, 0x24, 0x8d, 0x0d, 0x00, 0x00, 0x00, 0x12,
+            0x00, 0x00, 0x00, 0x2d, 0xe8, 0xe9, 0x0f, 0x00, 0x00, 0xc3,
+        ];
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(
+                function_rva,
+                RawString::from(&b"owner"[..]),
+                Some(code.len()),
+            )
+            .unwrap();
+        symbols
+            .add_function_at_rva(callee_rva, RawString::from(&b"callee"[..]), Some(1))
+            .unwrap();
+        let mut relocations = BTreeMap::new();
+        for site in [2, 9, 0xd] {
+            relocations.insert(
+                function_rva + site,
+                RelocKind::Function {
+                    overloads: symbols.functions[&function_rva].as_slice(),
+                    symbol: None,
+                    encoding: RelocationEncoding::Absolute,
+                },
+            );
+        }
+
+        let resolved = resolve_fixture(function_rva, &code, &symbols, &mut relocations);
+        assert_eq!(&resolved[0x12..0x17], [0xe8, 0, 0, 0, 0]);
+        assert!(matches!(
+            relocations[&(function_rva + 0x13)],
+            RelocKind::Function {
+                encoding: RelocationEncoding::Relative,
+                ..
+            }
+        ));
     }
 
     #[test]
