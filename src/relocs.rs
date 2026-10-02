@@ -168,24 +168,33 @@ fn resolve_manifest_alias(
             alias.owner
         ),
         (None, _) => {
-            // A function-local static is `name$S<ordinal>` in CodeView, and the
-            // ordinal shifts whenever its function changes. A reviewed row may
-            // spell it `name$S`; the live symbol that resolves the row answers.
-            let mut statics = owners.iter().filter(|(owner_rva, symbol)| {
-                is_ordinal_of_static(symbol.name.as_bytes(), alias.owner.as_bytes())
-                    && resolves(**owner_rva)
-            });
-            match (statics.next(), statics.next()) {
-                (Some((owner_rva, symbol)), None) => (*owner_rva, symbol.name),
-                (Some(_), Some(_)) => anyhow::bail!(
-                    "relocation alias owner is ambiguous in the PDB: {}",
-                    alias.owner
-                ),
-                (None, _) => anyhow::bail!(
+            // A function-local static spelled `name$S<ordinal>` changes its
+            // ordinal whenever its function changes. A reviewed row may spell
+            // it `name$S`; of the statics with that spelling, the one at the
+            // row's owner address answers. RVAs are unique, so at most one does.
+            let statics = owners
+                .iter()
+                .filter(|(_, symbol)| {
+                    is_ordinal_of_static(symbol.name.as_bytes(), alias.owner.as_bytes())
+                })
+                .collect::<Vec<_>>();
+            if statics.is_empty() {
+                anyhow::bail!(
                     "relocation alias owner is absent from the PDB: {}",
                     alias.owner
-                ),
+                );
             }
+            let Some((owner_rva, symbol)) =
+                statics.iter().find(|(owner_rva, _)| resolves(**owner_rva))
+            else {
+                anyhow::bail!(
+                    "relocation alias owner {} does not resolve to target {target_rva:#x} \
+                     with addend {:#x}",
+                    alias.owner,
+                    alias.addend
+                );
+            };
+            (**owner_rva, symbol.name)
         }
     };
     if !resolves(owner_rva) {
@@ -195,9 +204,11 @@ fn resolve_manifest_alias(
     Ok(Some((alias.addend, owner)))
 }
 
-/// Whether `live` is `spelling` (which ends in `$S`) plus a CodeView ordinal.
+/// Whether `live` is `spelling` (a non-empty name followed by `$S`) plus a
+/// decimal ordinal.
 fn is_ordinal_of_static(live: &[u8], spelling: &[u8]) -> bool {
-    spelling.ends_with(b"$S")
+    spelling.len() > b"$S".len()
+        && spelling.ends_with(b"$S")
         && live
             .strip_prefix(spelling)
             .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.iter().all(u8::is_ascii_digit))
@@ -1312,7 +1323,12 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("absent"), "{error}");
+        assert!(
+            error.contains("does not resolve to target 0x4200"),
+            "{error}"
+        );
+        assert!(!is_ordinal_of_static(b"$S1", b"$S"));
+        assert!(is_ordinal_of_static(b"x$S1", b"x$S"));
     }
 
     #[test]
