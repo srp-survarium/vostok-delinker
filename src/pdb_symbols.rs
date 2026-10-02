@@ -261,6 +261,8 @@ impl PdbSymbols {
                             continue;
                         }
                         if offset.section == env.text.id {
+                            // Module records win over global ones, as for
+                            // statics: they are closer to the original symbol.
                             self.text_data
                                 .insert(env.text.rva + offset.offset.to_usize(), name);
                             continue;
@@ -464,20 +466,23 @@ impl PdbSymbols {
         self.incremental_trampolines.keys().copied()
     }
 
-    /// The `.text` data record starting at `rva`, unless a function's extent
-    /// covers it: a record inside a function (a switch table, a case label) is
-    /// part of that function's code.
+    /// The `.text` data record starting at `rva`, unless it belongs to a
+    /// function: one starts there, or the extent of the function before it
+    /// covers it. A record inside a function (a switch table, a case label) is
+    /// part of that function's code. A function without a known extent is
+    /// taken to reach the next function.
     pub fn data_outside_functions(&self, rva: usize) -> Option<RawString<'static>> {
         let symbol = *self.text_data.get(&rva)?;
-        let inside = self
-            .functions
-            .range(..=rva)
-            .next_back()
-            .is_some_and(|(start, _)| {
-                self.function_extents
-                    .get(start)
-                    .is_some_and(|size| rva - start < *size)
-            });
+        let inside = self.functions.contains_key(&rva)
+            || self
+                .functions
+                .range(..rva)
+                .next_back()
+                .is_some_and(|(start, _)| {
+                    self.function_extents
+                        .get(start)
+                        .is_none_or(|size| rva - start < *size)
+                });
         (!inside).then_some(symbol)
     }
 

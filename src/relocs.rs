@@ -1342,6 +1342,25 @@ mod tests {
         assert!(classify(0x1024).is_none());
         assert!(classify(0x1010).is_none());
         assert!(symbols.data_outside_functions(0x1010).is_none());
+
+        // A record at a function's start is the function, and a function
+        // without a known extent reaches the next one.
+        symbols
+            .add_function_at_rva(0x1030, RawString::from(&b"public_only"[..]), None)
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x1040, RawString::from(&b"next"[..]), Some(4))
+            .unwrap();
+        for rva in [0x1030, 0x1038, 0x1040] {
+            symbols
+                .text_data
+                .insert(rva, RawString::from(&b"const_record"[..]));
+            assert!(symbols.data_outside_functions(rva).is_none(), "{rva:#x}");
+        }
+        symbols
+            .text_data
+            .insert(0x1044, RawString::from(&b"_s_after"[..]));
+        assert!(symbols.data_outside_functions(0x1044).is_some());
     }
 
     #[test]
