@@ -34,6 +34,7 @@ pub struct ObjectFile {
     pub bss_section_id: Option<object::write::SectionId>,
     pub text_section_id: Option<object::write::SectionId>,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
+    conjured_copies: HashMap<ConjuredCopy, SymbolId>,
     topology_sections: Vec<EmittedTopologySection>,
     definition_ranges: Vec<Vec<(usize, usize)>>,
     reviewed_section_checksums: Vec<([u8; 8], u32)>,
@@ -57,6 +58,14 @@ pub struct ObjectOffset {
 pub enum ObjectLocation {
     Offset(ObjectOffset),
     Extern(object::SymbolKind),
+}
+
+/// The target a private copy stands for: a PDB string by its name, or the
+/// constant/static word at an RVA spelled with a PDB name.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ConjuredCopy {
+    symbol: Vec<u8>,
+    target_rva: Option<usize>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -358,6 +367,7 @@ impl ObjectFile {
             bss_section_id: None,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            conjured_copies: HashMap::new(),
             topology_sections: Vec::new(),
             definition_ranges: Vec::new(),
             reviewed_section_checksums: Vec::new(),
@@ -521,6 +531,7 @@ impl ObjectFile {
             bss_section_id,
             text_section_id,
             undefined_symbols: HashMap::new(),
+            conjured_copies: HashMap::new(),
             topology_sections,
             definition_ranges: vec![Vec::new(); sections.len()],
             reviewed_section_checksums,
@@ -822,6 +833,32 @@ impl ObjectFile {
         let reloc_name = reloc_kind.get_name(matcher);
         let reloc_name = reloc_name.as_raw_string();
 
+        // An object holds one private copy per conjured target; every further
+        // reference binds to it, as the compiler's single definition would.
+        let copy = match (target_materialization, reloc_kind) {
+            (TargetMaterialization::Materialize, RelocKind::ConjuredString { symbol, .. }) => {
+                Some(ConjuredCopy {
+                    symbol: symbol.as_bytes().to_vec(),
+                    target_rva: None,
+                })
+            }
+            (
+                TargetMaterialization::Materialize,
+                RelocKind::ConjuredConstant { symbol, target_rva }
+                | RelocKind::ConjuredStatic { symbol, target_rva },
+            ) => Some(ConjuredCopy {
+                symbol: symbol.as_bytes().to_vec(),
+                target_rva: Some(target_rva),
+            }),
+            _ => None,
+        };
+        if let Some(copy) = &copy
+            && let Some(&symbol) = self.conjured_copies.get(copy)
+        {
+            self.add_symbol_relocation(symbol, reloc_offset, RelocationEncoding::Absolute)?;
+            return Ok(());
+        }
+
         // `Function` and `ReviewedData` reference a real definition elsewhere; a
         // `Conjured*` target is materialized as a private per-TU copy, unless the
         // caller only wants a reference.
@@ -879,12 +916,13 @@ impl ObjectFile {
                 let const_offset_in_coff_rdata =
                     self.append_section_data(rdata_section_id, data, 0x00);
 
-                self.add_relocation(
+                let symbol = self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                     RelocationEncoding::Absolute,
                 )?;
+                self.conjured_copies.insert(copy.unwrap(), symbol);
             }
 
             RelocKind::ConjuredConstant {
@@ -896,12 +934,13 @@ impl ObjectFile {
                 let rdata_section_id = self.rdata_section();
                 let const_offset_in_coff_rdata =
                     self.append_section_data(rdata_section_id, &new_data, 0x00);
-                self.add_relocation(
+                let symbol = self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(const_offset_in_coff_rdata),
                     reloc_offset,
                     RelocationEncoding::Absolute,
                 )?;
+                self.conjured_copies.insert(copy.unwrap(), symbol);
 
                 // Cycle guard for self-referential RVAs.
                 if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
@@ -928,12 +967,13 @@ impl ObjectFile {
                 let data_section_id = self.data_section();
                 let static_offset_in_coff_data =
                     self.append_section_data(data_section_id, &new_data, 0x00);
-                self.add_relocation(
+                let symbol = self.add_relocation(
                     reloc_name,
                     ObjectLocation::Offset(static_offset_in_coff_data),
                     reloc_offset,
                     RelocationEncoding::Absolute,
                 )?;
+                self.conjured_copies.insert(copy.unwrap(), symbol);
 
                 // Same cycle guard as the ConjuredConstant arm above.
                 if let Some(reloc_kind) = relocs_rva.get(&target_rva) {
@@ -1207,7 +1247,7 @@ impl ObjectFile {
         location: ObjectLocation,
         offset: ObjectOffset,
         encoding: RelocationEncoding,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SymbolId> {
         // The location decides symbol identity. `Extern` is a reference: one symbol
         // per external name, reused if this object already emitted it and resolving
         // to a local definition when this object defines it. `Offset` is a fresh
@@ -1256,6 +1296,16 @@ impl ObjectFile {
             }
         };
 
+        self.add_symbol_relocation(symbol, offset, encoding)?;
+        Ok(symbol)
+    }
+
+    fn add_symbol_relocation(
+        &mut self,
+        symbol: SymbolId,
+        offset: ObjectOffset,
+        encoding: RelocationEncoding,
+    ) -> anyhow::Result<()> {
         let (kind, addend) = match encoding {
             RelocationEncoding::Relative => (object::RelocationKind::Relative, -4),
             RelocationEncoding::Absolute => (object::RelocationKind::Absolute, 0),
@@ -1997,6 +2047,55 @@ mod tests {
             .map(|symbol| (symbol.is_definition(), symbol.address()))
             .collect::<Vec<_>>();
         assert_eq!(offsets, [(true, first.offset), (true, second.offset)]);
+    }
+
+    #[test]
+    fn repeated_conjured_targets_share_one_private_copy() {
+        let mut object = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
+        let text_section_id = object.text_section();
+        let field = object.append_section_data(text_section_id, &[0; 16], 0x90);
+        let mut image = vec![0_u8; 0x40];
+        image[0x10..0x14].copy_from_slice(b"word");
+        let relocs = BTreeMap::new();
+        let constant = RelocKind::ConjuredConstant {
+            symbol: RawString::from(&b"g_word"[..]),
+            target_rva: 0x10,
+        };
+        let string = RelocKind::ConjuredString {
+            symbol: RawString::from(&b"??_C@_03ABC@D?$AA@"[..]),
+            data: b"D\0",
+        };
+        for (kind, at) in [(constant, 0), (string, 4), (constant, 8), (string, 12)] {
+            object
+                .add_relocation_at(
+                    kind,
+                    field + at,
+                    &SymbolMatcher::off(),
+                    &image,
+                    &relocs,
+                    &mut HashSet::new(),
+                    TargetMaterialization::Materialize,
+                )
+                .unwrap();
+        }
+
+        let bytes = object.object.write().unwrap();
+        let parsed = object::File::parse(bytes.as_slice()).unwrap();
+        let copies = parsed
+            .symbols()
+            .filter(|symbol| symbol.is_definition())
+            .map(|symbol| symbol.name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(copies, ["g_word", "D_"]);
+        assert_eq!(parsed.section_by_name(".rdata").unwrap().size(), 8);
+        let targets = parsed
+            .section_by_name(".text")
+            .unwrap()
+            .relocations()
+            .map(|(_, relocation)| relocation.target())
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 4);
+        assert_eq!((targets[0], targets[1]), (targets[2], targets[3]));
     }
 
     #[test]
