@@ -415,7 +415,11 @@ impl DataSectionManifest {
                 if let Some(leader) = section.associative_ordinal
                     && (leader >= section.ordinal
                         || !rows.iter().any(|row| {
-                            row.ordinal == leader && row.comdat_selection != ComdatSelection::None
+                            row.ordinal == leader
+                                && !matches!(
+                                    row.comdat_selection,
+                                    ComdatSelection::None | ComdatSelection::Associative
+                                )
                         }))
                 {
                     anyhow::bail!(
@@ -621,6 +625,12 @@ mod tests {
     fn validates_contiguous_and_associative_ordinals() {
         assert!(parse("a.c\t2\t.data\t0x100\t4\t4\t0\t0\t0\t-\tdata\n").is_err());
         assert!(parse("a.c\t1\t.debug$F\t-\t4\t1\t0\t0\t5\t2\t-\n").is_err());
+
+        let leader = "a.c\t1\t.data\t0x100\t4\t4\t0xc0301040\t0\t2\t-\tdata\n";
+        let associative = "a.c\t2\t.debug$F\t-\t4\t1\t0x42101040\t0\t5\t1\t-\n";
+        assert!(parse(&format!("{leader}{associative}")).is_ok());
+        let chained = "a.c\t3\t.debug$F\t-\t4\t1\t0x42101040\t0\t5\t2\t-\n";
+        assert!(parse(&format!("{leader}{associative}{chained}")).is_err());
     }
 
     #[test]

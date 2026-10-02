@@ -20,7 +20,7 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Regist
 use pdb2::{FallibleIterator, RawString};
 
 use object::write::SymbolId;
-use object::{SectionFlags, SectionKind};
+use object::{ComdatKind, SectionFlags, SectionKind};
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -453,26 +453,61 @@ impl ObjectFile {
                 size: section.size,
             });
 
-            if section.comdat_selection != ComdatSelection::None {
-                anyhow::bail!(
-                    "candidate data COMDAT section {} is not yet emitted",
-                    section.ordinal
-                );
-            }
-
+            // Data the manifest does not place is appended to the first plain
+            // section of its storage. A COMDAT holds only the symbol cl put in it
+            // and a grouped section (`.CRT$XCU`) only its linker-sorted entries,
+            // so neither may receive it; without a plain section one is created.
+            let sink = section.comdat_selection == ComdatSelection::None;
             match section.storage {
-                Some(SectionStorage::Data) if data_section_id.is_none() => {
+                Some(SectionStorage::Data)
+                    if sink && section.name == b".data" && data_section_id.is_none() =>
+                {
                     data_section_id = Some(id)
                 }
-                Some(SectionStorage::Rdata) if rdata_section_id.is_none() => {
+                Some(SectionStorage::Rdata)
+                    if sink && section.name == b".rdata" && rdata_section_id.is_none() =>
+                {
                     rdata_section_id = Some(id)
                 }
-                Some(SectionStorage::Bss) if bss_section_id.is_none() => bss_section_id = Some(id),
+                Some(SectionStorage::Bss)
+                    if sink && section.name == b".bss" && bss_section_id.is_none() =>
+                {
+                    bss_section_id = Some(id)
+                }
                 None if section.name == b".text" && text_section_id.is_none() => {
                     text_section_id = Some(id)
                 }
                 _ => {}
             }
+        }
+
+        // The writer only needs the COMDAT's primary section, which its section
+        // symbol identifies; associative sections join their leader's group.
+        // Sections are contiguous by ordinal, as the manifest validates.
+        for section in sections {
+            let kind = match section.comdat_selection {
+                ComdatSelection::None | ComdatSelection::Associative => continue,
+                ComdatSelection::NoDuplicates => ComdatKind::NoDuplicates,
+                ComdatSelection::Any => ComdatKind::Any,
+                ComdatSelection::SameSize => ComdatKind::SameSize,
+                ComdatSelection::ExactMatch => ComdatKind::ExactMatch,
+                ComdatSelection::Largest => ComdatKind::Largest,
+                ComdatSelection::Newest => ComdatKind::Newest,
+            };
+            let leader = topology_sections[section.ordinal - 1].id;
+            let mut members = vec![leader];
+            members.extend(
+                sections
+                    .iter()
+                    .filter(|member| member.associative_ordinal == Some(section.ordinal))
+                    .map(|member| topology_sections[member.ordinal - 1].id),
+            );
+            let symbol = object.section_symbol(leader);
+            object.add_comdat(object::write::Comdat {
+                kind,
+                symbol,
+                sections: members,
+            });
         }
 
         if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
@@ -2051,6 +2086,166 @@ mod tests {
         assert_eq!(parsed_sections[0].name().unwrap(), ".drectve");
         assert_eq!(parsed_sections[1].data().unwrap(), b"main");
         assert_eq!(parsed_sections[2].data().unwrap(), b"fold");
+    }
+
+    #[test]
+    fn emits_comdat_groups_with_their_associative_sections() {
+        use object::ObjectComdat as _;
+
+        let section =
+            |ordinal, name: &'static [u8], rva, characteristics, selection, leader| DataSection {
+                object: b"fixture.c",
+                ordinal,
+                name,
+                rva,
+                size: 4,
+                alignment: 4,
+                characteristics,
+                checksum: 0,
+                comdat_selection: selection,
+                associative_ordinal: leader,
+                storage: rva.map(|_| SectionStorage::Rdata),
+            };
+        let sections = [
+            section(
+                1,
+                b".rdata",
+                Some(0x10),
+                0x4030_0040,
+                ComdatSelection::None,
+                None,
+            ),
+            section(
+                2,
+                b".rdata$r",
+                Some(0x20),
+                0x4030_1040,
+                ComdatSelection::Any,
+                None,
+            ),
+            section(
+                3,
+                b".rdata",
+                Some(0x30),
+                0x4030_1040,
+                ComdatSelection::Largest,
+                None,
+            ),
+            section(
+                4,
+                b".debug$F",
+                None,
+                0x4230_1040,
+                ComdatSelection::Associative,
+                Some(2),
+            ),
+        ];
+        let image = vec![0_u8; 0x40];
+        let rdata = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 2,
+            data: &image,
+        };
+        let empty = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: 0,
+            id: 3,
+            data: &[],
+        };
+        let mut output = ObjectFile::with_sections(&sections, rdata, empty, &image, false).unwrap();
+        for (name, rva, ordinal) in [
+            (&b"??_R4x@@6B@"[..], 0x20, 2),
+            (&b"??_7x@@6B@"[..], 0x30, 3),
+        ] {
+            output
+                .add_data_definition(
+                    DataDefinition {
+                        symbol_name: RawString::from(name),
+                        object: b"fixture.c",
+                        rva,
+                        size: 4,
+                        storage: DataStorage::Rdata,
+                        alignment: 4,
+                        section_ordinal: Some(ordinal),
+                        section_offset: Some(0),
+                        scope: DataScope::External,
+                        provisional: false,
+                    },
+                    &image,
+                )
+                .unwrap();
+        }
+
+        let bytes = output.object.write().unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let mut comdats = object
+            .comdats()
+            .map(|comdat| {
+                (
+                    comdat.kind(),
+                    comdat.sections().map(|index| index.0).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        comdats.sort_by_key(|(_, sections)| sections[0]);
+        assert_eq!(
+            comdats,
+            [
+                (object::ComdatKind::Any, vec![2, 4]),
+                (object::ComdatKind::Largest, vec![3]),
+            ]
+        );
+        let associative = object.section_by_index(object::SectionIndex(4)).unwrap();
+        let object::SectionFlags::Coff { characteristics } = associative.flags() else {
+            panic!("COFF section flags");
+        };
+        assert_ne!(characteristics & object::pe::IMAGE_SCN_LNK_COMDAT, 0);
+    }
+
+    #[test]
+    fn unplaced_data_never_joins_a_comdat_or_grouped_section() {
+        let section = |ordinal, name: &'static [u8], rva, characteristics, selection| DataSection {
+            object: b"fixture.c",
+            ordinal,
+            name,
+            rva: Some(rva),
+            size: 4,
+            alignment: 4,
+            characteristics,
+            checksum: 0,
+            comdat_selection: selection,
+            associative_ordinal: None,
+            storage: Some(SectionStorage::Data),
+        };
+        let sections = [
+            section(1, b".data", 0x10, 0xc030_1040, ComdatSelection::Any),
+            section(2, b".CRT$XCU", 0x20, 0xc030_0040, ComdatSelection::None),
+            section(3, b".data", 0x30, 0xc030_0040, ComdatSelection::None),
+        ];
+        let image = vec![0_u8; 0x40];
+        let data = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 3,
+            data: &image,
+        };
+        let mut output = ObjectFile::with_sections(&sections, data, data, &image, false).unwrap();
+        assert_eq!(output.data_section(), output.topology_sections[2].id);
+
+        let mut output =
+            ObjectFile::with_sections(&sections[..2], data, data, &image, false).unwrap();
+        let sink = output.data_section();
+        assert!(
+            output
+                .topology_sections
+                .iter()
+                .all(|section| section.id != sink),
+            "unplaced data joined a manifest section"
+        );
     }
 
     #[test]
