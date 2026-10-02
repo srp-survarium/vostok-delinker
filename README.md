@@ -61,6 +61,28 @@ cargo run --release -- \
 
 Run `vostok-delinker --help` for the complete option list.
 
+## Frontend and backend
+
+Delinking happens in two steps. The frontend reads the executable, the PDB
+and the manifests and decides how the image splits into objects; it records
+each object as a plan of sections with their bytes, symbols, relocations and
+COMDAT groups. The backend writes each plan as a COFF object without reading
+any input.
+
+By default one run does both. `--plan-path DIR` also writes each plan as
+`DIR/<object>.plan`, and `--plan-path` without `--output-path` stops after the
+frontend. `--from-plan-path DIR --output-path OUT` runs only the backend,
+writing the object of every plan under `DIR`. Writing plans and then objects
+from them yields the same bytes as one run.
+
+A plan is a text file of tab-separated records: a `vostok-object-plan 1`
+header, the checksum policy, then `section`, `symbol`, `reloc`, and `comdat`
+records, with names escaped and section bytes in hex. Sections and symbols
+are numbered by their order in the file. A relocation's addend lives in its
+field's bytes, as in a COFF object, so a `reloc` record names only the site,
+the symbol, and `absolute` or `relative`. A frontend other than the PDB one
+can produce plans for the same backend.
+
 ## Output objects
 
 Each function goes to the object named by its PDB source file, less the first

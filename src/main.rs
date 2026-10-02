@@ -1,5 +1,3 @@
-#![feature(os_string_truncate)]
-
 mod common_symbol_manifest;
 mod data_index;
 mod data_manifest;
@@ -8,6 +6,7 @@ mod manifest_tsv;
 mod missing_data_index;
 mod object_files;
 mod pdb_symbols;
+mod plan;
 mod reloc_alias_manifest;
 mod reloc_manifest;
 mod relocs;
@@ -25,24 +24,58 @@ use object::{Object, ObjectSection};
 
 #[derive(clap::Parser)]
 pub struct Cli {
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub pdb_path: std::path::PathBuf,
-
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub exe_path: std::path::PathBuf,
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        required_unless_present = "from_plan_path"
+    )]
+    pub pdb_path: Option<std::path::PathBuf>,
 
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
-        required_unless_present_any = ["write_data_index", "write_missing_data_index"]
+        required_unless_present = "from_plan_path"
+    )]
+    pub exe_path: Option<std::path::PathBuf>,
+
+    /// Directory to write the COFF objects to.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::DirPath,
+        required_unless_present_any = ["write_data_index", "write_missing_data_index", "plan_path"]
     )]
     pub output_path: Option<std::path::PathBuf>,
+
+    /// Directory to write each object's plan to, as `<object>.plan`: the
+    /// sections, symbols, relocations and COMDATs the delinker decided on,
+    /// which `--from-plan-path` writes as objects.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub plan_path: Option<std::path::PathBuf>,
+
+    /// Write the objects of the plans under this directory to `--output-path`,
+    /// reading no executable, PDB or manifest.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::DirPath,
+        requires = "output_path",
+        conflicts_with_all = [
+            "pdb_path", "exe_path", "engine_path", "plan_path", "write_symbol_map",
+            "read_symbol_map", "data_manifest", "data_section_manifest",
+            "common_symbol_manifest", "reloc_alias_manifest", "reloc_manifest",
+            "write_data_index", "write_missing_data_index",
+        ]
+    )]
+    pub from_plan_path: Option<std::path::PathBuf>,
 
     /// Source-tree prefix to strip from PDB file paths; the rest of a matching
     /// path names the output object. Repeatable, for a build that draws
     /// compilands from several trees: prefixes are tried in order and the first
     /// that matches wins. Functions from files under no prefix are skipped.
-    #[arg(long, value_hint = clap::ValueHint::FilePath, required = true)]
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        required_unless_present = "from_plan_path"
+    )]
     pub engine_path: Vec<String>,
 
     /// Pad each empty object's `.rdata` with 4 bytes. objdiff treats two
@@ -126,7 +159,7 @@ pub struct Cli {
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
-        conflicts_with_all = ["output_path", "write_missing_data_index"]
+        conflicts_with_all = ["output_path", "plan_path", "write_missing_data_index"]
     )]
     pub write_data_index: Option<std::path::PathBuf>,
 
@@ -136,7 +169,7 @@ pub struct Cli {
     #[arg(
         long,
         value_hint = clap::ValueHint::FilePath,
-        conflicts_with = "output_path"
+        conflicts_with_all = ["output_path", "plan_path"]
     )]
     pub write_missing_data_index: Option<std::path::PathBuf>,
 }
@@ -184,6 +217,8 @@ fn main() -> anyhow::Result<()> {
         pdb_path,
         exe_path,
         output_path,
+        plan_path,
+        from_plan_path,
         engine_path,
         pad_empty_rdata,
         write_symbol_map,
@@ -202,6 +237,17 @@ fn main() -> anyhow::Result<()> {
         write_missing_data_index,
     } = Cli::parse();
 
+    if let Some(directory) = from_plan_path {
+        let output_path = output_path.expect("clap requires --output-path with --from-plan-path");
+        let plans = plan::read_plans(&directory)?;
+        return plan::write_objects(
+            plans.iter().map(|(object, plan)| (object.as_slice(), plan)),
+            &output_path,
+        );
+    }
+    let exe_path = exe_path.expect("clap requires --exe-path without --from-plan-path");
+    let pdb_path = pdb_path.expect("clap requires --pdb-path without --from-plan-path");
+
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
     let exe = object::read::pe::PeFile32::parse(exe)?;
     let exe: &'static object::read::pe::PeFile32 = leak(exe);
@@ -219,7 +265,6 @@ fn main() -> anyhow::Result<()> {
         let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
         return missing_data_index::write(&env, exe, &mut pdb, &pdb_symbols, &path);
     }
-    let output_path = output_path.expect("clap requires --output-path without an index export");
 
     let engine_paths: Vec<Vec<u8>> = engine_path
         .iter()
@@ -248,7 +293,8 @@ fn main() -> anyhow::Result<()> {
         pdb,
         &engine_paths,
         pad_empty_rdata,
-        output_path.as_path(),
+        output_path.as_deref(),
+        plan_path.as_deref(),
         write_symbol_map.as_deref(),
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
@@ -269,7 +315,8 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     mut pdb: pdb2::PDB<'static, S>,
     engine_paths: &[Vec<u8>],
     pad_empty_rdata: bool,
-    output_path: &std::path::Path,
+    output_path: Option<&std::path::Path>,
+    plan_path: Option<&std::path::Path>,
     write_symbol_map: Option<&std::path::Path>,
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
@@ -360,7 +407,19 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         code_relocation_recovery,
     )?;
     reloc_alias_manifest.validate_occurrences(&observed_aliases)?;
-    object_files.write(output_path)?;
+    let plans = object_files.into_plans();
+    if let Some(directory) = plan_path {
+        plan::write_plans(
+            plans.iter().map(|(object, plan)| (*object, plan)),
+            directory,
+        )?;
+    }
+    if let Some(directory) = output_path {
+        plan::write_objects(
+            plans.iter().map(|(object, plan)| (*object, plan)),
+            directory,
+        )?;
+    }
 
     // Target side: record the choices base will later try to reproduce.
     if let Some(path) = write_symbol_map {

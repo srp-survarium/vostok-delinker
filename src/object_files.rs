@@ -6,6 +6,7 @@ use crate::data_section_manifest::{
     SectionTopology,
 };
 use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
+use crate::plan::{ObjectPlan, PlanChecksums, PlanComdat};
 use crate::reloc_alias_manifest::{RelocAliasManifest, RelocAliasObservations};
 use crate::relocs::{
     CodeRelocationRecovery, ManifestCoverage, RelocKind, RelocationEncoding, WritableExtent,
@@ -20,8 +21,8 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind, Regist
 
 use pdb2::{FallibleIterator, RawString};
 
-use object::write::SymbolId;
-use object::{ComdatKind, SectionFlags, SectionKind};
+use crate::plan::{SectionId, Symbol, SymbolId, SymbolSection};
+use object::{ComdatKind, SectionKind};
 
 pub struct ObjectFiles<'a> {
     pub objects: HashMap<&'a [u8], ObjectFile>,
@@ -30,11 +31,11 @@ pub struct ObjectFiles<'a> {
 
 pub struct ObjectFile {
     pad_rdata: bool,
-    pub object: object::write::Object<'static>,
-    pub data_section_id: Option<object::write::SectionId>,
-    pub rdata_section_id: Option<object::write::SectionId>,
-    pub bss_section_id: Option<object::write::SectionId>,
-    pub text_section_id: Option<object::write::SectionId>,
+    pub plan: ObjectPlan,
+    pub data_section_id: Option<SectionId>,
+    pub rdata_section_id: Option<SectionId>,
+    pub bss_section_id: Option<SectionId>,
+    pub text_section_id: Option<SectionId>,
     undefined_symbols: HashMap<Vec<u8>, SymbolId>,
     common_symbols: HashSet<Vec<u8>>,
     conjured_copies: HashMap<ConjuredCopy, SymbolId>,
@@ -45,7 +46,7 @@ pub struct ObjectFile {
 
 #[derive(Clone, Copy)]
 struct EmittedTopologySection {
-    id: object::write::SectionId,
+    id: SectionId,
     storage: Option<SectionStorage>,
     rva: Option<usize>,
     size: usize,
@@ -54,7 +55,7 @@ struct EmittedTopologySection {
 #[derive(Copy, Clone)]
 pub struct ObjectOffset {
     offset: u64,
-    section_id: object::write::SectionId,
+    section_id: SectionId,
 }
 
 #[derive(Copy, Clone)]
@@ -124,7 +125,7 @@ impl<'a> PlacedSections<'a> {
     }
 }
 
-impl ObjectFiles<'_> {
+impl<'a> ObjectFiles<'a> {
     pub fn parse<'s, S>(
         env: &Env,
         pdb: &mut pdb2::PDB<'static, S>,
@@ -330,103 +331,67 @@ impl ObjectFiles<'_> {
         Ok(this)
     }
 
-    pub fn write(self, base: &std::path::Path) -> anyhow::Result<()> {
-        let base_len = base.as_os_str().as_encoded_bytes().len();
-        let mut path = base.to_path_buf();
-        let mut symbolless_objects = Vec::new();
-
-        for (prefix, object_file) in self.objects {
-            path.as_mut_os_string().truncate(base_len);
-
-            let prefix = prefix
-                .iter()
-                .map(|&c| match c {
-                    b'\\' => '/',
-                    _ => char::from(c),
-                })
-                .collect::<String>();
-            path.as_mut_os_string().push("/");
-            path.as_mut_os_string().push(&prefix);
-            path.as_mut_os_string().push(".obj");
-
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            let mut bytes = object_file.object.write()?;
-            let symbolless = symbolless_comdats(&bytes)?;
-            if symbolless != 0 {
-                symbolless_objects.push((path.clone(), symbolless));
-            }
-            match self.section_checksums {
-                SectionChecksums::Reviewed => {
-                    apply_reviewed_section_checksums(
-                        &mut bytes,
-                        &object_file.reviewed_section_checksums,
-                    )?;
-                }
-                SectionChecksums::Zero => {
-                    zero_section_checksums(&mut bytes)?;
-                }
-            }
-            std::fs::write(&path, bytes)?;
-        }
-        if let Some((example, count)) = symbolless_objects.first() {
-            eprintln!(
-                "[comdat] {} object(s) carry COMDAT sections that define no symbol \
-                 (e.g. {count} in {}); object readers ignore such a COMDAT and link.exe \
-                 rejects it",
-                symbolless_objects.len(),
-                example.display()
-            );
-        }
-        Ok(())
+    /// The plan of every object, by object path, with the checksum policy
+    /// applied.
+    pub fn into_plans(self) -> Vec<(&'a [u8], ObjectPlan)> {
+        let mut plans = self
+            .objects
+            .into_iter()
+            .map(|(object, object_file)| {
+                let mut plan = object_file.plan;
+                plan.checksums = match self.section_checksums {
+                    SectionChecksums::Reviewed => {
+                        PlanChecksums::Reviewed(object_file.reviewed_section_checksums)
+                    }
+                    SectionChecksums::Zero => PlanChecksums::Zero,
+                };
+                (object, plan)
+            })
+            .collect::<Vec<_>>();
+        plans.sort_unstable_by_key(|(object, _)| *object);
+        plans
     }
 }
 
 impl ObjectFile {
-    fn data_section(&mut self) -> object::write::SectionId {
-        *self.data_section_id.get_or_insert_with(|| {
-            self.object
-                .add_section(Vec::new(), b".data".into(), SectionKind::Data)
-        })
+    fn data_section(&mut self) -> SectionId {
+        *self
+            .data_section_id
+            .get_or_insert_with(|| self.plan.add_section(b".data".into(), SectionKind::Data))
     }
 
-    fn bss_section(&mut self) -> object::write::SectionId {
+    fn bss_section(&mut self) -> SectionId {
         *self.bss_section_id.get_or_insert_with(|| {
-            self.object
-                .add_section(Vec::new(), b".bss".into(), SectionKind::UninitializedData)
+            self.plan
+                .add_section(b".bss".into(), SectionKind::UninitializedData)
         })
     }
 
-    fn rdata_section(&mut self) -> object::write::SectionId {
+    fn rdata_section(&mut self) -> SectionId {
         if let Some(section_id) = self.rdata_section_id {
             return section_id;
         }
-        let section_id =
-            self.object
-                .add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData);
-        pad_created_rdata(&mut self.object, section_id, self.pad_rdata);
+        let section_id = self
+            .plan
+            .add_section(b".rdata".into(), SectionKind::ReadOnlyData);
+        pad_created_rdata(&mut self.plan, section_id, self.pad_rdata);
         *self.rdata_section_id.insert(section_id)
     }
 
-    fn text_section(&mut self) -> object::write::SectionId {
-        *self.text_section_id.get_or_insert_with(|| {
-            self.object
-                .add_section(Vec::new(), b".text".into(), SectionKind::Text)
-        })
+    fn text_section(&mut self) -> SectionId {
+        *self
+            .text_section_id
+            .get_or_insert_with(|| self.plan.add_section(b".text".into(), SectionKind::Text))
     }
 
     fn empty_with_topology(pad_rdata: bool, topology: SectionTopology) -> Self {
-        let mut object = object::write::Object::new(
-            object::BinaryFormat::Coff,
-            object::Architecture::I386,
-            object::Endianness::Little,
-        );
-        object.set_mangling(object::write::Mangling::None);
+        let mut object = ObjectPlan::default();
 
         let (data_section_id, rdata_section_id, text_section_id) = match topology {
             SectionTopology::Synthesized => (
-                Some(object.add_section(Vec::new(), b".data".into(), SectionKind::Data)),
-                Some(object.add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData)),
-                Some(object.add_section(Vec::new(), b".text".into(), SectionKind::Text)),
+                Some(object.add_section(b".data".into(), SectionKind::Data)),
+                Some(object.add_section(b".rdata".into(), SectionKind::ReadOnlyData)),
+                Some(object.add_section(b".text".into(), SectionKind::Text)),
             ),
             SectionTopology::Exact => (None, None, None),
         };
@@ -437,7 +402,7 @@ impl ObjectFile {
 
         Self {
             pad_rdata,
-            object,
+            plan: object,
             data_section_id,
             rdata_section_id,
             bss_section_id: None,
@@ -458,12 +423,7 @@ impl ObjectFile {
         coff_data: &[u8],
         pad_rdata: bool,
     ) -> anyhow::Result<Self> {
-        let mut object = object::write::Object::new(
-            object::BinaryFormat::Coff,
-            object::Architecture::I386,
-            object::Endianness::Little,
-        );
-        object.set_mangling(object::write::Mangling::None);
+        let mut object = ObjectPlan::default();
 
         let mut topology_sections = Vec::with_capacity(sections.len());
         let mut data_section_id = None;
@@ -480,11 +440,12 @@ impl ObjectFile {
                 None if section.name == b".text" => SectionKind::Text,
                 None => SectionKind::Other,
             };
-            let id = object.add_section(Vec::new(), section.name.to_vec(), kind);
-            object.section_mut(id).flags = SectionFlags::Coff {
-                characteristics: section.characteristics
+            let id = object.add_section(section.name.to_vec(), kind);
+            object.set_characteristics(
+                id,
+                section.characteristics
                     & !(object::pe::IMAGE_SCN_ALIGN_MASK | object::pe::IMAGE_SCN_LNK_COMDAT),
-            };
+            );
 
             match (section.storage, section.rva) {
                 (Some(storage), Some(rva)) => {
@@ -590,7 +551,7 @@ impl ObjectFile {
                     .map(|member| topology_sections[member.ordinal - 1].id),
             );
             let symbol = object.section_symbol(leader);
-            object.add_comdat(object::write::Comdat {
+            object.add_comdat(PlanComdat {
                 kind,
                 symbol,
                 sections: members,
@@ -601,7 +562,7 @@ impl ObjectFile {
         // created later for unplaced data is padded.
         Ok(Self {
             pad_rdata,
-            object,
+            plan: object,
             data_section_id,
             rdata_section_id,
             bss_section_id,
@@ -620,11 +581,7 @@ impl ObjectFile {
 /// into the relocation table is equal, so different data with different names
 /// can match on offset alone. Four leading bytes in every `.rdata` the
 /// delinker creates move those offsets apart.
-fn pad_created_rdata(
-    object: &mut object::write::Object,
-    section_id: object::write::SectionId,
-    pad_rdata: bool,
-) {
+fn pad_created_rdata(object: &mut ObjectPlan, section_id: SectionId, pad_rdata: bool) {
     if pad_rdata {
         object.append_section_data(section_id, &0_u32.to_le_bytes(), 4);
     }
@@ -1051,21 +1008,20 @@ fn resolve_code_relocations<'s>(
 
 impl ObjectFile {
     fn add_common_symbol(&mut self, name: &[u8], size: u64) -> anyhow::Result<()> {
-        if self.object.symbol_id(name).is_some() {
+        if self.plan.symbol_id(name).is_some() {
             anyhow::bail!(
                 "COMMON symbol {} is already a symbol of its object",
                 String::from_utf8_lossy(name)
             );
         }
-        self.object.add_symbol(object::write::Symbol {
+        self.plan.add_symbol(Symbol {
             name: name.to_vec(),
             value: 0,
             size,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Linkage,
             weak: false,
-            section: object::write::SymbolSection::Common,
-            flags: object::SymbolFlags::None,
+            section: SymbolSection::Common,
         });
         self.common_symbols.insert(name.to_vec());
         Ok(())
@@ -1346,7 +1302,7 @@ impl ObjectFile {
             ranges.insert(insertion, (section_offset, section_local_end));
 
             if section.rva.is_none() && definition.storage != DataStorage::Bss {
-                self.object.section_mut(section.id).data_mut()[section_offset..section_local_end]
+                self.plan.section_data_mut(section.id)[section_offset..section_local_end]
                     .copy_from_slice(&coff_data[definition.rva..definition_end]);
             }
             ObjectOffset {
@@ -1358,7 +1314,7 @@ impl ObjectFile {
                 DataStorage::Data => {
                     let section_id = self.data_section();
                     ObjectOffset {
-                        offset: self.object.append_section_data(
+                        offset: self.plan.append_section_data(
                             section_id,
                             &coff_data[definition.rva..definition_end],
                             definition.alignment,
@@ -1369,7 +1325,7 @@ impl ObjectFile {
                 DataStorage::Rdata => {
                     let section_id = self.rdata_section();
                     ObjectOffset {
-                        offset: self.object.append_section_data(
+                        offset: self.plan.append_section_data(
                             section_id,
                             &coff_data[definition.rva..definition_end],
                             definition.alignment,
@@ -1379,7 +1335,7 @@ impl ObjectFile {
                 }
                 DataStorage::Bss => {
                     let section_id = self.bss_section();
-                    let offset = self.object.append_section_bss(
+                    let offset = self.plan.append_section_bss(
                         section_id,
                         definition.size.to_u64(),
                         definition.alignment,
@@ -1398,7 +1354,7 @@ impl ObjectFile {
             );
         }
         if self
-            .object
+            .plan
             .symbol_id(definition.symbol_name.as_bytes())
             .is_some()
         {
@@ -1407,7 +1363,7 @@ impl ObjectFile {
                 definition.symbol_name
             );
         }
-        self.object.add_symbol(object::write::Symbol {
+        self.plan.add_symbol(Symbol {
             name: definition.symbol_name.as_bytes().to_vec(),
             value: offset.offset,
             size: definition.size.to_u64(),
@@ -1417,8 +1373,7 @@ impl ObjectFile {
                 DataScope::Local => object::SymbolScope::Compilation,
             },
             weak: false,
-            section: object::write::SymbolSection::Section(offset.section_id),
-            flags: object::SymbolFlags::None,
+            section: SymbolSection::Section(offset.section_id),
         });
         Ok(())
     }
@@ -1479,11 +1434,11 @@ impl ObjectFile {
     ) -> anyhow::Result<()> {
         let definition_end = definition.rva.checked_add(definition.size).unwrap();
         let symbol_id = self
-            .object
+            .plan
             .symbol_id(definition.symbol_name.as_bytes())
             .ok_or_else(|| anyhow::anyhow!("missing emitted data symbol"))?;
-        let symbol = self.object.symbol(symbol_id);
-        let object::write::SymbolSection::Section(section_id) = symbol.section else {
+        let symbol = self.plan.symbol(symbol_id);
+        let SymbolSection::Section(section_id) = symbol.section else {
             anyhow::bail!("emitted data symbol has no output section");
         };
         let offset = ObjectOffset {
@@ -1511,13 +1466,8 @@ impl ObjectFile {
 }
 
 impl ObjectFile {
-    fn append_section_data(
-        &mut self,
-        section_id: object::write::SectionId,
-        data: &[u8],
-        pad: u8,
-    ) -> ObjectOffset {
-        let offset = append_with_padding(&mut self.object, section_id, data, pad);
+    fn append_section_data(&mut self, section_id: SectionId, data: &[u8], pad: u8) -> ObjectOffset {
+        let offset = append_with_padding(&mut self.plan, section_id, data, pad);
         ObjectOffset { offset, section_id }
     }
 
@@ -1536,23 +1486,22 @@ impl ObjectFile {
             // Reuse the defined symbol when this object owns it, otherwise keep one
             // undefined symbol per name. The writer indexes only defined symbols, so
             // undefined identities live in `undefined_symbols`.
-            ObjectLocation::Extern(kind) => match self.object.symbol_id(name.as_bytes()) {
+            ObjectLocation::Extern(kind) => match self.plan.symbol_id(name.as_bytes()) {
                 Some(symbol) => symbol,
                 None => {
-                    let writer = &mut self.object;
+                    let writer = &mut self.plan;
                     *self
                         .undefined_symbols
                         .entry(name.as_bytes().to_vec())
                         .or_insert_with(|| {
-                            writer.add_symbol(object::write::Symbol {
+                            writer.add_symbol(Symbol {
                                 name: name.as_bytes().to_vec(),
                                 value: 0,
                                 size: u64::MAX,
                                 kind,
                                 scope: object::SymbolScope::Linkage,
                                 weak: false,
-                                section: object::write::SymbolSection::Undefined,
-                                flags: object::SymbolFlags::None,
+                                section: SymbolSection::Undefined,
                             })
                         })
                 }
@@ -1563,15 +1512,14 @@ impl ObjectFile {
                 } else {
                     object::SymbolKind::Data
                 };
-                self.object.add_symbol(object::write::Symbol {
+                self.plan.add_symbol(Symbol {
                     name: name.as_bytes().to_vec(),
                     value: offset,
                     size: u64::MAX,
                     kind,
                     scope: object::SymbolScope::Linkage,
                     weak: false,
-                    section: object::write::SymbolSection::Section(section_id),
-                    flags: object::SymbolFlags::None,
+                    section: SymbolSection::Section(section_id),
                 })
             }
         };
@@ -1591,25 +1539,12 @@ impl ObjectFile {
             RelocationEncoding::Absolute => (object::RelocationKind::Absolute, 0),
         };
 
-        self.object.add_relocation(
-            offset.section_id,
-            object::write::Relocation {
-                offset: offset.offset,
-                symbol,
-                addend,
-                flags: object::RelocationFlags::Generic {
-                    kind,
-                    encoding: object::RelocationEncoding::Generic,
-                    size: 32,
-                },
-            },
-        )?;
-
-        Ok(())
+        self.plan
+            .add_relocation(offset.section_id, offset.offset, symbol, kind, addend)
     }
 
     fn add_function(&mut self, name: RawString, body: &[u8]) -> anyhow::Result<ObjectOffset> {
-        let existing = self.object.symbol_id(name.as_bytes());
+        let existing = self.plan.symbol_id(name.as_bytes());
         let undefined = self.undefined_symbols.get(name.as_bytes()).copied();
         let existing_symbol = match (existing, undefined) {
             (None, None) => None,
@@ -1621,15 +1556,14 @@ impl ObjectFile {
             (indexed_id, Some(undefined_id))
                 if indexed_id.is_none() || indexed_id == Some(undefined_id) =>
             {
-                let symbol = self.object.symbol(undefined_id);
+                let symbol = self.plan.symbol(undefined_id);
                 anyhow::ensure!(
                     symbol.value == 0
                         && symbol.size == u64::MAX
                         && symbol.kind == object::SymbolKind::Text
                         && symbol.scope == object::SymbolScope::Linkage
                         && !symbol.weak
-                        && symbol.section == object::write::SymbolSection::Undefined
-                        && matches!(symbol.flags, object::SymbolFlags::None),
+                        && symbol.section == SymbolSection::Undefined,
                     "incompatible undefined function symbol {}",
                     String::from_utf8_lossy(name.as_bytes())
                 );
@@ -1643,31 +1577,30 @@ impl ObjectFile {
 
         let text_section_id = self.text_section();
         let fun_offset_in_coff_text = self.append_section_data(text_section_id, body, 0x90);
-        let definition = object::write::Symbol {
+        let definition = Symbol {
             name: name.as_bytes().to_vec(),
             value: fun_offset_in_coff_text.offset,
             size: u64::MAX,
             kind: object::SymbolKind::Text,
             scope: object::SymbolScope::Linkage,
             weak: false,
-            section: object::write::SymbolSection::Section(fun_offset_in_coff_text.section_id),
-            flags: object::SymbolFlags::None,
+            section: SymbolSection::Section(fun_offset_in_coff_text.section_id),
         };
         if let Some(symbol_id) = existing_symbol {
-            *self.object.symbol_mut(symbol_id) = definition;
+            *self.plan.symbol_mut(symbol_id) = definition;
             let removed = self.undefined_symbols.remove(name.as_bytes());
             debug_assert_eq!(removed, Some(symbol_id));
         } else {
-            self.object.add_symbol(definition);
+            self.plan.add_symbol(definition);
         }
 
         Ok(fun_offset_in_coff_text)
     }
 
     fn is_function_definition(&self, symbol_id: SymbolId) -> bool {
-        let symbol = self.object.symbol(symbol_id);
+        let symbol = self.plan.symbol(symbol_id);
         symbol.kind == object::SymbolKind::Text
-            && matches!(symbol.section, object::write::SymbolSection::Section(_))
+            && matches!(symbol.section, SymbolSection::Section(_))
     }
 }
 
@@ -1734,8 +1667,8 @@ impl std::ops::Add<usize> for ObjectOffset {
 
 // Always pads to 4
 fn append_with_padding(
-    object: &mut object::write::Object,
-    section_id: object::write::SectionId,
+    object: &mut ObjectPlan,
+    section_id: SectionId,
     data: &[u8],
     pad: u8,
 ) -> u64 {
@@ -1756,134 +1689,6 @@ fn append_with_padding(
     }
 
     offset
-}
-
-/// The number of non-associative COMDAT sections without a symbol after their
-/// section symbol. That symbol is the COMDAT symbol: link.exe requires it and
-/// object readers find the group through it. A manifest can declare a COMDAT
-/// that nothing is placed into, such as a second `.text` COMDAT while every
-/// function lands in the first `.text` section.
-fn symbolless_comdats(bytes: &[u8]) -> anyhow::Result<usize> {
-    use object::read::coff::ImageSymbol as _;
-    use object::{Object as _, ObjectComdat as _, ObjectSection as _};
-
-    let file = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(bytes)?;
-    let grouped = file
-        .comdats()
-        .filter_map(|comdat| comdat.sections().next())
-        .collect::<HashSet<_>>();
-    let mut symbolless = 0;
-    for section in file.sections() {
-        let object::SectionFlags::Coff { characteristics } = section.flags() else {
-            continue;
-        };
-        let selection = file
-            .coff_symbol_table()
-            .iter()
-            .find(|(_, symbol)| {
-                symbol.has_aux_section()
-                    && symbol.section_number.get(object::LittleEndian) as usize == section.index().0
-            })
-            .and_then(|(index, _)| file.coff_symbol_table().aux_section(index).ok())
-            .map_or(0, |aux| aux.selection);
-        if characteristics & object::pe::IMAGE_SCN_LNK_COMDAT != 0
-            && selection != object::pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE
-            && !grouped.contains(&section.index())
-        {
-            symbolless += 1;
-        }
-    }
-    Ok(symbolless)
-}
-
-/// The checksum field of one section-definition auxiliary record.
-struct SectionChecksumField {
-    section_number: usize,
-    section_name: [u8; 8],
-    offset: usize,
-}
-
-fn section_checksum_fields(bytes: &[u8]) -> anyhow::Result<Vec<SectionChecksumField>> {
-    use object::endian::LittleEndian;
-    use object::read::SectionIndex;
-
-    let coff = object::read::coff::CoffFile::<&[u8], object::pe::ImageFileHeader>::parse(bytes)?;
-    let symbol_table_offset = coff.coff_header().pointer_to_symbol_table.get(LittleEndian) as usize;
-    let sections = coff.coff_section_table();
-    let symbols = coff.coff_symbol_table();
-    let checksum_in_aux = std::mem::offset_of!(object::pe::ImageAuxSymbolSection, check_sum);
-    let mut fields = Vec::new();
-
-    for (index, symbol) in symbols.iter() {
-        let section_number = symbol.section_number.get(LittleEndian) as usize;
-        if symbol.storage_class != object::pe::IMAGE_SYM_CLASS_STATIC
-            || symbol.number_of_aux_symbols != 1
-            || symbol.value.get(LittleEndian) != 0
-            || symbol.typ.get(LittleEndian) != object::pe::IMAGE_SYM_TYPE_NULL
-            || section_number == 0
-            || section_number > sections.len()
-        {
-            continue;
-        }
-        let section = sections.section(SectionIndex(section_number))?;
-        if symbol.name != section.name {
-            continue;
-        }
-        symbols.aux_section(index)?;
-        let offset = symbol_table_offset
-            .checked_add(
-                (index.0 + 1)
-                    .checked_mul(object::pe::IMAGE_SIZEOF_SYMBOL)
-                    .ok_or_else(|| anyhow::anyhow!("COFF auxiliary symbol offset overflows"))?,
-            )
-            .and_then(|offset| offset.checked_add(checksum_in_aux))
-            .ok_or_else(|| anyhow::anyhow!("COFF section checksum offset overflows"))?;
-        bytes
-            .get(offset..offset + std::mem::size_of::<u32>())
-            .ok_or_else(|| anyhow::anyhow!("COFF section checksum is outside the symbol table"))?;
-        fields.push(SectionChecksumField {
-            section_number,
-            section_name: section.name,
-            offset,
-        });
-    }
-    Ok(fields)
-}
-
-fn apply_reviewed_section_checksums(
-    bytes: &mut [u8],
-    reviewed: &[([u8; 8], u32)],
-) -> anyhow::Result<usize> {
-    let mut seen = vec![false; reviewed.len()];
-    let mut writes = Vec::with_capacity(reviewed.len());
-    for field in section_checksum_fields(bytes)? {
-        if field.section_number > reviewed.len() {
-            continue;
-        }
-        let (expected_name, checksum) = reviewed[field.section_number - 1];
-        if field.section_name != expected_name {
-            anyhow::bail!("reviewed section checksum order/name mismatch");
-        }
-        if std::mem::replace(&mut seen[field.section_number - 1], true) {
-            anyhow::bail!("duplicate COFF section-definition symbol");
-        }
-        writes.push((field.offset, checksum));
-    }
-    if seen.iter().any(|seen| !seen) {
-        anyhow::bail!("reviewed COFF section has no section-definition symbol");
-    }
-    for (offset, checksum) in writes {
-        bytes[offset..offset + std::mem::size_of::<u32>()].copy_from_slice(&checksum.to_le_bytes());
-    }
-    Ok(seen.len())
-}
-
-fn zero_section_checksums(bytes: &mut [u8]) -> anyhow::Result<usize> {
-    let fields = section_checksum_fields(bytes)?;
-    for field in &fields {
-        bytes[field.offset..field.offset + std::mem::size_of::<u32>()].fill(0);
-    }
-    Ok(fields.len())
 }
 
 //
@@ -1914,6 +1719,9 @@ fn get_constant_name(symbol: RawString, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{
+        apply_reviewed_section_checksums, symbolless_comdats, zero_section_checksums,
+    };
     use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 
     fn decoded_absolute_fields(code: &[u8]) -> Vec<(usize, u32)> {
@@ -2309,7 +2117,7 @@ mod tests {
             }
         }
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         assert_eq!(
             object.section_by_name(".text").unwrap().data(),
@@ -2396,9 +2204,9 @@ mod tests {
         object
             .add_data_definition(definition(DataScope::Local, 0), &[1, 2, 3, 4])
             .unwrap();
-        let symbol_id = object.object.symbol_id(b"fixture").unwrap();
+        let symbol_id = object.plan.symbol_id(b"fixture").unwrap();
         assert_eq!(
-            object.object.symbol(symbol_id).scope,
+            object.plan.symbol(symbol_id).scope,
             object::SymbolScope::Compilation
         );
     }
@@ -2443,7 +2251,7 @@ mod tests {
                 .undefined_symbols
                 .contains_key(b"external".as_slice())
         );
-        let bytes = object.object.write().unwrap();
+        let bytes = object.plan.write().unwrap();
         assert_eq!(short_coff_symbol_type(&bytes, b"external"), 0);
     }
 
@@ -2483,7 +2291,7 @@ mod tests {
         reference(&mut object, initialized, 8);
         reference(&mut object, zero_fill, 12);
 
-        let bytes = object.object.write().unwrap();
+        let bytes = object.plan.write().unwrap();
         let parsed = object::File::parse(bytes.as_slice()).unwrap();
         let copies = parsed
             .symbols()
@@ -2532,7 +2340,7 @@ mod tests {
             )
             .unwrap();
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let parsed = object::File::parse(bytes.as_slice()).unwrap();
         assert_eq!(parsed.section_by_name(".data").unwrap().size(), 0);
         let guard = parsed
@@ -2568,7 +2376,7 @@ mod tests {
             )
             .unwrap();
 
-        let bytes = object.object.write().unwrap();
+        let bytes = object.plan.write().unwrap();
         let parsed = object::File::parse(bytes.as_slice()).unwrap();
         let symbol = parsed
             .symbols()
@@ -2596,13 +2404,13 @@ mod tests {
 
         let undefined_id = output.undefined_symbols[b"later_function".as_slice()];
         let definition = output.add_function(name, &[0xc3]).unwrap();
-        let symbol = output.object.symbol(undefined_id);
+        let symbol = output.plan.symbol(undefined_id);
         assert_eq!(symbol.value, definition.offset);
         assert_eq!(symbol.kind, object::SymbolKind::Text);
         assert_eq!(symbol.scope, object::SymbolScope::Linkage);
         assert_eq!(
             symbol.section,
-            object::write::SymbolSection::Section(definition.section_id)
+            SymbolSection::Section(definition.section_id)
         );
         assert!(
             !output
@@ -2610,7 +2418,7 @@ mod tests {
                 .contains_key(b"later_function".as_slice())
         );
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let matching = object
             .symbols()
@@ -2638,15 +2446,14 @@ mod tests {
         let mut output = ObjectFile::empty_with_topology(false, SectionTopology::Synthesized);
         let data_section_id = output.data_section();
         let name = RawString::from(&b"collision"[..]);
-        output.object.add_symbol(object::write::Symbol {
+        output.plan.add_symbol(Symbol {
             name: name.as_bytes().to_vec(),
             value: 0,
             size: 4,
             kind: object::SymbolKind::Data,
             scope: object::SymbolScope::Linkage,
             weak: false,
-            section: object::write::SymbolSection::Section(data_section_id),
-            flags: object::SymbolFlags::None,
+            section: SymbolSection::Section(data_section_id),
         });
 
         let error = output
@@ -2656,7 +2463,7 @@ mod tests {
             .to_string();
         assert!(error.contains("incompatible pre-existing function symbol collision"));
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let matching = object
             .symbols()
@@ -2674,7 +2481,7 @@ mod tests {
         let second = output.add_function(name, &[0x90, 0xc3]).unwrap();
         assert_ne!(first.offset, second.offset);
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let offsets = object
             .symbols()
@@ -2714,7 +2521,7 @@ mod tests {
                 .unwrap();
         }
 
-        let bytes = object.object.write().unwrap();
+        let bytes = object.plan.write().unwrap();
         let parsed = object::File::parse(bytes.as_slice()).unwrap();
         let copies = parsed
             .symbols()
@@ -2814,7 +2621,7 @@ mod tests {
                 .unwrap();
         }
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let parsed_sections = object.sections().collect::<Vec<_>>();
         assert_eq!(parsed_sections[0].name().unwrap(), ".drectve");
@@ -2850,7 +2657,7 @@ mod tests {
             data: &image,
         };
         let output = ObjectFile::with_sections(&reviewed, section, section, &image, true).unwrap();
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let parsed = object::File::parse(bytes.as_slice()).unwrap();
         assert_eq!(parsed.section_by_name(".rdata").unwrap().size(), 8);
     }
@@ -2953,7 +2760,7 @@ mod tests {
         let mut output = ObjectFile::with_sections(&sections, rdata, empty, &image, false).unwrap();
         // Before any definition, neither COMDAT has a symbol of its own.
         assert_eq!(
-            symbolless_comdats(&output.object.write().unwrap()).unwrap(),
+            symbolless_comdats(&output.plan.write().unwrap()).unwrap(),
             2
         );
         for (name, rva, ordinal) in [
@@ -2979,7 +2786,7 @@ mod tests {
                 .unwrap();
         }
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let mut comdats = object
             .comdats()
@@ -3076,7 +2883,7 @@ mod tests {
             .add_function(RawString::from(&b"only_code"[..]), &[0xc3])
             .unwrap();
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         assert_eq!(
             object
@@ -3115,12 +2922,12 @@ mod tests {
             .unwrap();
         let lazy_rdata = output.rdata_section();
         output
-            .object
+            .plan
             .append_section_data(lazy_rdata, &[1, 2, 3, 4], 4);
-        output.object.section_symbol(lazy_rdata);
+        output.plan.section_symbol(lazy_rdata);
 
         let reviewed = output.reviewed_section_checksums.clone();
-        let mut bytes = output.object.write().unwrap();
+        let mut bytes = output.plan.write().unwrap();
         let generated = section_definition_checksums(&bytes);
         assert_eq!(generated.len(), 2);
         assert_ne!(generated[0], 0x1234_5678);
@@ -3221,7 +3028,7 @@ mod tests {
                 .unwrap();
         }
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let section = object.section_by_name(".data").unwrap();
         assert_eq!(section.data().unwrap(), b"left\0\0\0\0rght\x03\0\0\0");
@@ -3367,7 +3174,7 @@ mod tests {
             .add_topology_section_relocations(&SymbolMatcher::off(), &image, &relocs)
             .unwrap();
 
-        let bytes = output.object.write().unwrap();
+        let bytes = output.plan.write().unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
         let data_sections = object
             .sections()
