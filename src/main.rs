@@ -79,6 +79,12 @@ pub struct Cli {
     #[arg(long, requires = "data_manifest")]
     pub strict: bool,
 
+    /// Recover data relocations the data manifest does not cover from the
+    /// nearest PDB symbol. This is the behaviour whenever `--strict` is absent;
+    /// the flag states it explicitly.
+    #[arg(long, conflicts_with = "strict")]
+    pub recover_data_relocs_from_pdb: bool,
+
     /// Reviewed list of absolute relocation sites (`site_rva`, `kind`), for an
     /// image whose `.reloc` directory is missing. Combines with
     /// `--rediscover-relocations-from-pdb`: manifest sites are authoritative and
@@ -150,6 +156,7 @@ fn main() -> anyhow::Result<()> {
         data_section_manifest,
         reloc_alias_manifest,
         strict,
+        recover_data_relocs_from_pdb: _,
         reloc_manifest,
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
