@@ -29,6 +29,7 @@ pub struct ObjectFiles<'a> {
 }
 
 pub struct ObjectFile {
+    pad_rdata: bool,
     pub object: object::write::Object<'static>,
     pub data_section_id: Option<object::write::SectionId>,
     pub rdata_section_id: Option<object::write::SectionId>,
@@ -394,10 +395,14 @@ impl ObjectFile {
     }
 
     fn rdata_section(&mut self) -> object::write::SectionId {
-        *self.rdata_section_id.get_or_insert_with(|| {
+        if let Some(section_id) = self.rdata_section_id {
+            return section_id;
+        }
+        let section_id =
             self.object
-                .add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData)
-        })
+                .add_section(Vec::new(), b".rdata".into(), SectionKind::ReadOnlyData);
+        pad_created_rdata(&mut self.object, section_id, self.pad_rdata);
+        *self.rdata_section_id.insert(section_id)
     }
 
     fn text_section(&mut self) -> object::write::SectionId {
@@ -424,16 +429,12 @@ impl ObjectFile {
             SectionTopology::Exact => (None, None, None),
         };
 
-        // objdiff considers allocations to match if name is equal OR(!) offset
-        // into reloc table is the same.
-        //
-        // This makes different relocations with different data and different names
-        // to match, if they offsets match. These 4 bytes prevent that.
-        if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
-            object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
+        if let Some(rdata_section_id) = rdata_section_id {
+            pad_created_rdata(&mut object, rdata_section_id, pad_rdata);
         }
 
         Self {
+            pad_rdata,
             object,
             data_section_id,
             rdata_section_id,
@@ -594,11 +595,10 @@ impl ObjectFile {
             });
         }
 
-        if pad_rdata && let Some(rdata_section_id) = rdata_section_id {
-            object.append_section_data(rdata_section_id, &0_u32.to_le_bytes(), 4);
-        }
-
+        // A reviewed `.rdata` keeps exactly its reviewed size; only a `.rdata`
+        // created later for unplaced data is padded.
         Ok(Self {
+            pad_rdata,
             object,
             data_section_id,
             rdata_section_id,
@@ -611,6 +611,20 @@ impl ObjectFile {
             definition_ranges: vec![Vec::new(); sections.len()],
             reviewed_section_checksums,
         })
+    }
+}
+
+/// objdiff considers two allocations to match when their name OR their offset
+/// into the relocation table is equal, so different data with different names
+/// can match on offset alone. Four leading bytes in every `.rdata` the
+/// delinker creates move those offsets apart.
+fn pad_created_rdata(
+    object: &mut object::write::Object,
+    section_id: object::write::SectionId,
+    pad_rdata: bool,
+) {
+    if pad_rdata {
+        object.append_section_data(section_id, &0_u32.to_le_bytes(), 4);
     }
 }
 
@@ -2619,6 +2633,39 @@ mod tests {
         assert_eq!(parsed_sections[0].name().unwrap(), ".drectve");
         assert_eq!(parsed_sections[1].data().unwrap(), b"main");
         assert_eq!(parsed_sections[2].data().unwrap(), b"fold");
+    }
+
+    #[test]
+    fn rdata_padding_applies_only_to_sections_the_delinker_creates() {
+        let mut lazy = ObjectFile::empty_with_topology(true, SectionTopology::Exact);
+        let rdata = lazy.rdata_section();
+        assert_eq!(lazy.append_section_data(rdata, b"text", 0).offset, 4);
+
+        let reviewed = [DataSection {
+            object: b"fixture.c",
+            ordinal: 1,
+            name: b".rdata",
+            rva: Some(0x10),
+            size: 8,
+            alignment: 4,
+            characteristics: 0x4030_0040,
+            checksum: 0,
+            comdat_selection: ComdatSelection::None,
+            associative_ordinal: None,
+            storage: Some(SectionStorage::Rdata),
+        }];
+        let image = vec![0x55_u8; 0x20];
+        let section = crate::SecInfo {
+            rva: 0,
+            va: 0,
+            size: image.len(),
+            id: 2,
+            data: &image,
+        };
+        let output = ObjectFile::with_sections(&reviewed, section, section, &image, true).unwrap();
+        let bytes = output.object.write().unwrap();
+        let parsed = object::File::parse(bytes.as_slice()).unwrap();
+        assert_eq!(parsed.section_by_name(".rdata").unwrap().size(), 8);
     }
 
     #[test]
