@@ -37,15 +37,10 @@ pub struct Cli {
     )]
     pub output_path: Option<std::path::PathBuf>,
 
-    /// Source-tree prefix to strip from PDB file paths. REPEATABLE: a build can
-    /// draw compilands from more than one tree - the engine's own `sources/`, and
-    /// the Scaleform GFx SDK, which sits outside it (the retail PDB records it as
-    /// `C:\w\<hash>\Scaleform\Releases\GFx_4.2.21\`, ours as the local SDK
-    /// checkout). With a single prefix, every compiland from the other tree was
-    /// silently dropped on BOTH sides, so ~1.3k GFx sources produced no records
-    /// and their functions could never pair. Prefixes are tried in order; the
-    /// first that matches wins, and what remains is the recorded path - so give
-    /// each tree the prefix that leaves the SAME relative path on both sides.
+    /// Source-tree prefix to strip from PDB file paths; the rest of a matching
+    /// path names the output object. Repeatable, for a build that draws
+    /// compilands from several trees: prefixes are tried in order and the first
+    /// that matches wins. Functions from files under no prefix are skipped.
     #[arg(long, value_hint = clap::ValueHint::FilePath, required = true)]
     pub engine_path: Vec<String>,
 
@@ -72,7 +67,10 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_manifest: Option<std::path::PathBuf>,
 
-    /// Project-supplied candidate COFF section table and COMDAT topology.
+    /// Project-supplied candidate COFF section table and COMDAT topology. Its
+    /// header selects the section-definition checksums: a `checksum` column
+    /// replays reviewed values, a `provenance` column zeroes every checksum of
+    /// every object.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_section_manifest: Option<std::path::PathBuf>,
 
@@ -91,9 +89,9 @@ pub struct Cli {
     #[arg(long, requires = "data_manifest")]
     pub strict: bool,
 
-    /// Recover data relocations the data manifest does not cover from the
-    /// nearest PDB symbol. This is the behaviour whenever `--strict` is absent;
-    /// the flag states it explicitly.
+    /// Accepted for compatibility; it changes nothing. Data relocations the
+    /// data manifest does not cover are recovered from the nearest PDB symbol
+    /// whenever `--strict` is absent.
     #[arg(long, conflicts_with = "strict")]
     pub recover_data_relocs_from_pdb: bool,
 

@@ -653,12 +653,7 @@ fn get_function_location(
     }
 
     let location: &'static [u8] = match filename {
-        // First prefix that matches wins. A build draws compilands from more than
-        // one source tree - the engine's own `sources/`, and the Scaleform GFx
-        // SDK that sits outside it - and with a single prefix the other tree's
-        // compilands were dropped on BOTH sides, so those functions could never
-        // pair. Give each tree the prefix that leaves the same relative path on
-        // both sides and they key identically.
+        // The first prefix that matches wins; the rest names the object.
         Some(filename) => {
             let bytes = filename.as_bytes();
             match engine_paths
