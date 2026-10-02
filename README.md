@@ -61,6 +61,33 @@ cargo run --release -- \
 
 Run `vostok-delinker --help` for the complete option list.
 
+## Output objects
+
+Each function goes to the object named by its PDB source file, less the first
+`--engine-path` prefix that matches it. The option is repeatable for a build
+that draws compilands from several source trees; give each tree the prefix that
+leaves the same relative path for the target image and for a rebuilt one, so
+their objects pair. Functions from files under no prefix are not emitted.
+
+## Code
+
+A function is copied from `.text` at its PDB extent. The x86 decoder rebuilds
+relative branches: a call or jump that leaves the function becomes a relocation
+against the target function's symbol, and so does a call to the function
+itself, since the compiler emits recursion as a relocation too. Other internal
+branches keep their linked displacement.
+
+Switch jump tables that the compiler placed inside a function are not decoded
+as instructions. Their entries are found from the retained base relocations
+that hold a label of the function itself; because a label found late can show
+that bytes taken for a table are code, labels are collected until none is
+added.
+
+A PDB may also name data records inside `.text`, such as a hand-written table
+between functions. A reference to such a record becomes a relocation against
+it, unless a function covers its address; a function without a known extent is
+taken to reach the next function.
+
 ## Incremental-link trampolines
 
 An incremental linker may redirect calls, jumps, and stored function addresses
@@ -103,11 +130,13 @@ differently named section. An exact PDB symbol at the referenced IAT slot suppli
 the undefined COFF symbol name, such as `__imp__Function@4`; the linked slot
 address is replaced with a zero addend and an absolute relocation.
 
-Recovery requires a PE `HIGHLOW` base-relocation entry for the reference site.
-When such an entry targets the IAT, the supplied PDB must name that exact slot;
-Vostok reports an error instead of guessing a missing symbol identity. IAT
-references are separate from reviewed data definitions and are unaffected by
-`--strict`.
+The reference site comes from a PE `HIGHLOW` base-relocation entry, a reviewed
+`--reloc-manifest` site, or a recovered instruction operand of a stripped image.
+When a retained or reviewed site targets the IAT, the supplied PDB must name
+that exact slot; Vostok reports an error instead of guessing a missing symbol
+identity. `--rediscover-relocations-from-pdb` accepts only the named slots and
+skips the others. IAT references are separate from reviewed data definitions and
+are unaffected by `--strict`.
 
 ## Relocations without a `.reloc` section
 
@@ -206,39 +235,60 @@ Add `--strict` to require every retained or recovered absolute relocation whose
 target is in `.data` or `.rdata` to be covered by a manifest definition.
 Function targets continue to use PDB procedure symbols. `--strict` requires
 `--data-manifest` and reports both the relocation-site RVA and uncovered target
-RVA on failure.
+RVA on failure. Without `--strict`, a target the manifest does not cover is
+recovered from the PDB, as described under
+[Data the manifest does not cover](#data-the-manifest-does-not-cover).
 
 ### Manifest format
 
-The current format is a byte-oriented, tab-separated file. Empty lines and
-lines beginning with `#` are ignored. The first non-comment line must be this
-exact ASCII header:
+Every manifest Vostok reads is a byte-oriented, tab-separated file with LF or
+CRLF line endings. Empty lines and lines beginning with `#` are ignored. The
+first other line is a header, which must match one of the manifest's schemas
+exactly and selects it; each later line is one row with exactly the schema's
+columns. Numbers are decimal or `0x` hexadecimal, `-` marks an absent optional
+value, and an error names the file and line.
+
+The data manifest has two schemas. With the PDB schema, a PDB data symbol must
+begin at each row's RVA and supplies its identity:
 
 ```text
 object	rva	size	storage	alignment	section_ordinal	section_offset	scope
 ```
 
-Vostok parses the complete byte input with a `nom` grammar for LF/CRLF line
-boundaries and the exact eight-field row shape. It then applies semantic checks
-for paths, numbers, storage, extents, uniqueness, and overlap.
+The named schema states each identity itself, for an image whose PDB is
+synthetic or incomplete, and the evidence for the row:
 
-Each subsequent line defines one complete allocation:
+```text
+name	object	rva	size	storage	alignment	section_ordinal	section_offset	scope	provenance
+```
+
+Each row defines one complete allocation:
 
 | Field | Meaning |
 | --- | --- |
+| `name` | Named schema only: the COFF symbol name of the definition. |
 | `object` | UTF-8 relative output object path. `/` is normalized to `\`; absolute paths and `.` or `..` components are rejected. |
-| `rva` | Allocation start relative to the PE image base, in decimal or `0x` hexadecimal notation. A compatible PDB data symbol must begin at this exact RVA; that existing symbol supplies the identity. |
+| `rva` | Allocation start relative to the PE image base. With the PDB schema, a compatible PDB data symbol must begin at this exact RVA; that existing symbol supplies the identity. |
 | `size` | Complete allocation extent in bytes, in decimal or `0x` hexadecimal notation. |
 | `storage` | `data`, `rdata`, or `bss`. |
 | `alignment` | Required byte alignment; it must be a non-zero power of two. |
 | `section_ordinal` | One-based ordinal from the data section manifest, or `-` to use the object's default storage section. A numeric ordinal requires a numeric section offset. |
 | `section_offset` | Expected byte offset in the selected candidate section, or `-` when that topology has not been reviewed. Numeric offsets control emission order and are verified against the emitted COFF object. |
 | `scope` | The definition's source-level linkage: `local` for a `static` (internal linkage) definition, `external` for a non-`static` global (external linkage). A global is `external` even when only its own TU uses it -- scope follows the declaration, not usage. See [docs/scope.md](docs/scope.md). |
+| `provenance` | Named schema only: non-empty free text recording the evidence. A value starting with `provisional-` marks the row as a hypothesis, described below. |
 
 Start RVAs must be unique. Extents must be non-zero, non-overlapping,
 non-overflowing, and contained in the corresponding linked PE section. Storage
 must agree with the PDB symbol's PE section. A `bss` definition cannot contain a
-PE base relocation.
+PE base relocation. An external name is defined once, a local name once per
+object, and an object cannot define a name both ways. The exception is a folded
+COMDAT: several objects may define the same external name at the same RVA with
+the same extent, storage, and alignment, and each receives a copy.
+
+A provisional row is emitted like any other, but it proves nothing about the
+addresses it spans: it does not take part in the uniqueness and overlap checks,
+and it owns a relocation target only when no proven row does. Its extent must
+still lie within the linked PE section.
 
 Example:
 
@@ -255,11 +305,19 @@ offset `0x20` in candidate section 3, and owned by
 ### Data section manifest
 
 The optional data section manifest records the candidate COFF section table
-independently of symbol identity. Its first non-comment line must be this exact
-header:
+independently of symbol identity. It has two schemas, which differ in one
+column. With the checksum schema each row states the section-definition
+checksum to replay:
 
 ```text
 object	ordinal	name	rva	size	alignment	characteristics	checksum	comdat_selection	associative_ordinal	storage
+```
+
+With the provenance schema each row states its evidence instead, and every
+section-definition checksum of every emitted object is written as zero:
+
+```text
+object	ordinal	name	rva	size	alignment	characteristics	comdat_selection	associative_ordinal	storage	provenance
 ```
 
 Each object's ordinals must be unique, contiguous, and start at one. The fields
@@ -274,22 +332,29 @@ have these meanings:
 | `size` | Original section extent in bytes. |
 | `alignment` | Original non-zero, power-of-two section alignment. |
 | `characteristics` | Complete COFF section characteristics in decimal or `0x` hexadecimal notation. |
-| `checksum` | Exact checksum from the COFF section-definition auxiliary record. |
+| `checksum` | Checksum schema only: exact checksum from the COFF section-definition auxiliary record. |
 | `comdat_selection` | COFF selection value: `0` none, `1` no duplicates, `2` any, `3` same size, `4` exact match, `5` associative, `6` largest, or `7` newest. |
-| `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section. |
-| `storage` | `data`, `rdata`, or `bss` for a data-bearing candidate section, otherwise `-`. `data` accepts `.data` and linker-sorted `.CRT$*` subsections. An RVA requires storage, while storage may be present without an affine RVA. |
+| `associative_ordinal` | Leader section ordinal for selection `5`, otherwise `-`. The leader must precede the associative section and be a COMDAT that is not itself associative. |
+| `storage` | `data`, `rdata`, or `bss` for a data-bearing candidate section, otherwise `-`. Names compare by their group, the part before any `$`: `data` accepts `.data` and `.CRT`, `rdata` accepts `.rdata` and `.xdata`, and `bss` accepts `.bss`. An RVA requires storage, while storage may be present without an affine RVA. |
+| `provenance` | Provenance schema only: non-empty free text recording the evidence. |
 
 The manifest owns section order, names, characteristics, alignment, and linked
 data ranges. The PDB still owns symbol names. Data-manifest rows bind definitions
 to these sections by ordinal and offset; the section manifest never creates or
 renames a definition.
 
-When this manifest is supplied, its section table is exact: Vostok does not add
-unused `.data`, `.rdata`, or `.text` sections that are absent from its rows. A
-section needed by emitted content is created only when that content is actually
-encountered. Without the manifest, Vostok synthesizes its default section set.
-Exact-topology output replaces the object writer's generated section-definition
-checksums only for manifest-declared sections, using each row's reviewed value.
+When this manifest is supplied, its section table is exact for every object,
+including objects it does not list: Vostok does not add unused `.data`,
+`.rdata`, or `.text` sections that are absent from its rows. A section needed by
+emitted content is created only when that content is actually encountered.
+Without the manifest, Vostok synthesizes its default section set. The checksum
+schema replaces the object writer's generated section-definition checksums only
+for manifest-declared sections, using each row's reviewed value; the provenance
+schema zeroes them all.
+
+Content the manifests do not place goes to the object's default `.data`,
+`.rdata`, or `.bss` section: a manifest section named exactly that, with no
+COMDAT selection, or one Vostok creates.
 
 Vostok materializes affine `.data`, `.rdata`, and `.bss` ranges directly from
 the linked image. For a storage-assigned section without an affine RVA, it
@@ -299,9 +364,10 @@ definition's independent retail RVA, and retains zero-filled gaps and `.bss`.
 Definition ranges in one candidate section may not overlap.
 
 The implementation preserves the order, names, and characteristics of non-data
-rows as empty section records. A section that requests a COMDAT selection is
-rejected for now; COMDAT group emission and associative groups require
-additional work.
+rows as empty section records. A section with a COMDAT selection is emitted as
+a COMDAT whose leader is its section symbol; an associative section joins its
+leader's group. Vostok warns about a COMDAT section that defines no symbol, since
+a linker cannot select it by name.
 
 Assigned data sections are checked before emission. Affine RVA placement must
 satisfy the declared alignment; the numeric alignment must agree with the COFF
@@ -344,7 +410,41 @@ in the owner object and matched the definition at `100.0%`.
 
 The data manifest restores reviewed definitions and their position within each
 emitted storage section. The data section manifest separately restores reviewed
-same-name sections; COMDAT grouping is emitted by a follow-up.
+same-name sections and their COMDAT groups.
+
+## Data the manifest does not cover
+
+Without `--strict`, a data relocation target that no manifest row owns is
+recovered from the nearest PDB data symbol before it, as that symbol plus an
+addend. When the PDB types give the symbol a size that the target lies beyond,
+the relocation is still recovered from it and counted in a summary.
+
+The referring object then receives a private copy of the bytes it references,
+named after the PDB symbol: a string literal, a constant, or a static. An
+object holds one copy per target, which every later reference reuses, as the
+compiler's single definition would. A copy becomes a reference instead when a
+manifest defines the name as external, or as a definition at that symbol's own
+RVA. A zero-filled static gets no copy; it becomes an undefined external
+reference, since a copy would only grow the object's `.bss`. A COMMON symbol of
+the same name in the object takes precedence over a copy.
+
+A PDB synthesizer can mark an address whose original identity it knows exists
+but cannot yet spell by placing a fence symbol there. Give its name prefix with
+`--fence-prefix` (repeatable): a relocation that would be recovered through a
+fence fails the delink instead of inventing an identity.
+
+## COMMON symbol manifest
+
+An uninitialized global that an object declares COMMON owns no section bytes;
+the linker allocates the largest size any object asks for. The optional
+`--common-symbol-manifest` lists such declarations, with this header:
+
+```text
+object	name	size
+```
+
+Each row declares `name` COMMON with a non-zero `size` in `object`. A name is
+declared once per object.
 
 ## Relocation alias manifest
 
@@ -366,10 +466,12 @@ cargo run --release -- \
   --reloc-alias-manifest build/reloc-aliases.tsv
 ```
 
-Its first non-comment line must be this exact header:
+Its header selects one of two schemas, which differ only in a final column of
+evidence:
 
 ```text
 function_rva	target_rva	site_rva	owner	addend	occurrences
+function_rva	target_rva	site_rva	owner	addend	occurrences	provenance
 ```
 
 | Field | Meaning |
@@ -379,7 +481,8 @@ function_rva	target_rva	site_rva	owner	addend	occurrences
 | `site_rva` | Exact RVA of one four-byte relocation field, or `*` for every matching site not covered by an exact row. |
 | `owner` | Existing PDB data symbol or function alias that the candidate COFF relocations should reference. |
 | `addend` | Unsigned 32-bit COFF addend bits, including two's-complement encodings such as `0xfffffff8`. |
-| `occurrences` | Exact number of matching relocation sites expected in that function. |
+| `occurrences` | Exact number of distinct matching relocation sites expected in that function. A function body that several objects share counts each site once. |
+| `provenance` | Second schema only: non-empty free text recording the evidence. |
 
 Example:
 
@@ -391,7 +494,11 @@ function_rva	target_rva	site_rva	owner	addend	occurrences
 
 Data aliases apply only to existing `HIGHLOW` relocation sites inside `.text`.
 The owner must occur exactly once in the applicable PDB data-symbol table, and
-`owner RVA + addend` must wrap to the declared target RVA. Function aliases
+`owner RVA + addend` must wrap to the declared target RVA. A function-local
+static may be spelled without the ordinal its PDB name ends in, as `name$S`
+for `name$S12`, since the ordinal changes whenever its function does; of the
+statics with that spelling, the one that the addend carries to the target
+answers. Function aliases
 also apply to decoded external `call`, `jmp`, and conditional-branch targets,
 and to exact absolute function references retained by `HIGHLOW`; their owner
 must be one of the PDB aliases at the target RVA and their addend must be zero.
@@ -406,3 +513,15 @@ The manifest neither invents sites nor names.
 Recovered external function references use the COFF derived-function type for
 both relative branches and absolute function pointers. Data references remain
 untyped COFF symbols.
+
+## PDB data indexes
+
+Two options write an index instead of delinking, for a project building its
+manifests:
+
+- `--write-data-index FILE` writes every PDB data symbol in `.rdata` and `.data`
+  with its RVA, storage, type-derived size, scope, module, and public name.
+- `--write-missing-data-index FILE` writes every base-relocation target in
+  `.text`, `.rdata`, or `.data` that no PDB symbol starts at and no function or
+  string literal of known extent contains, with the compiland contributions that
+  hold its site and its target.
