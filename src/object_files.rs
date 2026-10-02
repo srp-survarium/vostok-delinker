@@ -237,6 +237,7 @@ impl ObjectFiles<'_> {
         }
 
         let mut function_claims = FunctionClaims::default();
+        let mut recovered_addends = HashMap::new();
         let mut modules = env.dbi.modules()?;
         while let Some(module) = modules.next()? {
             let Some(module_info) = pdb.module_info(&module)? else {
@@ -292,6 +293,7 @@ impl ObjectFiles<'_> {
                     manifest_coverage,
                     WritableExtent::of(env),
                     code_relocation_recovery,
+                    &mut recovered_addends,
                 )?;
 
                 let object_file = this.objects.entry(filename).or_insert_with(empty_object);
@@ -818,6 +820,9 @@ fn resolve_code_relocations<'s>(
     manifest_coverage: ManifestCoverage,
     writable: WritableExtent,
     code_relocation_recovery: CodeRelocationRecovery,
+    // Addends of the operand fields recovered so far, by site. A body that
+    // several objects own is decoded once per owner and must read the same.
+    recovered_addends: &mut HashMap<usize, u32>,
 ) -> anyhow::Result<Vec<u8>> {
     let fun_va = image_base.to_usize() + fun_rva;
 
@@ -867,6 +872,10 @@ fn resolve_code_relocations<'s>(
                     let field_offset = instruction_offset + field.offset;
                     let reloc_rva = fun_rva + field_offset;
                     if relocs_rva.contains_key(&reloc_rva) {
+                        if let Some(addend) = recovered_addends.get(&reloc_rva) {
+                            fun_bytes[field_offset..field_offset + 4]
+                                .copy_from_slice(&addend.to_le_bytes());
+                        }
                         continue;
                     }
                     let FunctionRelocationField::Within { .. } =
@@ -898,6 +907,7 @@ fn resolve_code_relocations<'s>(
                     fun_bytes[field_offset..field_offset + 4]
                         .copy_from_slice(&addend.to_le_bytes());
                     relocs_rva.insert(reloc_rva, kind);
+                    recovered_addends.insert(reloc_rva, addend);
                 }
             }
         }
@@ -1921,6 +1931,7 @@ mod tests {
             ManifestCoverage::AllowPartial,
             WritableExtent::all_initialized(),
             crate::relocs::BaseRelocationSource::Absent.code_relocation_recovery(),
+            &mut HashMap::new(),
         )
         .unwrap();
         assert_eq!(retained, linked_function);
@@ -1940,6 +1951,7 @@ mod tests {
             ManifestCoverage::AllowPartial,
             WritableExtent::all_initialized(),
             crate::relocs::BaseRelocationSource::Stripped.code_relocation_recovery(),
+            &mut HashMap::new(),
         )
         .unwrap();
         assert_eq!(recovered, [0xb8, 0, 0, 0, 0, 0xc3]);
@@ -1951,6 +1963,30 @@ mod tests {
                 ..
             }) if *overloads == [RawString::from(&b"target"[..])]
         ));
+
+        // A body that two objects own is decoded twice; both copies carry the
+        // recovered addend, not the linked address.
+        let mut relocations = BTreeMap::new();
+        let mut recovered_addends = HashMap::new();
+        for _ in 0..2 {
+            let copy = resolve_code_relocations(
+                image_base,
+                function_rva,
+                linked_function.len(),
+                &symbols,
+                &coff_data,
+                &mut relocations,
+                &aliases,
+                &mut RelocAliasObservations::default(),
+                &data_manifest,
+                ManifestCoverage::AllowPartial,
+                WritableExtent::all_initialized(),
+                crate::relocs::BaseRelocationSource::Stripped.code_relocation_recovery(),
+                &mut recovered_addends,
+            )
+            .unwrap();
+            assert_eq!(copy, [0xb8, 0, 0, 0, 0, 0xc3]);
+        }
     }
 
     #[test]
@@ -1992,6 +2028,7 @@ mod tests {
             ManifestCoverage::AllowPartial,
             WritableExtent::all_initialized(),
             CodeRelocationRecovery::RetainedOnly,
+            &mut HashMap::new(),
         )
         .unwrap();
 
@@ -2028,6 +2065,7 @@ mod tests {
             ManifestCoverage::AllowPartial,
             WritableExtent::all_initialized(),
             CodeRelocationRecovery::RetainedOnly,
+            &mut HashMap::new(),
         )
         .unwrap()
     }
