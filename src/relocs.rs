@@ -681,26 +681,25 @@ fn resolve_absolute_site<'s>(
             let diff = u32::try_from(target_rva - *function_rva)?;
             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
-            let symbol = if diff == 0
-                && (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva)
-            {
-                match symbols.relocation_field_owner(reloc_rva) {
-                    FunctionRelocationField::Within { function_rva } => reloc_aliases
-                        .resolve_function_alias(
-                            function_rva,
-                            target_rva,
-                            reloc_rva,
-                            function_overloads,
-                            observed_aliases,
-                        )?,
-                    FunctionRelocationField::MissingFunction
-                    | FunctionRelocationField::UnknownExtent
-                    | FunctionRelocationField::OutsideExtent
-                    | FunctionRelocationField::FieldOverflow => None,
-                }
-            } else {
-                None
-            };
+            let symbol =
+                if diff == 0 && (env.text.rva..env.text.rva + env.text.size).contains(&reloc_rva) {
+                    match symbols.relocation_field_owner(reloc_rva) {
+                        FunctionRelocationField::Within { function_rva } => reloc_aliases
+                            .resolve_function_alias(
+                                function_rva,
+                                target_rva,
+                                reloc_rva,
+                                function_overloads,
+                                observed_aliases,
+                            )?,
+                        FunctionRelocationField::MissingFunction
+                        | FunctionRelocationField::UnknownExtent
+                        | FunctionRelocationField::OutsideExtent
+                        | FunctionRelocationField::FieldOverflow => None,
+                    }
+                } else {
+                    None
+                };
 
             relocs_rva.insert(
                 reloc_rva,
