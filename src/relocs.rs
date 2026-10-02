@@ -436,12 +436,6 @@ struct RelocHeader {
 }
 const HEADER_SIZE: usize = std::mem::size_of::<RelocHeader>();
 
-#[repr(C)]
-#[derive(bytemuck::AnyBitPattern, bytemuck::NoUninit, Copy, Clone)]
-struct RelocEntry {
-    entry: u16,
-}
-
 #[derive(Copy, Clone)]
 struct RawSectionExtent {
     rva: u32,
@@ -697,14 +691,17 @@ fn highlow_sites(reloc_data: &[u8]) -> anyhow::Result<Vec<usize>> {
         if block_end > reloc_data.len() {
             anyhow::bail!("base relocation block at offset {pos:#x} is truncated");
         }
-        let entries: &[RelocEntry] =
-            bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..block_end]);
+        if block_size % 2 != 0 {
+            anyhow::bail!("base relocation block at offset {pos:#x} has odd size {block_size:#x}");
+        }
+        let entries = reloc_data[pos + HEADER_SIZE..block_end]
+            .chunks_exact(2)
+            .map(|entry| u16::from_le_bytes([entry[0], entry[1]]));
         pos = block_end;
         sites.extend(
             entries
-                .iter()
-                .filter(|RelocEntry { entry }| entry >> 12 == RELOC_TYP_HIGHLOW)
-                .map(|RelocEntry { entry }| (page_rva + u32::from(entry & 0x0FFF)).to_usize()),
+                .filter(|entry| entry >> 12 == RELOC_TYP_HIGHLOW)
+                .map(|entry| (page_rva + u32::from(entry & 0x0FFF)).to_usize()),
         );
     }
     Ok(sites)
@@ -1481,6 +1478,11 @@ mod tests {
         truncated[4] = 0x20;
         let error = highlow_sites(&truncated).unwrap_err().to_string();
         assert!(error.contains("truncated"), "{error}");
+
+        let mut odd = block(0x1000, &[0x3004, 0x0000]);
+        odd[4] = 11;
+        let error = highlow_sites(&odd).unwrap_err().to_string();
+        assert!(error.contains("odd size"), "{error}");
     }
 
     #[test]
