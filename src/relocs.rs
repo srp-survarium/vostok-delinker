@@ -117,26 +117,51 @@ fn resolve_manifest_alias(
         return Ok(None);
     };
 
-    let mut owners = owners
+    let resolves =
+        |owner_rva: usize| (owner_rva as u32).wrapping_add(alias.addend) == target_rva as u32;
+    let mut exact = owners
         .iter()
         .filter(|(_, symbol)| symbol.name == alias.owner);
-    let Some((owner_rva, _)) = owners.next() else {
-        anyhow::bail!(
-            "relocation alias owner is absent from the PDB: {}",
-            alias.owner
-        );
-    };
-    if owners.next().is_some() {
-        anyhow::bail!(
+    let (owner_rva, owner) = match (exact.next(), exact.next()) {
+        (Some((owner_rva, symbol)), None) => (*owner_rva, symbol.name),
+        (Some(_), Some(_)) => anyhow::bail!(
             "relocation alias owner is ambiguous in the PDB: {}",
             alias.owner
-        );
-    }
-    if (*owner_rva as u32).wrapping_add(alias.addend) != target_rva as u32 {
+        ),
+        (None, _) => {
+            // A function-local static is `name$S<ordinal>` in CodeView, and the
+            // ordinal shifts whenever its function changes. A reviewed row may
+            // spell it `name$S`; the live symbol that resolves the row answers.
+            let mut statics = owners.iter().filter(|(owner_rva, symbol)| {
+                is_ordinal_of_static(symbol.name.as_bytes(), alias.owner.as_bytes())
+                    && resolves(**owner_rva)
+            });
+            match (statics.next(), statics.next()) {
+                (Some((owner_rva, symbol)), None) => (*owner_rva, symbol.name),
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "relocation alias owner is ambiguous in the PDB: {}",
+                    alias.owner
+                ),
+                (None, _) => anyhow::bail!(
+                    "relocation alias owner is absent from the PDB: {}",
+                    alias.owner
+                ),
+            }
+        }
+    };
+    if !resolves(owner_rva) {
         anyhow::bail!("relocation alias owner/addend does not resolve to target");
     }
 
-    Ok(Some((alias.addend, alias.owner)))
+    Ok(Some((alias.addend, owner)))
+}
+
+/// Whether `live` is `spelling` (which ends in `$S`) plus a CodeView ordinal.
+fn is_ordinal_of_static(live: &[u8], spelling: &[u8]) -> bool {
+    spelling.ends_with(b"$S")
+        && live
+            .strip_prefix(spelling)
+            .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.iter().all(u8::is_ascii_digit))
 }
 
 #[derive(Copy, Clone)]
@@ -1089,6 +1114,55 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    #[test]
+    fn ordinal_free_static_spelling_selects_the_live_symbol_that_resolves() {
+        let mut symbols = pdb_symbols::PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1000, RawString::from(&b"function"[..]), Some(0x40))
+            .unwrap();
+        for (rva, name) in [
+            (0x4000, &b"_s_mask$S12"[..]),
+            (0x4100, &b"_s_mask$S7"[..]),
+            (0x4200, &b"_s_mask$Sx"[..]),
+        ] {
+            symbols
+                .statics
+                .insert(rva, PdbDataSymbol::new(RawString::from(name), None));
+        }
+        let aliases = RelocAliasManifest::parse(
+            b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\n\
+              0x1000\t0x40f2\t0x1010\t_s_mask$S\t0xfffffff2\t1\n\
+              0x1000\t0x4200\t0x1020\t_s_mask$S\t0\t1\n",
+            std::path::Path::new("aliases.tsv"),
+        )
+        .unwrap();
+        let mut observed = RelocAliasObservations::default();
+
+        let (addend, owner) = resolve_manifest_alias(
+            &aliases,
+            &symbols.statics,
+            &symbols,
+            &mut observed,
+            0x1010,
+            0x40f2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((addend, owner.as_bytes()), (0xfffffff2, &b"_s_mask$S7"[..]));
+
+        let error = resolve_manifest_alias(
+            &aliases,
+            &symbols.statics,
+            &symbols,
+            &mut observed,
+            0x1020,
+            0x4200,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("absent"), "{error}");
     }
 
     #[test]
