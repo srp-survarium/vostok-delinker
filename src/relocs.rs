@@ -284,11 +284,14 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         reloc_rva,
         target_rva,
     )? {
+        let owner_rva = (target_rva as u32).wrapping_sub(addend) as usize;
         let kind = if storage != DataStorage::Rdata {
             RelocKind::ConjuredStatic {
                 symbol: owner,
                 target_rva,
-                storage,
+                // The owner's storage, which an end-of-array target past its
+                // extent need not share.
+                storage: writable.storage(owner_rva),
             }
         } else {
             RelocKind::ConjuredConstant {
@@ -296,7 +299,6 @@ pub(crate) fn classify_exact_pdb_target<'s>(
                 target_rva,
             }
         };
-        let owner_rva = (target_rva as u32).wrapping_sub(addend) as usize;
         return Ok(Some((
             referenced_if_defined(data_manifest, owner_rva, kind),
             addend,
@@ -305,7 +307,7 @@ pub(crate) fn classify_exact_pdb_target<'s>(
 
     if let Some((owner, addend)) = data_manifest
         .owner_and_addend_for_rva(target_rva)
-        .or_else(|| data_manifest.provisional_owner_and_addend_for_rva(target_rva, storage))
+        .or_else(|| provisional_owner(data_manifest, target_rva, storage))
     {
         let addend = u32::try_from(addend)?;
         return Ok(Some((
@@ -342,6 +344,29 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         referenced_if_defined(data_manifest, target_rva, kind),
         0,
     )))
+}
+
+/// The provisional definition owning `target_rva`, preferring `storage`. The
+/// split between retail `.data` and its zero-fill tail is only as exact as the
+/// raw size, which the linker rounds up to the file alignment, so a writable
+/// target falls back to the other writable storage.
+fn provisional_owner(
+    data_manifest: &DataManifest,
+    target_rva: usize,
+    storage: DataStorage,
+) -> Option<(crate::data_manifest::DataDefinition, usize)> {
+    let fallback = match storage {
+        DataStorage::Data => Some(DataStorage::Bss),
+        DataStorage::Bss => Some(DataStorage::Data),
+        DataStorage::Rdata => None,
+    };
+    data_manifest
+        .provisional_owner_and_addend_for_rva(target_rva, storage)
+        .or_else(|| {
+            fallback.and_then(|storage| {
+                data_manifest.provisional_owner_and_addend_for_rva(target_rva, storage)
+            })
+        })
 }
 
 /// A PDB synthesizer can place a fence symbol named `UNPROVISIONED_...` at a
@@ -1000,7 +1025,8 @@ fn resolve_absolute_site<'s>(
             let owner = data_manifest
                 .owner_and_addend_for_rva(target_rva)
                 .or_else(|| {
-                    data_manifest.provisional_owner_and_addend_for_rva(
+                    provisional_owner(
+                        data_manifest,
                         target_rva,
                         WritableExtent::of(env).storage(target_rva),
                     )
