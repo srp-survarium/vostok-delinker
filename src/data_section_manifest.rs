@@ -340,21 +340,30 @@ impl DataSectionManifest {
                 );
             }
             if let Some(storage) = storage {
+                // A `$` suffix is only the linker's ordering key within a group:
+                // `.rdata$r` holds cl's RTTI records and `.xdata$x` its exception
+                // tables, and both link into read-only data.
+                let group = match row.name.iter().position(|byte| *byte == b'$') {
+                    Some(index) => &row.name[..index],
+                    None => row.name,
+                };
                 let (name_matches, required, forbidden) = match storage {
                     SectionStorage::Data => (
-                        row.name == b".data" || row.name.starts_with(b".CRT$"),
+                        group == b".data" || group == b".CRT",
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA,
                     ),
                     SectionStorage::Rdata => (
-                        row.name == b".rdata",
+                        group == b".rdata" || group == b".xdata",
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
+                            | object::pe::IMAGE_SCN_CNT_CODE
+                            | object::pe::IMAGE_SCN_MEM_EXECUTE
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                     ),
                     SectionStorage::Bss => (
-                        row.name == b".bss",
+                        group == b".bss",
                         object::pe::IMAGE_SCN_CNT_UNINITIALIZED_DATA
                             | object::pe::IMAGE_SCN_MEM_WRITE,
                         object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA,
@@ -625,6 +634,31 @@ mod tests {
     fn accepts_linker_sorted_initialized_writable_sections() {
         let manifest = parse("a.c\t1\t.CRT$XCU\t0x100\t4\t4\t0xc0300040\t0\t0\t-\tdata\n").unwrap();
         assert_eq!(manifest.sections()[0].storage, Some(SectionStorage::Data));
+    }
+
+    #[test]
+    fn grouped_section_names_select_storage_by_their_group() {
+        for (name, alignment, characteristics, comdat, storage) in [
+            (".rdata$r", 4, "0x40301040", 2, "rdata"),
+            (".xdata$x", 8, "0x40401040", 2, "rdata"),
+            (".data$1", 4, "0xc0300040", 0, "data"),
+            (".bss$1", 4, "0xc0300080", 0, "bss"),
+        ] {
+            let row = format!(
+                "a.c\t1\t{name}\t0x100\t8\t{alignment}\t{characteristics}\t0\t{comdat}\t-\t{storage}\n"
+            );
+            assert!(parse(&row).is_ok(), "rejected {name}");
+        }
+        for (name, characteristics, storage) in [
+            (".rdatax", "0x40300040", "rdata"),
+            (".text$x", "0x40300040", "rdata"),
+            (".xdata$x", "0x60300020", "rdata"),
+            (".xdata$x", "0xc0300040", "data"),
+        ] {
+            let row =
+                format!("a.c\t1\t{name}\t0x100\t8\t4\t{characteristics}\t0\t0\t-\t{storage}\n");
+            assert!(parse(&row).is_err(), "accepted {name} {characteristics}");
+        }
     }
 
     #[test]
