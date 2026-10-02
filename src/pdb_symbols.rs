@@ -177,7 +177,7 @@ impl PdbSymbols {
                 {
                     constant_data_symbols.push((
                         symbol_rva,
-                        PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
+                        PdbDataSymbol::new(name, type_sizes.extent_of(type_index)),
                     ));
                 }
                 pdb2::SymbolData::Data(pdb2::DataSymbol { type_index, .. })
@@ -185,7 +185,7 @@ impl PdbSymbols {
                 {
                     static_data_symbols.push((
                         symbol_rva,
-                        PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
+                        PdbDataSymbol::new(name, type_sizes.extent_of(type_index)),
                     ));
                 }
                 _ => {}
@@ -285,7 +285,7 @@ impl PdbSymbols {
                             () if offset.section == env.data.id => &mut self.statics,
                             _ => continue,
                         };
-                        let mut symbol = PdbDataSymbol::new(name, type_sizes.size_of(type_index));
+                        let mut symbol = PdbDataSymbol::new(name, type_sizes.extent_of(type_index));
                         if let Some(global) = symbols.remove(&symbol_rva) {
                             symbol.fill_size_from(global);
                         }
@@ -532,45 +532,74 @@ impl PdbSymbols {
     }
 }
 
-struct TypeSizeResolver {
+/// Byte sizes of PDB types. A forward reference to a class or union takes the
+/// size of the complete definition of the same name.
+pub(crate) struct TypeSizeResolver {
     finder: Option<pdb2::TypeFinder<'static>>,
+    complete_sizes: HashMap<&'static [u8], usize>,
     cache: HashMap<TypeIndex, Option<usize>>,
 }
 
 impl TypeSizeResolver {
-    fn parse<S>(pdb: &mut pdb2::PDB<'static, S>) -> Self
+    /// Index the TPI stream. A stream that is missing or fails to parse part
+    /// way leaves the types before the failure resolvable.
+    pub(crate) fn parse<S>(pdb: &mut pdb2::PDB<'static, S>) -> Self
     where
         S: pdb2::Source<'static> + 'static,
     {
-        let Ok(type_information) = pdb.type_information() else {
-            return Self {
-                finder: None,
-                cache: HashMap::new(),
-            };
+        let mut this = Self {
+            finder: None,
+            complete_sizes: HashMap::new(),
+            cache: HashMap::new(),
         };
-        let type_information = leak(type_information);
+        let type_information = match pdb.type_information() {
+            Ok(type_information) => leak(type_information),
+            Err(error) => {
+                eprintln!("[warning] no PDB type sizes: {error}");
+                return this;
+            }
+        };
         let mut finder = type_information.finder();
         let mut iter = type_information.iter();
         loop {
             match iter.next() {
-                Ok(Some(_)) => finder.update(&iter),
-                Ok(None) => break,
-                Err(_) => {
-                    return Self {
-                        finder: None,
-                        cache: HashMap::new(),
+                Ok(Some(typ)) => {
+                    finder.update(&iter);
+                    let (name, unique_name, size) = match typ.parse() {
+                        Ok(TypeData::Class(typ)) if !typ.properties.forward_reference() => {
+                            (typ.name, typ.unique_name, typ.size)
+                        }
+                        Ok(TypeData::Union(typ)) if !typ.properties.forward_reference() => {
+                            (typ.name, typ.unique_name, typ.size)
+                        }
+                        _ => continue,
                     };
+                    let Some(size) = usize::try_from(size).ok().filter(|&size| size != 0) else {
+                        continue;
+                    };
+                    for name in std::iter::once(name).chain(unique_name) {
+                        this.complete_sizes.insert(name.as_bytes(), size);
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("[warning] PDB type sizes end at a malformed record: {error}");
+                    break;
                 }
             }
         }
-
-        Self {
-            finder: Some(finder),
-            cache: HashMap::new(),
-        }
+        this.finder = Some(finder);
+        this
     }
 
-    fn size_of(&mut self, index: TypeIndex) -> Option<usize> {
+    /// The size of a data symbol's type, unless zero: an array the PDB records
+    /// without a bound says nothing about the symbol's extent.
+    fn extent_of(&mut self, index: TypeIndex) -> Option<usize> {
+        self.size_of(index).filter(|&size| size != 0)
+    }
+
+    /// The size the PDB records for a type; an array without a bound is zero.
+    pub(crate) fn size_of(&mut self, index: TypeIndex) -> Option<usize> {
         if let Some(size) = self.cache.get(&index) {
             return *size;
         }
@@ -579,23 +608,32 @@ impl TypeSizeResolver {
             return None;
         };
 
+        // A cycle through modifiers or aliases resolves to no size.
         self.cache.insert(index, None);
+        let complete_size = |size: u64, name: RawString<'_>, unique_name: Option<RawString<'_>>| {
+            usize::try_from(size)
+                .ok()
+                .filter(|&size| size != 0)
+                .or_else(|| {
+                    unique_name
+                        .and_then(|name| self.complete_sizes.get(name.as_bytes()))
+                        .or_else(|| self.complete_sizes.get(name.as_bytes()))
+                        .copied()
+                })
+        };
         let size = match finder.find(index).and_then(|typ| typ.parse()) {
             Ok(TypeData::Primitive(typ)) => primitive_size(typ.kind, typ.indirection),
             Ok(TypeData::Pointer(typ)) => {
                 let size = typ.attributes.size();
                 (size != 0).then_some(usize::from(size))
             }
+            Ok(TypeData::Array(typ)) => typ.dimensions.last().map(|size| size.to_usize()),
+            Ok(TypeData::Class(typ)) => complete_size(typ.size, typ.name, typ.unique_name),
+            Ok(TypeData::Union(typ)) => complete_size(typ.size, typ.name, typ.unique_name),
             Ok(TypeData::Modifier(typ)) => self.size_of(typ.underlying_type),
-            Ok(TypeData::Array(typ)) => typ
-                .dimensions
-                .last()
-                .copied()
-                .map(|size| size.to_usize())
-                .filter(|&size| size != 0),
-            Ok(TypeData::Class(typ)) => usize::try_from(typ.size).ok().filter(|&size| size != 0),
-            Ok(TypeData::Union(typ)) => usize::try_from(typ.size).ok().filter(|&size| size != 0),
             Ok(TypeData::Enumeration(typ)) => self.size_of(typ.underlying_type),
+            Ok(TypeData::Alias(typ)) => self.size_of(typ.underlying_type),
+            Ok(TypeData::Bitfield(typ)) => self.size_of(typ.underlying_type),
             _ => None,
         };
         self.cache.insert(index, size);

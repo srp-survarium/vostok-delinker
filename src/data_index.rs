@@ -1,10 +1,10 @@
 use crate::Env;
-use crate::pdb_symbols::primitive_size;
-use crate::utils::{ToU64, ToUsize};
+use crate::pdb_symbols::TypeSizeResolver;
+use crate::utils::ToUsize;
 
-use pdb2::{FallibleIterator, RawString, TypeData, TypeIndex};
+use pdb2::{FallibleIterator, TypeIndex};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -15,7 +15,7 @@ struct Row {
     rva: usize,
     section: &'static str,
     storage: &'static str,
-    size: Option<u64>,
+    size: Option<usize>,
     type_index: TypeIndex,
     scope: &'static str,
     module: Vec<u8>,
@@ -28,22 +28,7 @@ pub fn write<S>(env: &Env, pdb: &mut pdb2::PDB<'static, S>, path: &Path) -> anyh
 where
     S: pdb2::Source<'static> + 'static,
 {
-    let type_information = pdb.type_information()?;
-    let mut type_finder = type_information.finder();
-    let mut complete_sizes = HashMap::new();
-    let mut type_iter = type_information.iter();
-    while let Some(typ) = type_iter.next()? {
-        type_finder.update(&type_iter);
-        match typ.parse() {
-            Ok(TypeData::Class(data)) if !data.properties.forward_reference() => {
-                remember_complete_size(&mut complete_sizes, data.name, data.unique_name, data.size);
-            }
-            Ok(TypeData::Union(data)) if !data.properties.forward_reference() => {
-                remember_complete_size(&mut complete_sizes, data.name, data.unique_name, data.size);
-            }
-            _ => {}
-        }
-    }
+    let mut type_sizes = TypeSizeResolver::parse(pdb);
 
     let mut rows = Vec::new();
     let mut public_names: BTreeMap<usize, (Vec<u8>, &'static str, &'static str)> = BTreeMap::new();
@@ -63,7 +48,7 @@ where
                         rva,
                         section,
                         storage,
-                        size: type_size(&type_finder, data.type_index, &complete_sizes, 0),
+                        size: type_sizes.size_of(data.type_index),
                         type_index: data.type_index,
                         scope: if data.global { "external" } else { "local" },
                         module: Vec::new(),
@@ -96,7 +81,7 @@ where
                 rva,
                 section,
                 storage,
-                size: type_size(&type_finder, data.type_index, &complete_sizes, 0),
+                size: type_sizes.size_of(data.type_index),
                 type_index: data.type_index,
                 scope: if data.global { "external" } else { "local" },
                 module: module_name.clone(),
@@ -183,21 +168,6 @@ where
     Ok(())
 }
 
-fn remember_complete_size(
-    sizes: &mut HashMap<Vec<u8>, u64>,
-    name: RawString<'_>,
-    unique_name: Option<RawString<'_>>,
-    size: u64,
-) {
-    if size == 0 {
-        return;
-    }
-    sizes.insert(name.as_bytes().to_vec(), size);
-    if let Some(name) = unique_name {
-        sizes.insert(name.as_bytes().to_vec(), size);
-    }
-}
-
 fn data_location(
     env: &Env,
     offset: pdb2::PdbInternalSectionOffset,
@@ -216,53 +186,6 @@ fn data_location(
         return Some((rva, ".data", storage));
     }
     None
-}
-
-fn type_size(
-    finder: &pdb2::TypeFinder<'_>,
-    index: TypeIndex,
-    complete_sizes: &HashMap<Vec<u8>, u64>,
-    depth: usize,
-) -> Option<u64> {
-    if depth > 32 {
-        return None;
-    }
-    match finder.find(index).ok()?.parse().ok()? {
-        TypeData::Primitive(data) => primitive_size(data.kind, data.indirection).map(ToU64::to_u64),
-        TypeData::Class(data) => {
-            if data.size != 0 {
-                Some(data.size)
-            } else {
-                data.unique_name
-                    .and_then(|name| complete_sizes.get(name.as_bytes()).copied())
-                    .or_else(|| complete_sizes.get(data.name.as_bytes()).copied())
-            }
-        }
-        TypeData::Union(data) => {
-            if data.size != 0 {
-                Some(data.size)
-            } else {
-                data.unique_name
-                    .and_then(|name| complete_sizes.get(name.as_bytes()).copied())
-                    .or_else(|| complete_sizes.get(data.name.as_bytes()).copied())
-            }
-        }
-        TypeData::Array(data) => data.dimensions.last().map(|size| u64::from(*size)),
-        TypeData::Pointer(data) => {
-            Some(u64::from(data.attributes.size())).filter(|size| *size != 0)
-        }
-        TypeData::Modifier(data) => {
-            type_size(finder, data.underlying_type, complete_sizes, depth + 1)
-        }
-        TypeData::Enumeration(data) => {
-            type_size(finder, data.underlying_type, complete_sizes, depth + 1)
-        }
-        TypeData::Alias(data) => type_size(finder, data.underlying_type, complete_sizes, depth + 1),
-        TypeData::Bitfield(data) => {
-            type_size(finder, data.underlying_type, complete_sizes, depth + 1)
-        }
-        _ => None,
-    }
 }
 
 fn hex(bytes: &[u8]) -> String {
