@@ -1,10 +1,6 @@
+use crate::manifest_tsv::{self, column, field};
 use crate::pdb_symbols::PdbSymbols;
 
-use nom::bytes::complete::{tag, take_till};
-use nom::character::complete::{line_ending, not_line_ending};
-use nom::combinator::{all_consuming, opt};
-use nom::multi::separated_list0;
-use nom::sequence::terminated;
 use nom::{IResult, Parser};
 use pdb2::RawString;
 
@@ -30,15 +26,9 @@ enum Schema {
     Named,
 }
 
-impl Schema {
-    fn from_header(line: &[u8]) -> Option<Self> {
-        match line {
-            PDB_HEADER => Some(Self::Pdb),
-            NAMED_HEADER => Some(Self::Named),
-            _ => None,
-        }
-    }
+const SCHEMAS: &[(&[u8], Schema)] = &[(PDB_HEADER, Schema::Pdb), (NAMED_HEADER, Schema::Named)];
 
+impl Schema {
     fn column_count(self) -> &'static str {
         match self {
             Self::Pdb => "eight",
@@ -59,22 +49,6 @@ struct ManifestRow<'a> {
     section_offset: &'a [u8],
     scope: &'a [u8],
     provenance: Option<&'a [u8]>,
-}
-
-fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
-    terminated(
-        separated_list0(line_ending, not_line_ending),
-        opt(line_ending),
-    )
-    .parse(input)
-}
-
-fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_till(|byte| byte == b'\t').parse(input)
-}
-
-fn column(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    terminated(field, tag(&b"\t"[..])).parse(input)
 }
 
 fn pdb_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
@@ -212,159 +186,69 @@ impl DataManifest {
         let mut definitions = Vec::new();
         let mut rvas = HashSet::new();
         let mut external_names = HashSet::new();
-        let mut local_names = HashSet::new();
+        let mut object_names = HashMap::new();
         let mut folded_comdat_owners = HashMap::<FoldedComdatKey, HashSet<&[u8]>>::new();
-        let mut schema = None;
 
-        let (_, lines) = all_consuming(manifest_lines)
-            .parse(bytes)
-            .map_err(|_| anyhow::anyhow!("{}: invalid line ending", path.display()))?;
-
-        for (line_index, line) in lines.into_iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.is_empty() || line.starts_with(b"#") {
-                continue;
-            }
-            let Some(schema) = schema else {
-                schema = Some(Schema::from_header(line).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{}:{}: invalid data manifest header",
-                        path.display(),
-                        line_number
-                    )
-                })?);
-                continue;
-            };
-            if Schema::from_header(line).is_some() {
-                anyhow::bail!(
-                    "{}:{}: duplicate data manifest header",
-                    path.display(),
-                    line_number
-                );
-            }
-
+        let (schema, rows) = manifest_tsv::read(bytes, path, "data manifest", SCHEMAS)?;
+        for line in rows {
             let row = match schema {
-                Schema::Pdb => all_consuming(pdb_row).parse(line),
-                Schema::Named => all_consuming(named_row).parse(line),
-            }
-            .map(|(_, row)| row)
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "{}:{}: expected exactly {} tab-separated columns",
-                    path.display(),
-                    line_number,
-                    schema.column_count()
-                )
-            })?;
-            validate_text(path, line_number, "object", row.object)?;
-            if row.object.is_empty() {
-                anyhow::bail!(
-                    "{}:{}: object must be non-empty",
-                    path.display(),
-                    line_number
-                );
-            }
+                Schema::Pdb => line.columns(pdb_row, schema.column_count())?,
+                Schema::Named => line.columns(named_row, schema.column_count())?,
+            };
+            let object = line.object(row.object)?;
             for (field, value) in [("name", row.name), ("provenance", row.provenance)] {
-                let Some(value) = value else {
-                    continue;
-                };
-                validate_text(path, line_number, field, value)?;
-                if value.is_empty() {
-                    anyhow::bail!(
-                        "{}:{}: {field} must be non-empty",
-                        path.display(),
-                        line_number
-                    );
+                if let Some(value) = value {
+                    line.non_empty_text(field, value)?;
                 }
             }
-            let object = std::str::from_utf8(row.object)?.replace('/', "\\");
-            if object.contains(':')
-                || object
-                    .split('\\')
-                    .any(|part| part.is_empty() || part == "." || part == "..")
-            {
-                anyhow::bail!(
-                    "{}:{}: object path must be relative and normalized",
-                    path.display(),
-                    line_number
-                );
-            }
 
-            let rva = parse_number(row.rva)?;
-            let size = parse_number(row.size)?;
+            let rva = line.number("rva", row.rva)?;
+            let size = line.number("size", row.size)?;
             if size == 0 {
-                anyhow::bail!(
-                    "{}:{}: data size must be non-zero",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: data size must be non-zero");
             }
             if rva.checked_add(size).is_none() {
-                anyhow::bail!(
-                    "{}:{}: data extent overflows the address space",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: data extent overflows the address space");
             }
             let storage = match row.storage {
                 b"data" => DataStorage::Data,
                 b"rdata" => DataStorage::Rdata,
                 b"bss" => DataStorage::Bss,
                 value => anyhow::bail!(
-                    "{}:{}: unsupported storage {}",
-                    path.display(),
-                    line_number,
+                    "{line}: unsupported storage {}",
                     String::from_utf8_lossy(value)
                 ),
             };
-            let alignment = parse_number(row.alignment)? as u64;
+            let alignment = line.number("alignment", row.alignment)? as u64;
             if alignment == 0 || !alignment.is_power_of_two() {
-                anyhow::bail!(
-                    "{}:{}: alignment must be a non-zero power of two",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: alignment must be a non-zero power of two");
             }
             let section_offset = if row.section_offset == b"-" {
                 None
             } else {
-                let offset = parse_number(row.section_offset)?;
+                let offset = line.number("section_offset", row.section_offset)?;
                 if offset.checked_add(size).is_none() {
-                    anyhow::bail!(
-                        "{}:{}: candidate data extent overflows the object section",
-                        path.display(),
-                        line_number
-                    );
+                    anyhow::bail!("{line}: candidate data extent overflows the object section");
                 }
                 Some(offset)
             };
             let section_ordinal = if row.section_ordinal == b"-" {
                 None
             } else {
-                let ordinal = parse_number(row.section_ordinal)?;
+                let ordinal = line.number("section_ordinal", row.section_ordinal)?;
                 if ordinal == 0 {
-                    anyhow::bail!(
-                        "{}:{}: section ordinal must be non-zero",
-                        path.display(),
-                        line_number
-                    );
+                    anyhow::bail!("{line}: section ordinal must be non-zero");
                 }
                 Some(ordinal)
             };
             if section_ordinal.is_some() && section_offset.is_none() {
-                anyhow::bail!(
-                    "{}:{}: a section ordinal requires a section offset",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: a section ordinal requires a section offset");
             }
             let scope = match row.scope {
                 b"external" => DataScope::External,
                 b"local" => DataScope::Local,
                 value => anyhow::bail!(
-                    "{}:{}: unsupported scope {}",
-                    path.display(),
-                    line_number,
+                    "{line}: unsupported scope {}",
                     String::from_utf8_lossy(value)
                 ),
             };
@@ -385,25 +269,16 @@ impl DataManifest {
                         .or_else(|| symbols.strings.get(&rva).map(|(name, _)| *name)),
                 }
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{}:{}: no compatible PDB data symbol starts at RVA {rva:#x}",
-                        path.display(),
-                        line_number
-                    )
+                    anyhow::anyhow!("{line}: no compatible PDB data symbol starts at RVA {rva:#x}")
                 })?,
             };
             let name: &'static [u8] = symbol_name.as_bytes();
 
-            let object: &'static [u8] = object.into_bytes().leak();
             let folded_copy = scope == DataScope::External
                 && match folded_comdat_owners.entry((name, rva, size, storage, alignment)) {
                     Entry::Occupied(mut owners) => {
                         if !owners.get_mut().insert(object) {
-                            anyhow::bail!(
-                                "{}:{}: duplicate data definition in one object",
-                                path.display(),
-                                line_number
-                            );
+                            anyhow::bail!("{line}: duplicate data definition in one object");
                         }
                         true
                     }
@@ -413,22 +288,19 @@ impl DataManifest {
                     }
                 };
             if !provisional && !folded_copy && !rvas.insert(rva) {
-                anyhow::bail!("{}:{}: duplicate data RVA", path.display(), line_number);
+                anyhow::bail!("{line}: duplicate data RVA");
             }
-            let unique_name = match scope {
-                DataScope::External => folded_copy || external_names.insert(name),
-                DataScope::Local => local_names.insert((object, name)),
-            };
-            if !unique_name {
+            if scope == DataScope::External && !folded_copy && !external_names.insert(name) {
+                anyhow::bail!("{line}: duplicate external data name {symbol_name}");
+            }
+            // An object cannot define one name twice, whatever the scopes.
+            if let Some(defined) = object_names.insert((object, name), scope) {
                 anyhow::bail!(
-                    "{}:{}: duplicate {} data name {}",
-                    path.display(),
-                    line_number,
-                    match scope {
-                        DataScope::External => "external",
-                        DataScope::Local => "local",
-                    },
-                    symbol_name
+                    "{line}: duplicate {} data name {symbol_name}",
+                    match (defined, scope) {
+                        (DataScope::Local, DataScope::Local) => "local",
+                        _ => "external and local",
+                    }
                 );
             }
 
@@ -444,9 +316,6 @@ impl DataManifest {
                 scope,
                 provisional,
             });
-        }
-        if schema.is_none() {
-            anyhow::bail!("{}: missing data manifest header", path.display());
         }
 
         let mut owners = definitions
@@ -542,30 +411,6 @@ impl DataManifest {
             })?;
         Some((*definition, rva - definition.rva))
     }
-}
-
-fn validate_text(path: &Path, line: usize, field: &str, value: &[u8]) -> anyhow::Result<()> {
-    if value.iter().any(|byte| byte.is_ascii_control()) {
-        anyhow::bail!(
-            "{}:{}: {} contains a control byte",
-            path.display(),
-            line,
-            field
-        );
-    }
-    Ok(())
-}
-
-fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
-    let value = std::str::from_utf8(value)?;
-    let result = match value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        Some(hex) => usize::from_str_radix(hex, 16),
-        None => value.parse(),
-    }?;
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -858,6 +703,18 @@ mod tests {
             .to_string()
             .contains("duplicate local data name s")
         );
+        for rows in [
+            "s\tone.c\t0x900\t4\tdata\t4\t-\t-\texternal\treviewed\n\
+             s\tone.c\t0x910\t4\tdata\t4\t-\t-\tlocal\treviewed\n",
+            "s\tone.c\t0x900\t4\tdata\t4\t-\t-\tlocal\treviewed\n\
+             s\tone.c\t0x910\t4\tdata\t4\t-\t-\texternal\treviewed\n",
+        ] {
+            let error = named(rows).err().unwrap().to_string();
+            assert!(
+                error.contains("duplicate external and local data name s"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

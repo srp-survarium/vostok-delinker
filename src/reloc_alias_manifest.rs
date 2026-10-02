@@ -1,11 +1,7 @@
-use nom::bytes::complete::{tag, take_till};
-use nom::character::complete::{line_ending, not_line_ending};
-use nom::combinator::{all_consuming, opt};
-use nom::multi::separated_list0;
-use nom::sequence::terminated;
 use nom::{IResult, Parser};
 use pdb2::RawString;
 
+use crate::manifest_tsv::{self, column, field};
 use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +13,17 @@ const HEADER: &[u8] = b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccur
 const PROVENANCE_HEADER: &[u8] =
     b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\tprovenance";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Schema {
+    Plain,
+    Provenance,
+}
+
+const SCHEMAS: &[(&[u8], Schema)] = &[
+    (HEADER, Schema::Plain),
+    (PROVENANCE_HEADER, Schema::Provenance),
+];
+
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
     function_rva: &'a [u8],
@@ -26,22 +33,6 @@ struct ManifestRow<'a> {
     addend: &'a [u8],
     occurrences: &'a [u8],
     provenance: Option<&'a [u8]>,
-}
-
-fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
-    terminated(
-        separated_list0(line_ending, not_line_ending),
-        opt(line_ending),
-    )
-    .parse(input)
-}
-
-fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_till(|byte| byte == b'\t').parse(input)
-}
-
-fn column(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    terminated(field, tag(&b"\t"[..])).parse(input)
 }
 
 fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
@@ -126,89 +117,32 @@ impl RelocAliasManifest {
     }
 
     pub(crate) fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<Self> {
-        let (_, lines) = all_consuming(manifest_lines)
-            .parse(bytes)
-            .map_err(|_| anyhow::anyhow!("{}: invalid line ending", path.display()))?;
+        let (schema, rows) = manifest_tsv::read(bytes, path, "relocation alias manifest", SCHEMAS)?;
         let mut aliases = BTreeMap::new();
-        let mut with_provenance = None;
-
-        for (line_index, line) in lines.into_iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.is_empty() || line.starts_with(b"#") {
-                continue;
-            }
-            let is_header = line == HEADER || line == PROVENANCE_HEADER;
-            let Some(with_provenance) = with_provenance else {
-                if !is_header {
-                    anyhow::bail!(
-                        "{}:{}: invalid relocation alias manifest header",
-                        path.display(),
-                        line_number
-                    );
-                }
-                with_provenance = Some(line == PROVENANCE_HEADER);
-                continue;
+        for row in rows {
+            let fields = match schema {
+                Schema::Plain => row.columns(manifest_row, "six")?,
+                Schema::Provenance => row.columns(provenance_row, "seven")?,
             };
-            if is_header {
-                anyhow::bail!(
-                    "{}:{}: duplicate relocation alias manifest header",
-                    path.display(),
-                    line_number
-                );
+            row.non_empty_text("relocation owner", fields.owner)?;
+            if let Some(provenance) = fields.provenance {
+                row.non_empty_text("provenance", provenance)?;
             }
-            let row = if with_provenance {
-                all_consuming(provenance_row).parse(line)
-            } else {
-                all_consuming(manifest_row).parse(line)
-            }
-            .map(|(_, row)| row)
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "{}:{}: expected exactly {} tab-separated columns",
-                    path.display(),
-                    line_number,
-                    if with_provenance { "seven" } else { "six" }
-                )
-            })?;
-            if row.owner.is_empty() || row.owner.iter().any(|byte| byte.is_ascii_control()) {
-                anyhow::bail!(
-                    "{}:{}: relocation owner must be non-empty printable bytes",
-                    path.display(),
-                    line_number
-                );
-            }
-            if let Some(provenance) = row.provenance
-                && (provenance.is_empty() || provenance.iter().any(|byte| byte.is_ascii_control()))
-            {
-                anyhow::bail!(
-                    "{}:{}: provenance must be non-empty printable text",
-                    path.display(),
-                    line_number
-                );
-            }
-            let function_rva = parse_number(row.function_rva)?;
-            let target_rva = parse_number(row.target_rva)?;
-            let site_rva = match row.site_rva {
+            let function_rva = row.number("function_rva", fields.function_rva)?;
+            let target_rva = row.number("target_rva", fields.target_rva)?;
+            let site_rva = match fields.site_rva {
                 b"*" => None,
-                value => Some(parse_number(value)?),
+                value => Some(row.number("site_rva", value)?),
             };
-            let addend = u32::try_from(parse_number(row.addend)?)?;
-            let occurrences = parse_number(row.occurrences)?;
+            let addend = row.u32("addend", fields.addend)?;
+            let occurrences = row.number("occurrences", fields.occurrences)?;
             if occurrences == 0 {
-                anyhow::bail!(
-                    "{}:{}: occurrence count must be non-zero",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{row}: occurrence count must be non-zero");
             }
             if site_rva.is_some() && occurrences != 1 {
-                anyhow::bail!(
-                    "{}:{}: exact relocation site must have exactly one occurrence",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{row}: exact relocation site must have exactly one occurrence");
             }
-            let owner: &'static [u8] = row.owner.to_vec().leak();
+            let owner: &'static [u8] = fields.owner.to_vec().leak();
             let alias = RelocAlias {
                 function_rva,
                 target_rva,
@@ -222,17 +156,9 @@ impl RelocAliasManifest {
                     .map(|rva| format!("{rva:#x}"))
                     .unwrap_or_else(|| "*".to_string());
                 anyhow::bail!(
-                    "{}:{}: duplicate relocation function/target/site RVAs {function_rva:#x}/{target_rva:#x}/{site}",
-                    path.display(),
-                    line_number
+                    "{row}: duplicate relocation function/target/site RVAs {function_rva:#x}/{target_rva:#x}/{site}"
                 );
             }
-        }
-        if with_provenance.is_none() {
-            anyhow::bail!(
-                "{}: missing relocation alias manifest header",
-                path.display()
-            );
         }
         Ok(Self { aliases })
     }
@@ -343,17 +269,6 @@ impl RelocAliasManifest {
         }
         Ok(())
     }
-}
-
-fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
-    let value = std::str::from_utf8(value)?;
-    Ok(match value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        Some(hex) => usize::from_str_radix(hex, 16),
-        None => value.parse(),
-    }?)
 }
 
 #[cfg(test)]

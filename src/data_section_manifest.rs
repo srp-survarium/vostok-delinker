@@ -1,8 +1,5 @@
-use nom::bytes::complete::{tag, take_till};
-use nom::character::complete::{line_ending, not_line_ending};
-use nom::combinator::{all_consuming, opt};
-use nom::multi::separated_list0;
-use nom::sequence::terminated;
+use crate::manifest_tsv::{self, column, field};
+
 use nom::{IResult, Parser};
 
 use std::collections::{HashMap, HashSet};
@@ -21,15 +18,10 @@ enum Schema {
     Provenance,
 }
 
-impl Schema {
-    fn from_header(line: &[u8]) -> Option<Self> {
-        match line {
-            CHECKSUM_HEADER => Some(Self::Checksum),
-            PROVENANCE_HEADER => Some(Self::Provenance),
-            _ => None,
-        }
-    }
-}
+const SCHEMAS: &[(&[u8], Schema)] = &[
+    (CHECKSUM_HEADER, Schema::Checksum),
+    (PROVENANCE_HEADER, Schema::Provenance),
+];
 
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
@@ -45,22 +37,6 @@ struct ManifestRow<'a> {
     associative_ordinal: &'a [u8],
     storage: &'a [u8],
     provenance: Option<&'a [u8]>,
-}
-
-fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
-    terminated(
-        separated_list0(line_ending, not_line_ending),
-        opt(line_ending),
-    )
-    .parse(input)
-}
-
-fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_till(|byte| byte == b'\t').parse(input)
-}
-
-fn column(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    terminated(field, tag(&b"\t"[..])).parse(input)
 }
 
 fn checksum_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
@@ -186,91 +162,41 @@ impl DataSectionManifest {
     }
 
     fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<Self> {
-        let (_, lines) = all_consuming(manifest_lines)
-            .parse(bytes)
-            .map_err(|_| anyhow::anyhow!("{}: invalid line ending", path.display()))?;
+        let (schema, rows) = manifest_tsv::read(bytes, path, "data section manifest", SCHEMAS)?;
         let mut sections = Vec::new();
         let mut ordinals = HashSet::new();
-        let mut schema = None;
 
-        for (line_index, line) in lines.into_iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.is_empty() || line.starts_with(b"#") {
-                continue;
-            }
-            let Some(schema) = schema else {
-                schema = Some(Schema::from_header(line).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{}:{}: invalid data section manifest header",
-                        path.display(),
-                        line_number
-                    )
-                })?);
-                continue;
-            };
-            if Schema::from_header(line).is_some() {
-                anyhow::bail!(
-                    "{}:{}: duplicate data section manifest header",
-                    path.display(),
-                    line_number
-                );
-            }
+        for line in rows {
             let row = match schema {
-                Schema::Checksum => all_consuming(checksum_row).parse(line),
-                Schema::Provenance => all_consuming(provenance_row).parse(line),
+                Schema::Checksum => line.columns(checksum_row, "eleven")?,
+                Schema::Provenance => line.columns(provenance_row, "eleven")?,
+            };
+            if let Some(provenance) = row.provenance {
+                line.non_empty_text("provenance", provenance)?;
             }
-            .map(|(_, row)| row)
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "{}:{}: expected exactly eleven tab-separated columns",
-                    path.display(),
-                    line_number
-                )
-            })?;
-            if let Some(provenance) = row.provenance
-                && (provenance.is_empty() || provenance.iter().any(|byte| byte.is_ascii_control()))
-            {
-                anyhow::bail!(
-                    "{}:{}: provenance must be non-empty printable text",
-                    path.display(),
-                    line_number
-                );
-            }
-            let object = normalize_object(row.object, path, line_number)?;
-            let ordinal = parse_number(row.ordinal)?;
+            let object = line.object(row.object)?;
+            let ordinal = line.number("ordinal", row.ordinal)?;
             if ordinal == 0 || !ordinals.insert((object, ordinal)) {
-                anyhow::bail!(
-                    "{}:{}: section ordinal must be unique and non-zero per object",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: section ordinal must be unique and non-zero per object");
             }
             if row.name.is_empty()
                 || row.name.len() > 8
                 || row.name.iter().any(|byte| byte.is_ascii_control())
             {
-                anyhow::bail!(
-                    "{}:{}: section name must contain one to eight printable bytes",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: section name must contain one to eight printable bytes");
             }
-            let rva = parse_optional_number(row.rva)?;
-            let size = parse_number(row.size)?;
-            let alignment = parse_number(row.alignment)? as u64;
+            let rva = line.optional_number("rva", row.rva)?;
+            let size = line.number("size", row.size)?;
+            let alignment = line.number("alignment", row.alignment)? as u64;
             if alignment == 0 || !alignment.is_power_of_two() {
-                anyhow::bail!(
-                    "{}:{}: section alignment must be a non-zero power of two",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: section alignment must be a non-zero power of two");
             }
-            let characteristics = u32::try_from(parse_number(row.characteristics)?)?;
+            let characteristics = line.u32("characteristics", row.characteristics)?;
             let checksum = match row.checksum {
-                Some(checksum) => u32::try_from(parse_number(checksum)?)?,
+                Some(checksum) => line.u32("checksum", checksum)?,
                 None => 0,
             };
-            let comdat_selection = match parse_number(row.comdat_selection)? {
+            let comdat_selection = match line.number("comdat_selection", row.comdat_selection)? {
                 0 => ComdatSelection::None,
                 1 => ComdatSelection::NoDuplicates,
                 2 => ComdatSelection::Any,
@@ -279,19 +205,12 @@ impl DataSectionManifest {
                 5 => ComdatSelection::Associative,
                 6 => ComdatSelection::Largest,
                 7 => ComdatSelection::Newest,
-                _ => anyhow::bail!(
-                    "{}:{}: unsupported COMDAT selection",
-                    path.display(),
-                    line_number
-                ),
+                _ => anyhow::bail!("{line}: unsupported COMDAT selection"),
             };
-            let associative_ordinal = parse_optional_number(row.associative_ordinal)?;
+            let associative_ordinal =
+                line.optional_number("associative_ordinal", row.associative_ordinal)?;
             if (comdat_selection == ComdatSelection::Associative) != associative_ordinal.is_some() {
-                anyhow::bail!(
-                    "{}:{}: associative COMDAT selection/ordinal mismatch",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: associative COMDAT selection/ordinal mismatch");
             }
             let storage = match row.storage {
                 b"-" => None,
@@ -299,25 +218,17 @@ impl DataSectionManifest {
                 b"rdata" => Some(SectionStorage::Rdata),
                 b"bss" => Some(SectionStorage::Bss),
                 value => anyhow::bail!(
-                    "{}:{}: unsupported section storage {}",
-                    path.display(),
-                    line_number,
+                    "{line}: unsupported section storage {}",
                     String::from_utf8_lossy(value)
                 ),
             };
             if rva.is_some() && storage.is_none() {
-                anyhow::bail!(
-                    "{}:{}: an assigned data section RVA requires a storage class",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: an assigned data section RVA requires a storage class");
             }
             if let Some(rva) = rva {
                 if rva & (alignment as usize - 1) != 0 || rva.checked_add(size).is_none() {
                     anyhow::bail!(
-                        "{}:{}: data section RVA/extent violates alignment or overflows",
-                        path.display(),
-                        line_number
+                        "{line}: data section RVA/extent violates alignment or overflows"
                     );
                 }
             }
@@ -325,19 +236,11 @@ impl DataSectionManifest {
             if alignment > 8192
                 || characteristics & object::pe::IMAGE_SCN_ALIGN_MASK != expected_alignment_bits
             {
-                anyhow::bail!(
-                    "{}:{}: section alignment disagrees with its characteristics",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: section alignment disagrees with its characteristics");
             }
             let comdat_flag = characteristics & object::pe::IMAGE_SCN_LNK_COMDAT != 0;
             if comdat_flag != (comdat_selection != ComdatSelection::None) {
-                anyhow::bail!(
-                    "{}:{}: COMDAT characteristic/selection mismatch",
-                    path.display(),
-                    line_number
-                );
+                anyhow::bail!("{line}: COMDAT characteristic/selection mismatch");
             }
             if let Some(storage) = storage {
                 // A `$` suffix is only the linker's ordering key within a group:
@@ -374,9 +277,7 @@ impl DataSectionManifest {
                     || characteristics & forbidden != 0
                 {
                     anyhow::bail!(
-                        "{}:{}: storage does not match candidate section name/characteristics",
-                        path.display(),
-                        line_number
+                        "{line}: storage does not match candidate section name/characteristics"
                     );
                 }
             }
@@ -394,9 +295,6 @@ impl DataSectionManifest {
                 storage,
             });
         }
-        let Some(schema) = schema else {
-            anyhow::bail!("{}: missing data section manifest header", path.display());
-        };
 
         sections.sort_unstable_by_key(|section| (section.object, section.ordinal));
         let mut by_object = HashMap::<&[u8], Vec<&DataSection>>::new();
@@ -498,41 +396,6 @@ fn compatible_folded_comdat_alias(first: &DataSection, second: &DataSection) -> 
                 | ComdatSelection::Largest
                 | ComdatSelection::Newest
         )
-}
-
-fn normalize_object(value: &[u8], path: &Path, line: usize) -> anyhow::Result<&'static [u8]> {
-    let object = std::str::from_utf8(value)?.replace('/', "\\");
-    if object.contains(':')
-        || object
-            .split('\\')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        anyhow::bail!(
-            "{}:{}: object path must be relative and normalized",
-            path.display(),
-            line
-        );
-    }
-    Ok(object.into_bytes().leak())
-}
-
-fn parse_optional_number(value: &[u8]) -> anyhow::Result<Option<usize>> {
-    if value == b"-" {
-        Ok(None)
-    } else {
-        Ok(Some(parse_number(value)?))
-    }
-}
-
-fn parse_number(value: &[u8]) -> anyhow::Result<usize> {
-    let value = std::str::from_utf8(value)?;
-    Ok(match value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        Some(hex) => usize::from_str_radix(hex, 16),
-        None => value.parse(),
-    }?)
 }
 
 #[cfg(test)]

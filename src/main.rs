@@ -4,6 +4,7 @@ mod common_symbol_manifest;
 mod data_index;
 mod data_manifest;
 mod data_section_manifest;
+mod manifest_tsv;
 mod missing_data_index;
 mod object_files;
 mod pdb_symbols;
