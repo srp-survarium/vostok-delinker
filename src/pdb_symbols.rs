@@ -277,24 +277,19 @@ impl PdbSymbols {
                             _ => continue,
                         };
 
-                        match () {
-                            () if offset.section == env.rdata.id => {
-                                let _old_symbol = self.constants.insert(
-                                    symbol_rva,
-                                    PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
-                                );
-                            }
-                            () if offset.section == env.data.id => {
-                                // Prefer symbol names from modules.
-                                // As those are closer to the original symbols.
-                                // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
-                                let _old_symbol = self.statics.insert(
-                                    symbol_rva,
-                                    PdbDataSymbol::new(name, type_sizes.size_of(type_index)),
-                                );
-                            }
+                        // Prefer symbol names from modules, as those are closer
+                        // to the original symbols, but keep a size only the
+                        // global record knows.
+                        let symbols = match () {
+                            () if offset.section == env.rdata.id => &mut self.constants,
+                            () if offset.section == env.data.id => &mut self.statics,
                             _ => continue,
                         };
+                        let mut symbol = PdbDataSymbol::new(name, type_sizes.size_of(type_index));
+                        if let Some(global) = symbols.remove(&symbol_rva) {
+                            symbol.fill_size_from(global);
+                        }
+                        symbols.insert(symbol_rva, symbol);
                     }
 
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })) => {
