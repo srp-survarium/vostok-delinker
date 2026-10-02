@@ -1,7 +1,9 @@
 #![feature(os_string_truncate)]
 
+mod data_index;
 mod data_manifest;
 mod data_section_manifest;
+mod missing_data_index;
 mod object_files;
 mod pdb_symbols;
 mod reloc_alias_manifest;
@@ -27,8 +29,12 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub exe_path: std::path::PathBuf,
 
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub output_path: std::path::PathBuf,
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        required_unless_present_any = ["write_data_index", "write_missing_data_index"]
+    )]
+    pub output_path: Option<std::path::PathBuf>,
 
     /// Source-tree prefix to strip from PDB file paths. REPEATABLE: a build can
     /// draw compilands from more than one tree - the engine's own `sources/`, and
@@ -103,6 +109,25 @@ pub struct Cli {
     /// symbol start (to catch interior pointers). 0 = exact symbol starts only.
     #[arg(long, default_value_t = 32)]
     pub rediscovery_interior_bound: usize,
+
+    /// Instead of delinking, write every PDB data symbol with its location and
+    /// type-derived size as TSV.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with_all = ["output_path", "write_missing_data_index"]
+    )]
+    pub write_data_index: Option<std::path::PathBuf>,
+
+    /// Instead of delinking, write as TSV every base-relocation target in
+    /// `.text`, `.rdata` or `.data` that no PDB symbol names or contains, with
+    /// the compiland contributions of its site and target.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "output_path"
+    )]
+    pub write_missing_data_index: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -160,6 +185,8 @@ fn main() -> anyhow::Result<()> {
         reloc_manifest,
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
+        write_data_index,
+        write_missing_data_index,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -168,7 +195,18 @@ fn main() -> anyhow::Result<()> {
 
     let pdb = std::fs::read(pdb_path)?.leak();
     let pdb = std::io::Cursor::new(pdb);
-    let pdb = pdb2::PDB::open(pdb)?;
+    let mut pdb = pdb2::PDB::open(pdb)?;
+
+    if let Some(path) = write_data_index {
+        let env = Env::build(exe, &mut pdb)?;
+        return data_index::write(&env, &mut pdb, &path);
+    }
+    if let Some(path) = write_missing_data_index {
+        let env = Env::build(exe, &mut pdb)?;
+        let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
+        return missing_data_index::write(&env, exe, &mut pdb, &pdb_symbols, &path);
+    }
+    let output_path = output_path.expect("clap requires --output-path without an index export");
 
     let engine_paths: Vec<Vec<u8>> = engine_path
         .iter()

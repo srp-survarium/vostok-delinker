@@ -444,6 +444,11 @@ impl PdbSymbols {
         self.incremental_trampolines.contains_key(&rva)
     }
 
+    /// The Procedure/Thunk length recorded for the function starting at `rva`.
+    pub fn function_extent(&self, rva: usize) -> Option<usize> {
+        self.function_extents.get(&rva).copied()
+    }
+
     pub fn relocation_field_in_function(
         &self,
         function_rva: usize,
@@ -561,7 +566,7 @@ impl TypeSizeResolver {
     }
 }
 
-fn primitive_size(
+pub(crate) fn primitive_size(
     kind: pdb2::PrimitiveKind,
     indirection: Option<pdb2::Indirection>,
 ) -> Option<usize> {

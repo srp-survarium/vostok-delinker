@@ -603,41 +603,62 @@ fn resolve_reloc_directory<'s>(
     observed_aliases: &mut RelocAliasObservations,
     out_of_extent: &mut OutOfExtentFallbacks,
 ) -> anyhow::Result<()> {
+    for reloc_rva in highlow_sites(reloc_data)? {
+        resolve_absolute_site(
+            env,
+            symbols,
+            data_manifest,
+            reloc_aliases,
+            manifest_coverage,
+            exe_data,
+            coff_data,
+            relocs_rva,
+            observed_aliases,
+            out_of_extent,
+            reloc_rva,
+        )?;
+    }
+    Ok(())
+}
+
+/// The RVA of every HIGHLOW entry in a base-relocation directory.
+fn highlow_sites(reloc_data: &[u8]) -> anyhow::Result<Vec<usize>> {
+    const RELOC_TYP_HIGHLOW: u16 = 3;
+    let mut sites = Vec::new();
     let mut pos = 0;
     while pos + HEADER_SIZE <= reloc_data.len() {
         let RelocHeader {
             page_rva,
             block_size,
         } = bytemuck::pod_read_unaligned::<RelocHeader>(&reloc_data[pos..pos + HEADER_SIZE]);
-        if block_size == 0 || block_size < 8 {
+        if block_size < 8 {
             break;
         }
-        let entries: &[RelocEntry] =
-            bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..pos + block_size.to_usize()]);
-        pos += block_size.to_usize();
-
-        for RelocEntry { entry } in entries {
-            const RELOC_TYP_HIGHLOW: u16 = 3;
-            if entry >> 12 != RELOC_TYP_HIGHLOW {
-                continue;
-            }
-            let reloc_rva = (page_rva + u32::from(entry & 0x0FFF)).to_usize();
-            resolve_absolute_site(
-                env,
-                symbols,
-                data_manifest,
-                reloc_aliases,
-                manifest_coverage,
-                exe_data,
-                coff_data,
-                relocs_rva,
-                observed_aliases,
-                out_of_extent,
-                reloc_rva,
-            )?;
+        let block_end = pos + block_size.to_usize();
+        if block_end > reloc_data.len() {
+            anyhow::bail!("base relocation block at offset {pos:#x} is truncated");
         }
+        let entries: &[RelocEntry] =
+            bytemuck::cast_slice(&reloc_data[pos + HEADER_SIZE..block_end]);
+        pos = block_end;
+        sites.extend(
+            entries
+                .iter()
+                .filter(|RelocEntry { entry }| entry >> 12 == RELOC_TYP_HIGHLOW)
+                .map(|RelocEntry { entry }| (page_rva + u32::from(entry & 0x0FFF)).to_usize()),
+        );
     }
-    Ok(())
+    Ok(sites)
+}
+
+/// The HIGHLOW sites of the image's base-relocation directory, if it has one.
+pub(crate) fn retained_highlow_sites(
+    exe: &'static object::read::pe::PeFile32<'static>,
+) -> anyhow::Result<Option<Vec<usize>>> {
+    match base_relocation_data(exe)? {
+        (BaseRelocationSource::Directory { .. }, data) => highlow_sites(data).map(Some),
+        (BaseRelocationSource::Stripped | BaseRelocationSource::Absent, _) => Ok(None),
+    }
 }
 
 /// Resolve every reviewed site listed in the reloc manifest.
@@ -1284,6 +1305,27 @@ mod tests {
         assert!(error.contains("--strict"));
         assert!(error.contains("0x1010"));
         assert!(error.contains("0x4000"));
+    }
+
+    #[test]
+    fn highlow_sites_walk_every_block_and_reject_truncation() {
+        let block = |page: u32, entries: &[u16]| {
+            let mut bytes = page.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&(8 + 2 * entries.len() as u32).to_le_bytes());
+            for entry in entries {
+                bytes.extend_from_slice(&entry.to_le_bytes());
+            }
+            bytes
+        };
+        // HIGHLOW entries at 0x1004 and 0x2ff8; an ABSOLUTE padding entry is skipped.
+        let mut directory = block(0x1000, &[0x3004, 0x0000]);
+        directory.extend(block(0x2000, &[0x3ff8, 0x0000]));
+        assert_eq!(highlow_sites(&directory).unwrap(), [0x1004, 0x2ff8]);
+
+        let mut truncated = block(0x1000, &[0x3004, 0x0000]);
+        truncated[4] = 0x20;
+        let error = highlow_sites(&truncated).unwrap_err().to_string();
+        assert!(error.contains("truncated"), "{error}");
     }
 
     #[test]
