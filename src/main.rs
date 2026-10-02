@@ -1,8 +1,14 @@
 #![feature(os_string_truncate)]
 
+mod common_symbol_manifest;
+mod data_index;
 mod data_manifest;
+mod data_section_manifest;
+mod manifest_tsv;
+mod missing_data_index;
 mod object_files;
 mod pdb_symbols;
+mod reloc_alias_manifest;
 mod reloc_manifest;
 mod relocs;
 mod symbol_matcher;
@@ -25,11 +31,19 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub exe_path: std::path::PathBuf,
 
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub output_path: std::path::PathBuf,
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        required_unless_present_any = ["write_data_index", "write_missing_data_index"]
+    )]
+    pub output_path: Option<std::path::PathBuf>,
 
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub engine_path: String,
+    /// Source-tree prefix to strip from PDB file paths; the rest of a matching
+    /// path names the output object. Repeatable, for a build that draws
+    /// compilands from several trees: prefixes are tried in order and the first
+    /// that matches wins. Functions from files under no prefix are skipped.
+    #[arg(long, value_hint = clap::ValueHint::FilePath, required = true)]
+    pub engine_path: Vec<String>,
 
     /// Pad each empty object's `.rdata` with 4 bytes. objdiff treats two
     /// allocations as matching when their name OR their offset into the reloc
@@ -54,10 +68,39 @@ pub struct Cli {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub data_manifest: Option<std::path::PathBuf>,
 
-    /// Require every PE base relocation targeting `.data` or `.rdata` to
-    /// resolve to a definition in `--data-manifest`.
+    /// Project-supplied candidate COFF section table and COMDAT topology. Its
+    /// header selects the section-definition checksums: a `checksum` column
+    /// replays reviewed values, a `provenance` column zeroes every checksum of
+    /// every object.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub data_section_manifest: Option<std::path::PathBuf>,
+
+    /// Project-supplied TSV of COMMON symbols (`object`, `name`, `size`) that an
+    /// object declares instead of defining storage.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub common_symbol_manifest: Option<std::path::PathBuf>,
+
+    /// Reviewed function/target/site selections whose data or function
+    /// relocations use a specific existing PDB owner symbol and addend.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub reloc_alias_manifest: Option<std::path::PathBuf>,
+
+    /// Require every retained or recovered absolute relocation targeting
+    /// `.data` or `.rdata` to resolve to a definition in `--data-manifest`.
     #[arg(long, requires = "data_manifest")]
     pub strict: bool,
+
+    /// Accepted for compatibility; it changes nothing. Data relocations the
+    /// data manifest does not cover are recovered from the nearest PDB symbol
+    /// whenever `--strict` is absent.
+    #[arg(long, conflicts_with = "strict")]
+    pub recover_data_relocs_from_pdb: bool,
+
+    /// Refuse to recover a data relocation through a PDB symbol whose name
+    /// starts with this prefix: a fence that a PDB synthesizer placed where it
+    /// knows an identity exists but cannot yet spell it. Repeatable.
+    #[arg(long, value_name = "PREFIX", conflicts_with = "strict")]
+    pub fence_prefix: Vec<String>,
 
     /// Reviewed list of absolute relocation sites (`site_rva`, `kind`), for an
     /// image whose `.reloc` directory is missing. Combines with
@@ -77,6 +120,25 @@ pub struct Cli {
     /// symbol start (to catch interior pointers). 0 = exact symbol starts only.
     #[arg(long, default_value_t = 32)]
     pub rediscovery_interior_bound: usize,
+
+    /// Instead of delinking, write every PDB data symbol with its location and
+    /// type-derived size as TSV.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with_all = ["output_path", "write_missing_data_index"]
+    )]
+    pub write_data_index: Option<std::path::PathBuf>,
+
+    /// Instead of delinking, write as TSV every base-relocation target in
+    /// `.text`, `.rdata` or `.data` that no PDB symbol names or contains, with
+    /// the compiland contributions of its site and target.
+    #[arg(
+        long,
+        value_hint = clap::ValueHint::FilePath,
+        conflicts_with = "output_path"
+    )]
+    pub write_missing_data_index: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Copy)]
@@ -88,6 +150,27 @@ pub struct SecInfo<'a> {
     pub id: u16,
 
     pub data: &'a [u8],
+}
+
+#[derive(Clone, Debug, Copy)]
+pub struct IatInfo<'a> {
+    pub rva: usize,
+    pub size: usize,
+    pub section: SecInfo<'a>,
+}
+
+impl IatInfo<'_> {
+    pub fn contains_rva(self, rva: usize) -> bool {
+        (self.rva..self.rva + self.size).contains(&rva)
+    }
+
+    pub fn rva_for_offset(self, offset: pdb2::PdbInternalSectionOffset) -> Option<usize> {
+        if offset.section != self.section.id {
+            return None;
+        }
+        let rva = self.section.rva.checked_add(offset.offset.to_usize())?;
+        self.contains_rva(rva).then_some(rva)
+    }
 }
 
 // # Notes
@@ -106,10 +189,17 @@ fn main() -> anyhow::Result<()> {
         write_symbol_map,
         read_symbol_map,
         data_manifest,
+        data_section_manifest,
+        common_symbol_manifest,
+        reloc_alias_manifest,
         strict,
+        recover_data_relocs_from_pdb: _,
+        fence_prefix,
         reloc_manifest,
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
+        write_data_index,
+        write_missing_data_index,
     } = Cli::parse();
 
     let exe: &[u8] = std::fs::read(exe_path)?.leak();
@@ -118,27 +208,53 @@ fn main() -> anyhow::Result<()> {
 
     let pdb = std::fs::read(pdb_path)?.leak();
     let pdb = std::io::Cursor::new(pdb);
-    let pdb = pdb2::PDB::open(pdb)?;
+    let mut pdb = pdb2::PDB::open(pdb)?;
 
-    let mut engine_path = engine_path.to_lowercase().replace('/', "\\");
-    if !engine_path.ends_with('\\') {
-        engine_path.push('\\');
+    if let Some(path) = write_data_index {
+        let env = Env::build(exe, &mut pdb)?;
+        return data_index::write(&env, &mut pdb, &path);
     }
+    if let Some(path) = write_missing_data_index {
+        let env = Env::build(exe, &mut pdb)?;
+        let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
+        return missing_data_index::write(&env, exe, &mut pdb, &pdb_symbols, &path);
+    }
+    let output_path = output_path.expect("clap requires --output-path without an index export");
+
+    let engine_paths: Vec<Vec<u8>> = engine_path
+        .iter()
+        .map(|path| {
+            let mut path = path.to_lowercase().replace('/', "\\");
+            if !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path.into_bytes()
+        })
+        .collect();
     let manifest_coverage = if strict {
         relocs::ManifestCoverage::RequireComplete
     } else {
-        relocs::ManifestCoverage::AllowPartial
+        relocs::ManifestCoverage::AllowPartial {
+            fences: fence_prefix
+                .into_iter()
+                .map(String::into_bytes)
+                .collect::<Vec<_>>()
+                .leak(),
+        }
     };
 
     process_executable(
         exe,
         pdb,
-        engine_path.as_bytes(),
+        &engine_paths,
         pad_empty_rdata,
         output_path.as_path(),
         write_symbol_map.as_deref(),
         read_symbol_map.as_deref(),
         data_manifest.as_deref(),
+        data_section_manifest.as_deref(),
+        common_symbol_manifest.as_deref(),
+        reloc_alias_manifest.as_deref(),
         manifest_coverage,
         reloc_manifest.as_deref(),
         rediscover_relocations_from_pdb,
@@ -151,12 +267,15 @@ fn main() -> anyhow::Result<()> {
 fn process_executable<S: pdb2::Source<'static> + 'static>(
     exe: &'static object::read::pe::PeFile32<'static>,
     mut pdb: pdb2::PDB<'static, S>,
-    engine_path: &[u8],
+    engine_paths: &[Vec<u8>],
     pad_empty_rdata: bool,
     output_path: &std::path::Path,
     write_symbol_map: Option<&std::path::Path>,
     read_symbol_map: Option<&std::path::Path>,
     data_manifest_path: Option<&std::path::Path>,
+    data_section_manifest_path: Option<&std::path::Path>,
+    common_symbol_manifest_path: Option<&std::path::Path>,
+    reloc_alias_manifest_path: Option<&std::path::Path>,
     manifest_coverage: relocs::ManifestCoverage,
     reloc_manifest_path: Option<&std::path::Path>,
     rediscover_relocations_from_pdb: bool,
@@ -167,16 +286,47 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
     let pdb_symbols = PdbSymbols::parse(&env, &mut pdb)?;
     let data_manifest = data_manifest::DataManifest::load(data_manifest_path, &pdb_symbols)?;
     let reloc_manifest = reloc_manifest::RelocManifest::load(reloc_manifest_path)?;
-    let (coff_data, relocs_rva) = relocs::resolve_absolute_relocations(
+    let data_section_manifest =
+        data_section_manifest::DataSectionManifest::load(data_section_manifest_path)?;
+    let common_symbol_manifest =
+        common_symbol_manifest::CommonSymbolManifest::load(common_symbol_manifest_path)?;
+    let reloc_alias_manifest =
+        reloc_alias_manifest::RelocAliasManifest::load(reloc_alias_manifest_path)?;
+    reloc_alias_manifest.validate_site_membership(&pdb_symbols)?;
+    let relocs::ResolvedRelocations {
+        coff_data,
+        by_rva: relocs_rva,
+        mut observed_aliases,
+        source: base_relocation_source,
+    } = relocs::resolve_absolute_relocations(
         &env,
         exe,
         &pdb_symbols,
         &data_manifest,
+        &reloc_alias_manifest,
         manifest_coverage,
         reloc_manifest.as_ref(),
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
     )?;
+    let code_relocation_recovery = base_relocation_source.code_relocation_recovery();
+    match base_relocation_source {
+        relocs::BaseRelocationSource::Directory { rva, size } => {
+            eprintln!(
+                "[relocs] using PE base relocation directory at RVA {rva:#x}, size {size:#x}"
+            );
+        }
+        relocs::BaseRelocationSource::Stripped => {
+            eprintln!(
+                "[relocs] PE base relocation directory is absent with RELOCS_STRIPPED; recovering exact PDB instruction-operand relocations"
+            );
+        }
+        relocs::BaseRelocationSource::Absent => {
+            eprintln!(
+                "[relocs] PE base relocation directory is absent without RELOCS_STRIPPED; absolute sites come from the recovery inputs"
+            );
+        }
+    }
 
     // Base side reconciles its folded names against the target's recorded
     // choices; the target side (and a plain run) just emits local defaults.
@@ -198,11 +348,18 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         &pdb_symbols,
         &coff_data,
         relocs_rva,
-        engine_path,
+        engine_paths,
         pad_empty_rdata,
         &matcher,
         &data_manifest,
+        &data_section_manifest,
+        &common_symbol_manifest,
+        &reloc_alias_manifest,
+        &mut observed_aliases,
+        manifest_coverage,
+        code_relocation_recovery,
     )?;
+    reloc_alias_manifest.validate_occurrences(&observed_aliases)?;
     object_files.write(output_path)?;
 
     // Target side: record the choices base will later try to reproduce.
@@ -232,6 +389,7 @@ pub struct Env<'a> {
     pub text: SecInfo<'a>,
     pub rdata: SecInfo<'a>,
     pub data: SecInfo<'a>,
+    pub iat: Option<IatInfo<'a>>,
 
     pub dbi: &'static pdb2::DebugInformation<'static>,
     pub string_table: &'static pdb2::StringTable<'static>,
@@ -282,15 +440,102 @@ impl Env<'_> {
         let rdata = build_sec_info(rdata_sec)?;
         let data = build_sec_info(data_sec)?;
 
+        let iat = exe
+            .data_directory(object::pe::IMAGE_DIRECTORY_ENTRY_IAT)
+            .map(|directory| {
+                let rva = directory.virtual_address.get(LittleEndian).to_usize();
+                let size = directory.size.get(LittleEndian).to_usize();
+                let end = rva
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow::anyhow!("IAT extent overflows"))?;
+                let section = exe
+                    .sections()
+                    .find(|section| {
+                        let section_rva = section.address().to_usize() - image_base.to_usize();
+                        let Some(section_end) = section_rva.checked_add(section.size().to_usize())
+                        else {
+                            return false;
+                        };
+                        section_rva <= rva && end <= section_end
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("IAT is not contained in one PE section"))?;
+
+                Ok::<_, anyhow::Error>(IatInfo {
+                    rva,
+                    size,
+                    section: build_sec_info(section)?,
+                })
+            })
+            .transpose()?;
+
         Ok(Self {
             image_base,
             text,
             rdata,
             data,
+            iat,
 
             dbi,
             string_table,
             symbol_table,
         })
+    }
+
+    pub fn iat_rva(&self, offset: pdb2::PdbInternalSectionOffset) -> Option<usize> {
+        self.iat?.rva_for_offset(offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IatInfo, SecInfo};
+
+    fn iat() -> IatInfo<'static> {
+        IatInfo {
+            rva: 0x2200,
+            size: 0x20,
+            section: SecInfo {
+                rva: 0x2000,
+                va: 0x402000,
+                size: 0x1000,
+                id: 4,
+                data: &[],
+            },
+        }
+    }
+
+    #[test]
+    fn iat_range_is_half_open() {
+        let iat = iat();
+        assert!(iat.contains_rva(0x2200));
+        assert!(iat.contains_rva(0x221f));
+        assert!(!iat.contains_rva(0x21ff));
+        assert!(!iat.contains_rva(0x2220));
+    }
+
+    #[test]
+    fn pdb_offset_must_resolve_inside_iat_range() {
+        let iat = iat();
+        assert_eq!(
+            iat.rva_for_offset(pdb2::PdbInternalSectionOffset {
+                section: 4,
+                offset: 0x210,
+            }),
+            Some(0x2210)
+        );
+        assert_eq!(
+            iat.rva_for_offset(pdb2::PdbInternalSectionOffset {
+                section: 3,
+                offset: 0x210,
+            }),
+            None
+        );
+        assert_eq!(
+            iat.rva_for_offset(pdb2::PdbInternalSectionOffset {
+                section: 4,
+                offset: 0x220,
+            }),
+            None
+        );
     }
 }

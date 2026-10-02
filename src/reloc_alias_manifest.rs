@@ -1,0 +1,506 @@
+use nom::{IResult, Parser};
+use pdb2::RawString;
+
+use crate::manifest_tsv::{self, column, field};
+use crate::pdb_symbols::{FunctionRelocationField, PdbSymbols};
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+const HEADER: &[u8] = b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences";
+
+/// The same rows, each stating the evidence for its spelling.
+const PROVENANCE_HEADER: &[u8] =
+    b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\tprovenance";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Schema {
+    Plain,
+    Provenance,
+}
+
+const SCHEMAS: &[(&[u8], Schema)] = &[
+    (HEADER, Schema::Plain),
+    (PROVENANCE_HEADER, Schema::Provenance),
+];
+
+#[derive(Clone, Copy, Debug)]
+struct ManifestRow<'a> {
+    function_rva: &'a [u8],
+    target_rva: &'a [u8],
+    site_rva: &'a [u8],
+    owner: &'a [u8],
+    addend: &'a [u8],
+    occurrences: &'a [u8],
+    provenance: Option<&'a [u8]>,
+}
+
+fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+    let (input, (function_rva, target_rva, site_rva, owner, addend, occurrences)) =
+        (column, column, column, column, column, field).parse(input)?;
+    Ok((
+        input,
+        ManifestRow {
+            function_rva,
+            target_rva,
+            site_rva,
+            owner,
+            addend,
+            occurrences,
+            provenance: None,
+        },
+    ))
+}
+
+fn provenance_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+    let (input, (function_rva, target_rva, site_rva, owner, addend, occurrences, provenance)) =
+        (column, column, column, column, column, column, field).parse(input)?;
+    Ok((
+        input,
+        ManifestRow {
+            function_rva,
+            target_rva,
+            site_rva,
+            owner,
+            addend,
+            occurrences,
+            provenance: Some(provenance),
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RelocAliasKey {
+    function_rva: usize,
+    target_rva: usize,
+    site_rva: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelocAlias {
+    pub function_rva: usize,
+    pub target_rva: usize,
+    pub site_rva: Option<usize>,
+    pub owner: RawString<'static>,
+    pub addend: u32,
+    pub occurrences: usize,
+}
+
+impl RelocAlias {
+    fn key(self) -> RelocAliasKey {
+        RelocAliasKey {
+            function_rva: self.function_rva,
+            target_rva: self.target_rva,
+            site_rva: self.site_rva,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct RelocAliasObservations {
+    /// The distinct relocation sites each row selected: a body that several
+    /// objects own is decoded once per owner, but its sites count once.
+    sites: BTreeMap<RelocAliasKey, BTreeSet<usize>>,
+}
+
+#[derive(Default)]
+pub struct RelocAliasManifest {
+    aliases: BTreeMap<RelocAliasKey, RelocAlias>,
+}
+
+impl RelocAliasManifest {
+    pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        Self::parse(&std::fs::read(path)?, path)
+    }
+
+    pub(crate) fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<Self> {
+        let (schema, rows) = manifest_tsv::read(bytes, path, "relocation alias manifest", SCHEMAS)?;
+        let mut aliases = BTreeMap::new();
+        for row in rows {
+            let fields = match schema {
+                Schema::Plain => row.columns(manifest_row, "six")?,
+                Schema::Provenance => row.columns(provenance_row, "seven")?,
+            };
+            row.non_empty_text("relocation owner", fields.owner)?;
+            if let Some(provenance) = fields.provenance {
+                row.non_empty_text("provenance", provenance)?;
+            }
+            let function_rva = row.number("function_rva", fields.function_rva)?;
+            let target_rva = row.number("target_rva", fields.target_rva)?;
+            let site_rva = match fields.site_rva {
+                b"*" => None,
+                value => Some(row.number("site_rva", value)?),
+            };
+            let addend = row.u32("addend", fields.addend)?;
+            let occurrences = row.number("occurrences", fields.occurrences)?;
+            if occurrences == 0 {
+                anyhow::bail!("{row}: occurrence count must be non-zero");
+            }
+            if site_rva.is_some() && occurrences != 1 {
+                anyhow::bail!("{row}: exact relocation site must have exactly one occurrence");
+            }
+            let owner: &'static [u8] = fields.owner.to_vec().leak();
+            let alias = RelocAlias {
+                function_rva,
+                target_rva,
+                site_rva,
+                owner: RawString::from(owner),
+                addend,
+                occurrences,
+            };
+            if aliases.insert(alias.key(), alias).is_some() {
+                let site = site_rva
+                    .map(|rva| format!("{rva:#x}"))
+                    .unwrap_or_else(|| "*".to_string());
+                anyhow::bail!(
+                    "{row}: duplicate relocation function/target/site RVAs {function_rva:#x}/{target_rva:#x}/{site}"
+                );
+            }
+        }
+        Ok(Self { aliases })
+    }
+
+    fn select(
+        &self,
+        function_rva: usize,
+        target_rva: usize,
+        site_rva: usize,
+    ) -> Option<(RelocAliasKey, RelocAlias)> {
+        let exact = RelocAliasKey {
+            function_rva,
+            target_rva,
+            site_rva: Some(site_rva),
+        };
+        let wildcard = RelocAliasKey {
+            function_rva,
+            target_rva,
+            site_rva: None,
+        };
+        self.aliases
+            .get(&exact)
+            .map(|alias| (exact, *alias))
+            .or_else(|| self.aliases.get(&wildcard).map(|alias| (wildcard, *alias)))
+    }
+
+    pub fn resolve(
+        &self,
+        function_rva: usize,
+        target_rva: usize,
+        site_rva: usize,
+        observed: &mut RelocAliasObservations,
+    ) -> Option<RelocAlias> {
+        let (key, alias) = self.select(function_rva, target_rva, site_rva)?;
+        observed.sites.entry(key).or_default().insert(site_rva);
+        Some(alias)
+    }
+
+    pub fn resolve_function_alias(
+        &self,
+        function_rva: usize,
+        target_rva: usize,
+        site_rva: usize,
+        overloads: &[RawString<'static>],
+        observed: &mut RelocAliasObservations,
+    ) -> anyhow::Result<Option<RawString<'static>>> {
+        let Some(alias) = self.resolve(function_rva, target_rva, site_rva, observed) else {
+            return Ok(None);
+        };
+        if alias.addend != 0 {
+            anyhow::bail!(
+                "function relocation alias {function_rva:#x}/{target_rva:#x}/{site_rva:#x} has non-zero addend {:#x}",
+                alias.addend
+            );
+        }
+        if !overloads.contains(&alias.owner) {
+            anyhow::bail!(
+                "function relocation alias owner {} is absent at target RVA {target_rva:#x}",
+                alias.owner
+            );
+        }
+        Ok(Some(alias.owner))
+    }
+
+    pub fn validate_site_membership(&self, symbols: &PdbSymbols) -> anyhow::Result<()> {
+        for alias in self.aliases.values() {
+            let Some(site_rva) = alias.site_rva else {
+                continue;
+            };
+            match symbols.relocation_field_in_function(alias.function_rva, site_rva) {
+                FunctionRelocationField::Within { .. } => {}
+                FunctionRelocationField::MissingFunction => anyhow::bail!(
+                    "relocation alias exact site {site_rva:#x} names missing function {:#x}",
+                    alias.function_rva
+                ),
+                FunctionRelocationField::UnknownExtent => anyhow::bail!(
+                    "relocation alias exact site {site_rva:#x} names function {:#x} without a Procedure/Thunk extent",
+                    alias.function_rva
+                ),
+                FunctionRelocationField::OutsideExtent => anyhow::bail!(
+                    "relocation alias exact site field {site_rva:#x}..{:#x} is outside function {:#x}",
+                    site_rva.saturating_add(std::mem::size_of::<u32>()),
+                    alias.function_rva
+                ),
+                FunctionRelocationField::FieldOverflow => {
+                    anyhow::bail!("relocation alias exact site {site_rva:#x} overflows RVA")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_occurrences(&self, observed: &RelocAliasObservations) -> anyhow::Result<()> {
+        for (key, alias) in &self.aliases {
+            let count = observed.sites.get(key).map_or(0, BTreeSet::len);
+            if count != alias.occurrences {
+                let site = key
+                    .site_rva
+                    .map(|rva| format!("{rva:#x}"))
+                    .unwrap_or_else(|| "*".to_string());
+                anyhow::bail!(
+                    "relocation alias {:#x}/{:#x}/{site} expected {} occurrence(s), observed {count}",
+                    key.function_rva,
+                    key.target_rva,
+                    alias.occurrences
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER_TEXT: &str = "function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\n";
+
+    #[test]
+    fn parses_wrapping_addend_and_crlf() {
+        let manifest = RelocAliasManifest::parse(
+            b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\r\n\
+              0x4a061\t0xf5180\t*\t?data@@3PAUitem@@A\t0xfffffff8\t1",
+            Path::new("aliases.tsv"),
+        )
+        .unwrap();
+        let mut observed = RelocAliasObservations::default();
+        assert_eq!(
+            manifest.resolve(0x4a061, 0xf5180, 0x4a080, &mut observed),
+            Some(RelocAlias {
+                function_rva: 0x4a061,
+                target_rva: 0xf5180,
+                site_rva: None,
+                owner: RawString::from(&b"?data@@3PAUitem@@A"[..]),
+                addend: 0xfffffff8,
+                occurrences: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_keys_and_wrong_columns() {
+        let duplicate = format!(
+            "{HEADER_TEXT}0x2000\t0x1000\t0x2010\ta\t0\t1\n\
+             0x2000\t0x1000\t0x2010\tb\t0\t1\n"
+        );
+        assert!(RelocAliasManifest::parse(duplicate.as_bytes(), Path::new("aliases.tsv")).is_err());
+        let extra = format!("{HEADER_TEXT}0x2000\t0x1000\t*\ta\t0\t1\textra\n");
+        assert!(RelocAliasManifest::parse(extra.as_bytes(), Path::new("aliases.tsv")).is_err());
+    }
+
+    #[test]
+    fn provenance_header_adds_a_required_evidence_column() {
+        let header = "function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\tprovenance\n";
+        let manifest = RelocAliasManifest::parse(
+            format!("# reviewed\n{header}0x2000\t0x1000\t0x2010\ta$S\t0x4\t1\tarray end\n")
+                .as_bytes(),
+            Path::new("aliases.tsv"),
+        )
+        .unwrap();
+        let mut observed = RelocAliasObservations::default();
+        let alias = manifest
+            .resolve(0x2000, 0x1000, 0x2010, &mut observed)
+            .unwrap();
+        assert_eq!((alias.owner.as_bytes(), alias.addend), (&b"a$S"[..], 4));
+
+        for row in [
+            "0x2000\t0x1000\t0x2010\ta\t0\t1\t\n",
+            "0x2000\t0x1000\t0x2010\ta\t0\t1\tbad\x01\n",
+        ] {
+            let error = RelocAliasManifest::parse(
+                format!("{header}{row}").as_bytes(),
+                Path::new("aliases.tsv"),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("provenance"), "{error}");
+        }
+        let error = RelocAliasManifest::parse(
+            format!("{header}0x2000\t0x1000\t0x2010\ta\t0\t1\n").as_bytes(),
+            Path::new("aliases.tsv"),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("seven"), "{error}");
+    }
+
+    #[test]
+    fn rejects_non_unit_exact_site_occurrences() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2010\ta\t0\t2\n");
+        assert!(RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).is_err());
+    }
+
+    #[test]
+    fn validates_exact_site_membership() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x3010\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x20))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x3000, RawString::from(&b"b"[..]), Some(0x20))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_err());
+    }
+
+    #[test]
+    fn rejects_exact_site_field_crossing_next_function() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2ffe\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x1000))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x3000, RawString::from(&b"b"[..]), Some(0x20))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_err());
+    }
+
+    #[test]
+    fn exact_site_requires_a_procedure_extent() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2000\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), None)
+            .unwrap();
+        let error = manifest
+            .validate_site_membership(&symbols)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without a Procedure/Thunk extent"));
+    }
+
+    #[test]
+    fn exact_site_requires_an_existing_function() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2000\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let error = manifest
+            .validate_site_membership(&PdbSymbols::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("names missing function 0x2000"));
+    }
+
+    #[test]
+    fn exact_site_after_final_function_is_rejected() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x2010\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x10))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_err());
+    }
+
+    #[test]
+    fn exact_site_field_may_end_at_function_extent() {
+        let text = format!("{HEADER_TEXT}0x2000\t0x1000\t0x200c\ta\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x2000, RawString::from(&b"a"[..]), Some(0x10))
+            .unwrap();
+        assert!(manifest.validate_site_membership(&symbols).is_ok());
+    }
+
+    #[test]
+    fn exact_site_overrides_wildcard_for_mixed_midi_end_sentinels() {
+        let text = format!(
+            "{HEADER_TEXT}0xd3910\t0x134de0\t*\t?hSequence@@3PAPAU_SEQUENCE@@A\t0\t5\n\
+             0xd3910\t0x134de0\t0xd3aa5\t?pMIDIWrap@@3PAPAVMIDIWrap@@A\t0xf0\t1\n"
+        );
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut observed = RelocAliasObservations::default();
+        for site_rva in [0xd398a, 0xd39aa, 0xd39d9, 0xd39ee, 0xd3a32] {
+            assert_eq!(
+                manifest
+                    .resolve(0xd3910, 0x134de0, site_rva, &mut observed)
+                    .unwrap()
+                    .owner,
+                RawString::from(&b"?hSequence@@3PAPAU_SEQUENCE@@A"[..])
+            );
+        }
+        let exact = manifest
+            .resolve(0xd3910, 0x134de0, 0xd3aa5, &mut observed)
+            .unwrap();
+        assert_eq!(
+            exact.owner,
+            RawString::from(&b"?pMIDIWrap@@3PAPAVMIDIWrap@@A"[..])
+        );
+        assert_eq!(exact.addend, 0xf0);
+        assert!(manifest.validate_occurrences(&observed).is_ok());
+    }
+
+    #[test]
+    fn validates_observed_occurrence_count_per_selected_row() {
+        let text = format!(
+            "{HEADER_TEXT}0x2000\t0x1000\t*\ta\t0\t2\n\
+             0x2000\t0x1000\t0x2010\tb\t0\t1\n"
+        );
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let mut observed = RelocAliasObservations::default();
+        manifest.resolve(0x2000, 0x1000, 0x2008, &mut observed);
+        manifest.resolve(0x2000, 0x1000, 0x2010, &mut observed);
+        assert!(manifest.validate_occurrences(&observed).is_err());
+
+        // A site seen again, by another owner decoding the same body, counts once.
+        manifest.resolve(0x2000, 0x1000, 0x2008, &mut observed);
+        assert!(manifest.validate_occurrences(&observed).is_err());
+        manifest.resolve(0x2000, 0x1000, 0x200c, &mut observed);
+        manifest.validate_occurrences(&observed).unwrap();
+    }
+
+    #[test]
+    fn resolves_reviewed_function_alias_by_exact_site() {
+        let text = format!("{HEADER_TEXT}0x4a0f0\t0xe0130\t0x4a120\t__write\t0\t1\n");
+        let manifest =
+            RelocAliasManifest::parse(text.as_bytes(), Path::new("aliases.tsv")).unwrap();
+        let overloads = [
+            RawString::from(&b"__write"[..]),
+            RawString::from(&b"_write"[..]),
+        ];
+        let mut observed = RelocAliasObservations::default();
+        assert_eq!(
+            manifest
+                .resolve_function_alias(0x4a0f0, 0xe0130, 0x4a120, &overloads, &mut observed)
+                .unwrap(),
+            Some(RawString::from(&b"__write"[..]))
+        );
+        assert!(manifest.validate_occurrences(&observed).is_ok());
+    }
+}

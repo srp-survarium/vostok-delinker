@@ -1,36 +1,9 @@
-use nom::bytes::complete::{tag, take_till};
-use nom::character::complete::{line_ending, not_line_ending};
-use nom::combinator::{all_consuming, opt};
-use nom::multi::separated_list0;
-use nom::sequence::terminated;
-use nom::{IResult, Parser};
+use crate::manifest_tsv::{self, column, field};
 
 use std::collections::HashSet;
 use std::path::Path;
 
 const HEADER: &[u8] = b"site_rva\tkind";
-
-struct RelocRow<'a> {
-    site_rva: &'a [u8],
-    kind: &'a [u8],
-}
-
-fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
-    terminated(
-        separated_list0(line_ending, not_line_ending),
-        opt(line_ending),
-    )
-    .parse(input)
-}
-
-fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_till(|byte| byte == b'\t').parse(input)
-}
-
-fn manifest_row(input: &[u8]) -> IResult<&[u8], RelocRow<'_>> {
-    let (input, (site_rva, kind)) = (terminated(field, tag(&b"\t"[..])), field).parse(input)?;
-    Ok((input, RelocRow { site_rva, kind }))
-}
 
 /// Reviewed list of absolute (`dir32`) relocation sites, for an image whose
 /// `.reloc` directory is missing. Each row names the RVA of a 4-byte field that
@@ -53,63 +26,17 @@ impl RelocManifest {
     fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<Self> {
         let mut sites = Vec::new();
         let mut seen = HashSet::new();
-        let mut saw_header = false;
-
-        let (_, lines) = all_consuming(manifest_lines)
-            .parse(bytes)
-            .map_err(|_| anyhow::anyhow!("{}: invalid line ending", path.display()))?;
-
-        for (line_index, line) in lines.into_iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.is_empty() || line.starts_with(b"#") {
-                continue;
+        let ((), rows) = manifest_tsv::read(bytes, path, "reloc manifest", &[(HEADER, ())])?;
+        for row in rows {
+            let (site_rva, kind) = row.columns((column, field), "two")?;
+            if kind != b"dir32" {
+                anyhow::bail!("{row}: unsupported kind {}", String::from_utf8_lossy(kind));
             }
-            if !saw_header {
-                if line != HEADER {
-                    anyhow::bail!(
-                        "{}:{}: invalid reloc manifest header",
-                        path.display(),
-                        line_number
-                    );
-                }
-                saw_header = true;
-                continue;
-            }
-            if line == HEADER {
-                anyhow::bail!(
-                    "{}:{}: duplicate reloc manifest header",
-                    path.display(),
-                    line_number
-                );
-            }
-
-            let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
-                anyhow::anyhow!(
-                    "{}:{}: expected exactly two tab-separated columns",
-                    path.display(),
-                    line_number
-                )
-            })?;
-            match row.kind {
-                b"dir32" => {}
-                value => anyhow::bail!(
-                    "{}:{}: unsupported kind {}",
-                    path.display(),
-                    line_number,
-                    String::from_utf8_lossy(value)
-                ),
-            }
-            let site_rva = parse_number(row.site_rva).ok_or_else(|| {
-                anyhow::anyhow!("{}:{}: invalid site_rva", path.display(), line_number)
-            })?;
+            let site_rva = row.number("site_rva", site_rva)?;
             if !seen.insert(site_rva) {
-                anyhow::bail!("{}:{}: duplicate site RVA", path.display(), line_number);
+                anyhow::bail!("{row}: duplicate site RVA");
             }
             sites.push(site_rva);
-        }
-
-        if !saw_header {
-            anyhow::bail!("{}: missing reloc manifest header", path.display());
         }
         sites.sort_unstable();
         Ok(Self { sites })
@@ -118,17 +45,6 @@ impl RelocManifest {
     /// The reviewed site RVAs, ascending.
     pub fn sites(&self) -> &[usize] {
         &self.sites
-    }
-}
-
-fn parse_number(value: &[u8]) -> Option<usize> {
-    let value = std::str::from_utf8(value).ok()?;
-    match value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        Some(hex) => usize::from_str_radix(hex, 16).ok(),
-        None => value.parse().ok(),
     }
 }
 

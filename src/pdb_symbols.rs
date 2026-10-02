@@ -1,6 +1,6 @@
-use pdb2::{FallibleIterator, RawString};
+use pdb2::{FallibleIterator, RawString, TypeData, TypeIndex};
 
-use std::collections::{BTreeMap, btree_map};
+use std::collections::{BTreeMap, HashMap, btree_map};
 
 use crate::Env;
 use crate::utils::{ToUsize, leak};
@@ -8,10 +8,52 @@ use crate::utils::{ToUsize, leak};
 #[derive(Default)]
 pub struct PdbSymbols {
     pub functions: BTreeMap<usize, Vec<RawString<'static>>>,
+    function_extents: BTreeMap<usize, usize>,
+    incremental_trampolines: BTreeMap<usize, PdbIncrementalTrampoline>,
+    pub imports: BTreeMap<usize, RawString<'static>>,
+    /// Data records the PDB places in `.text`, by RVA.
+    pub text_data: BTreeMap<usize, RawString<'static>>,
     pub strings: BTreeMap<usize, (RawString<'static>, Vec<u8>)>,
 
-    pub constants: BTreeMap<usize, RawString<'static>>,
-    pub statics: BTreeMap<usize, RawString<'static>>,
+    pub constants: BTreeMap<usize, PdbDataSymbol>,
+    pub statics: BTreeMap<usize, PdbDataSymbol>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PdbIncrementalTrampoline {
+    target_rva: usize,
+    size: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FunctionRelocationField {
+    Within { function_rva: usize },
+    MissingFunction,
+    UnknownExtent,
+    OutsideExtent,
+    FieldOverflow,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PdbDataSymbol {
+    pub name: RawString<'static>,
+    size: Option<usize>,
+}
+
+impl PdbDataSymbol {
+    pub fn new(name: RawString<'static>, size: Option<usize>) -> Self {
+        Self { name, size }
+    }
+
+    pub fn contains(self, symbol_rva: usize, target_rva: usize) -> bool {
+        target_rva >= symbol_rva && self.size.is_none_or(|size| target_rva - symbol_rva < size)
+    }
+
+    fn fill_size_from(&mut self, other: Self) {
+        if self.size.is_none() {
+            self.size = other.size;
+        }
+    }
 }
 
 impl PdbSymbols {
@@ -20,14 +62,20 @@ impl PdbSymbols {
         S: pdb2::Source<'static> + 'static,
     {
         let mut this = Self::default();
+        let mut type_sizes = TypeSizeResolver::parse(pdb);
 
-        this.iterate_symbol_table(env)?;
-        this.iterate_modules(env, pdb)?;
+        this.iterate_symbol_table(env, &mut type_sizes)?;
+        this.iterate_modules(env, pdb, &mut type_sizes)?;
+        this.validate_incremental_trampolines(env)?;
 
         Ok(this)
     }
 
-    fn iterate_symbol_table(&mut self, env: &Env) -> anyhow::Result<()> {
+    fn iterate_symbol_table(
+        &mut self,
+        env: &Env,
+        type_sizes: &mut TypeSizeResolver,
+    ) -> anyhow::Result<()> {
         // Data symbols partially repeat Public symbols, but they also have unique symbols.
         //
         // Whenever available we would prefer Public symbols, since those are mangled and contain
@@ -36,6 +84,7 @@ impl PdbSymbols {
         // But we also want unique symbols.
         let mut static_data_symbols = vec![];
         let mut constant_data_symbols = vec![];
+        let mut import_data_symbols = vec![];
 
         let mut symbols = env.symbol_table.iter();
         while let Some(symbol) = symbols.next()? {
@@ -48,14 +97,31 @@ impl PdbSymbols {
             };
             let name = *name;
 
-            let symbol_rva = match () {
-                () if offset.section == env.text.id => env.text.rva + offset.offset.to_usize(),
-                () if offset.section == env.rdata.id => env.rdata.rva + offset.offset.to_usize(),
-                () if offset.section == env.data.id => env.data.rva + offset.offset.to_usize(),
-                _ => continue,
+            let symbol_rva = match env.iat_rva(*offset) {
+                Some(rva) => rva,
+                None => match () {
+                    () if offset.section == env.text.id => env.text.rva + offset.offset.to_usize(),
+                    () if offset.section == env.rdata.id => {
+                        env.rdata.rva + offset.offset.to_usize()
+                    }
+                    () if offset.section == env.data.id => env.data.rva + offset.offset.to_usize(),
+                    _ => continue,
+                },
             };
 
             match symbol {
+                pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
+                    if env.iat.is_some_and(|iat| iat.contains_rva(symbol_rva)) =>
+                {
+                    self.imports.entry(symbol_rva).or_insert(name);
+                }
+
+                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                    if env.iat.is_some_and(|iat| iat.contains_rva(symbol_rva)) =>
+                {
+                    import_data_symbols.push((symbol_rva, name));
+                }
+
                 // @NOTE: There are more symbols in `.text`, which are not functions.
                 // Seem to be useless though:
                 // 0x1cba96: __imp_load__CoInitialize@4
@@ -85,41 +151,60 @@ impl PdbSymbols {
                     // @TODO: There can be multiple symbols for the same constant name.
                     // While it makes sense to keep all of them and find closest,
                     // for now we simply keep one.
-                    let _old_symbol = self.constants.insert(symbol_rva, name);
+                    let _old_symbol = self
+                        .constants
+                        .insert(symbol_rva, PdbDataSymbol::new(name, None));
                 }
 
                 pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })
                     if offset.section == env.data.id =>
                 {
-                    let old_symbol = self.statics.insert(symbol_rva, name);
+                    let old_symbol = self
+                        .statics
+                        .insert(symbol_rva, PdbDataSymbol::new(name, None));
                     assert_eq!(old_symbol, None, "Static symbols cannot repeat");
                 }
 
-                // Unmangled data symbols to cover missing spots.
                 pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                    if offset.section == env.text.id =>
+                {
+                    self.text_data.entry(symbol_rva).or_insert(name);
+                }
+
+                // Unmangled data symbols to cover missing spots.
+                pdb2::SymbolData::Data(pdb2::DataSymbol { type_index, .. })
                     if offset.section == env.rdata.id =>
                 {
-                    constant_data_symbols.push((symbol_rva, name));
+                    constant_data_symbols.push((
+                        symbol_rva,
+                        PdbDataSymbol::new(name, type_sizes.extent_of(type_index)),
+                    ));
                 }
-                pdb2::SymbolData::Data(pdb2::DataSymbol { .. })
+                pdb2::SymbolData::Data(pdb2::DataSymbol { type_index, .. })
                     if offset.section == env.data.id =>
                 {
-                    static_data_symbols.push((symbol_rva, name));
+                    static_data_symbols.push((
+                        symbol_rva,
+                        PdbDataSymbol::new(name, type_sizes.extent_of(type_index)),
+                    ));
                 }
                 _ => {}
             }
         }
-        for (symbol_rva, name) in static_data_symbols {
+        for (symbol_rva, name) in import_data_symbols {
+            self.imports.entry(symbol_rva).or_insert(name);
+        }
+        for (symbol_rva, symbol) in static_data_symbols {
             match self.statics.entry(symbol_rva) {
-                btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
-                btree_map::Entry::Occupied(_) => (),
+                btree_map::Entry::Vacant(entry) => _ = entry.insert(symbol),
+                btree_map::Entry::Occupied(mut entry) => entry.get_mut().fill_size_from(symbol),
             }
         }
 
-        for (symbol_rva, name) in constant_data_symbols {
+        for (symbol_rva, symbol) in constant_data_symbols {
             match self.constants.entry(symbol_rva) {
-                btree_map::Entry::Vacant(entry) => _ = entry.insert(name),
-                btree_map::Entry::Occupied(_) => (),
+                btree_map::Entry::Vacant(entry) => _ = entry.insert(symbol),
+                btree_map::Entry::Occupied(mut entry) => entry.get_mut().fill_size_from(symbol),
             }
         }
 
@@ -131,6 +216,7 @@ impl PdbSymbols {
 
         env: &Env,
         pdb: &mut pdb2::PDB<'static, S>,
+        type_sizes: &mut TypeSizeResolver,
     ) -> anyhow::Result<()>
     where
         S: pdb2::Source<'static> + 'static,
@@ -148,13 +234,39 @@ impl PdbSymbols {
             while let Some(symbol) = iter.next()? {
                 match symbol.parse() {
                     Ok(pdb2::SymbolData::Procedure(pdb2::ProcedureSymbol {
-                        name, offset, ..
-                    })) => self.add_function_symbol(env, name, offset),
-                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol { name, offset, .. })) => {
-                        self.add_function_symbol(env, name, offset)
-                    }
+                        name,
+                        offset,
+                        len,
+                        ..
+                    })) => self.add_function_symbol(env, name, offset, len.to_usize())?,
+                    Ok(pdb2::SymbolData::Thunk(pdb2::ThunkSymbol {
+                        name, offset, len, ..
+                    })) => self.add_function_symbol(env, name, offset, len.to_usize())?,
 
-                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol { offset, name, .. })) => {
+                    Ok(pdb2::SymbolData::Trampoline(pdb2::TrampolineSymbol {
+                        tramp_type: pdb2::TrampolineType::Incremental,
+                        size,
+                        thunk,
+                        target,
+                    })) => self.add_incremental_trampoline(env, thunk, target, size.into())?,
+
+                    Ok(pdb2::SymbolData::Data(pdb2::DataSymbol {
+                        offset,
+                        name,
+                        type_index,
+                        ..
+                    })) => {
+                        if let Some(symbol_rva) = env.iat_rva(offset) {
+                            self.imports.entry(symbol_rva).or_insert(name);
+                            continue;
+                        }
+                        if offset.section == env.text.id {
+                            // Module records win over global ones, as for
+                            // statics: they are closer to the original symbol.
+                            self.text_data
+                                .insert(env.text.rva + offset.offset.to_usize(), name);
+                            continue;
+                        }
                         let symbol_rva = match () {
                             () if offset.section == env.rdata.id => {
                                 env.rdata.rva + offset.offset.to_usize()
@@ -165,18 +277,19 @@ impl PdbSymbols {
                             _ => continue,
                         };
 
-                        match () {
-                            () if offset.section == env.rdata.id => {
-                                let _old_symbol = self.constants.insert(symbol_rva, name);
-                            }
-                            () if offset.section == env.data.id => {
-                                // Prefer symbol names from modules.
-                                // As those are closer to the original symbols.
-                                // For comparison see: `survarium::damage_zone_cook::damage_zone_cook`.
-                                let _old_symbol = self.statics.insert(symbol_rva, name);
-                            }
+                        // Prefer symbol names from modules, as those are closer
+                        // to the original symbols, but keep a size only the
+                        // global record knows.
+                        let symbols = match () {
+                            () if offset.section == env.rdata.id => &mut self.constants,
+                            () if offset.section == env.data.id => &mut self.statics,
                             _ => continue,
                         };
+                        let mut symbol = PdbDataSymbol::new(name, type_sizes.extent_of(type_index));
+                        if let Some(global) = symbols.remove(&symbol_rva) {
+                            symbol.fill_size_from(global);
+                        }
+                        symbols.insert(symbol_rva, symbol);
                     }
 
                     Ok(pdb2::SymbolData::Public(pdb2::PublicSymbol { .. })) => {
@@ -197,11 +310,586 @@ impl PdbSymbols {
 
         name: RawString<'static>,
         offset: pdb2::PdbInternalSectionOffset,
-    ) {
+        size: usize,
+    ) -> anyhow::Result<()> {
         let symbol_rva = env.text.rva + offset.offset.to_usize();
 
         self.functions
             .entry(symbol_rva)
             .or_insert_with(|| vec![name]);
+        self.record_function_extent(symbol_rva, size)
+    }
+
+    pub(crate) fn record_function_extent(
+        &mut self,
+        symbol_rva: usize,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        symbol_rva
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("PDB function extent overflows RVA"))?;
+        match self.function_extents.entry(symbol_rva) {
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(size);
+            }
+            btree_map::Entry::Occupied(entry) if *entry.get() == size => {}
+            btree_map::Entry::Occupied(entry) => anyhow::bail!(
+                "PDB function records at RVA {symbol_rva:#x} disagree on size: {} and {size}",
+                entry.get()
+            ),
+        }
+        Ok(())
+    }
+
+    fn add_incremental_trampoline(
+        &mut self,
+        env: &Env,
+        thunk: pdb2::PdbInternalSectionOffset,
+        target: pdb2::PdbInternalSectionOffset,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        if thunk.section != env.text.id || target.section != env.text.id {
+            anyhow::bail!("PDB incremental trampoline is not contained in .text");
+        }
+        let thunk_rva = env
+            .text
+            .rva
+            .checked_add(thunk.offset.to_usize())
+            .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline RVA overflows"))?;
+        let target_rva = env
+            .text
+            .rva
+            .checked_add(target.offset.to_usize())
+            .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline target RVA overflows"))?;
+        self.add_incremental_trampoline_at_rva(thunk_rva, target_rva, size)
+    }
+
+    pub(crate) fn add_incremental_trampoline_at_rva(
+        &mut self,
+        thunk_rva: usize,
+        target_rva: usize,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let trampoline = PdbIncrementalTrampoline { target_rva, size };
+        match self.incremental_trampolines.entry(thunk_rva) {
+            btree_map::Entry::Vacant(entry) => {
+                entry.insert(trampoline);
+            }
+            btree_map::Entry::Occupied(entry) if *entry.get() == trampoline => {}
+            btree_map::Entry::Occupied(_) => {
+                anyhow::bail!("PDB incremental trampoline records at RVA {thunk_rva:#x} disagree")
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_incremental_trampolines(&mut self, env: &Env) -> anyhow::Result<()> {
+        self.validate_incremental_trampolines_in_text(env.text.rva, env.text.data)
+    }
+
+    pub(crate) fn validate_incremental_trampolines_in_text(
+        &mut self,
+        text_rva: usize,
+        text_data: &[u8],
+    ) -> anyhow::Result<()> {
+        const JMP_REL32: u8 = 0xe9;
+        const JMP_REL32_SIZE: usize = 5;
+
+        for (&thunk_rva, trampoline) in &self.incremental_trampolines {
+            if trampoline.size != JMP_REL32_SIZE {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} has unsupported size {}",
+                    trampoline.size
+                );
+            }
+            if self
+                .incremental_trampolines
+                .contains_key(&trampoline.target_rva)
+            {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} targets another trampoline"
+                );
+            }
+            // A library function compiled without debug information has only a
+            // public symbol; it is still a valid relocation target.
+            if !self.functions.contains_key(&trampoline.target_rva) {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} has no exact target function"
+                );
+            }
+            let offset = thunk_rva
+                .checked_sub(text_rva)
+                .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline precedes .text"))?;
+            let bytes = text_data
+                .get(offset..offset + JMP_REL32_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("PDB incremental trampoline exceeds .text"))?;
+            if bytes[0] != JMP_REL32 {
+                anyhow::bail!("PDB incremental trampoline at RVA {thunk_rva:#x} is not JMP rel32");
+            }
+            let displacement = i32::from_le_bytes(bytes[1..].try_into()?);
+            let decoded_target = i64::try_from(thunk_rva)?
+                .checked_add(i64::try_from(JMP_REL32_SIZE)?)
+                .and_then(|next| next.checked_add(i64::from(displacement)))
+                .and_then(|target| usize::try_from(target).ok())
+                .ok_or_else(|| anyhow::anyhow!("incremental trampoline target overflows RVA"))?;
+            if decoded_target != trampoline.target_rva {
+                anyhow::bail!(
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} disagrees with PE target"
+                );
+            }
+        }
+
+        for thunk_rva in self.incremental_trampolines.keys() {
+            self.functions.remove(thunk_rva);
+            self.function_extents.remove(thunk_rva);
+        }
+        Ok(())
+    }
+
+    pub fn resolve_incremental_trampoline(&self, target_rva: usize) -> usize {
+        self.incremental_trampolines
+            .get(&target_rva)
+            .map_or(target_rva, |trampoline| trampoline.target_rva)
+    }
+
+    pub fn is_incremental_trampoline(&self, rva: usize) -> bool {
+        self.incremental_trampolines.contains_key(&rva)
+    }
+
+    /// The linker-created incremental trampolines, by RVA.
+    pub fn incremental_trampoline_rvas(&self) -> impl Iterator<Item = usize> + '_ {
+        self.incremental_trampolines.keys().copied()
+    }
+
+    /// The `.text` data record starting at `rva`, unless it belongs to a
+    /// function: one starts there, or the extent of the function before it
+    /// covers it. A record inside a function (a switch table, a case label) is
+    /// part of that function's code. A function without a known extent is
+    /// taken to reach the next function.
+    pub fn data_outside_functions(&self, rva: usize) -> Option<RawString<'static>> {
+        let symbol = *self.text_data.get(&rva)?;
+        let inside = self.functions.contains_key(&rva)
+            || self
+                .functions
+                .range(..rva)
+                .next_back()
+                .is_some_and(|(start, _)| {
+                    self.function_extents
+                        .get(start)
+                        .is_none_or(|size| rva - start < *size)
+                });
+        (!inside).then_some(symbol)
+    }
+
+    /// The Procedure/Thunk length recorded for the function starting at `rva`.
+    pub fn function_extent(&self, rva: usize) -> Option<usize> {
+        self.function_extents.get(&rva).copied()
+    }
+
+    pub fn relocation_field_in_function(
+        &self,
+        function_rva: usize,
+        site_rva: usize,
+    ) -> FunctionRelocationField {
+        if !self.functions.contains_key(&function_rva) {
+            return FunctionRelocationField::MissingFunction;
+        }
+        let Some(size) = self.function_extents.get(&function_rva).copied() else {
+            return FunctionRelocationField::UnknownExtent;
+        };
+        let Some(site_end) = site_rva.checked_add(std::mem::size_of::<u32>()) else {
+            return FunctionRelocationField::FieldOverflow;
+        };
+        let Some(function_end) = function_rva.checked_add(size) else {
+            return FunctionRelocationField::FieldOverflow;
+        };
+        if function_rva <= site_rva && site_end <= function_end {
+            FunctionRelocationField::Within { function_rva }
+        } else {
+            FunctionRelocationField::OutsideExtent
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_function_at_rva(
+        &mut self,
+        symbol_rva: usize,
+        name: RawString<'static>,
+        size: Option<usize>,
+    ) -> anyhow::Result<()> {
+        self.functions.entry(symbol_rva).or_default().push(name);
+        if let Some(size) = size {
+            self.record_function_extent(symbol_rva, size)?;
+        }
+        Ok(())
+    }
+
+    pub fn relocation_field_owner(&self, site_rva: usize) -> FunctionRelocationField {
+        let Some((function_rva, _)) = self.functions.range(..=site_rva).next_back() else {
+            return FunctionRelocationField::MissingFunction;
+        };
+        self.relocation_field_in_function(*function_rva, site_rva)
+    }
+}
+
+/// Byte sizes of PDB types. A forward reference to a class or union takes the
+/// size of the complete definition of the same name.
+pub(crate) struct TypeSizeResolver {
+    finder: Option<pdb2::TypeFinder<'static>>,
+    complete_sizes: HashMap<&'static [u8], usize>,
+    cache: HashMap<TypeIndex, Option<usize>>,
+}
+
+impl TypeSizeResolver {
+    /// Index the TPI stream. A stream that is missing or fails to parse part
+    /// way leaves the types before the failure resolvable.
+    pub(crate) fn parse<S>(pdb: &mut pdb2::PDB<'static, S>) -> Self
+    where
+        S: pdb2::Source<'static> + 'static,
+    {
+        let mut this = Self {
+            finder: None,
+            complete_sizes: HashMap::new(),
+            cache: HashMap::new(),
+        };
+        let type_information = match pdb.type_information() {
+            Ok(type_information) => leak(type_information),
+            Err(error) => {
+                eprintln!("[warning] no PDB type sizes: {error}");
+                return this;
+            }
+        };
+        let mut finder = type_information.finder();
+        let mut iter = type_information.iter();
+        loop {
+            match iter.next() {
+                Ok(Some(typ)) => {
+                    finder.update(&iter);
+                    let (name, unique_name, size) = match typ.parse() {
+                        Ok(TypeData::Class(typ)) if !typ.properties.forward_reference() => {
+                            (typ.name, typ.unique_name, typ.size)
+                        }
+                        Ok(TypeData::Union(typ)) if !typ.properties.forward_reference() => {
+                            (typ.name, typ.unique_name, typ.size)
+                        }
+                        _ => continue,
+                    };
+                    let Some(size) = usize::try_from(size).ok().filter(|&size| size != 0) else {
+                        continue;
+                    };
+                    for name in std::iter::once(name).chain(unique_name) {
+                        this.complete_sizes.insert(name.as_bytes(), size);
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("[warning] PDB type sizes end at a malformed record: {error}");
+                    break;
+                }
+            }
+        }
+        this.finder = Some(finder);
+        this
+    }
+
+    /// The size of a data symbol's type, unless zero: an array the PDB records
+    /// without a bound says nothing about the symbol's extent.
+    fn extent_of(&mut self, index: TypeIndex) -> Option<usize> {
+        self.size_of(index).filter(|&size| size != 0)
+    }
+
+    /// The size the PDB records for a type; an array without a bound is zero.
+    pub(crate) fn size_of(&mut self, index: TypeIndex) -> Option<usize> {
+        if let Some(size) = self.cache.get(&index) {
+            return *size;
+        }
+
+        let Some(finder) = &self.finder else {
+            return None;
+        };
+
+        // A cycle through modifiers or aliases resolves to no size.
+        self.cache.insert(index, None);
+        let complete_size = |size: u64, name: RawString<'_>, unique_name: Option<RawString<'_>>| {
+            usize::try_from(size)
+                .ok()
+                .filter(|&size| size != 0)
+                .or_else(|| {
+                    unique_name
+                        .and_then(|name| self.complete_sizes.get(name.as_bytes()))
+                        .or_else(|| self.complete_sizes.get(name.as_bytes()))
+                        .copied()
+                })
+        };
+        let size = match finder.find(index).and_then(|typ| typ.parse()) {
+            Ok(TypeData::Primitive(typ)) => primitive_size(typ.kind, typ.indirection),
+            Ok(TypeData::Pointer(typ)) => {
+                let size = typ.attributes.size();
+                (size != 0).then_some(usize::from(size))
+            }
+            Ok(TypeData::Array(typ)) => typ.dimensions.last().map(|size| size.to_usize()),
+            Ok(TypeData::Class(typ)) => complete_size(typ.size, typ.name, typ.unique_name),
+            Ok(TypeData::Union(typ)) => complete_size(typ.size, typ.name, typ.unique_name),
+            Ok(TypeData::Modifier(typ)) => self.size_of(typ.underlying_type),
+            Ok(TypeData::Enumeration(typ)) => self.size_of(typ.underlying_type),
+            Ok(TypeData::Alias(typ)) => self.size_of(typ.underlying_type),
+            Ok(TypeData::Bitfield(typ)) => self.size_of(typ.underlying_type),
+            _ => None,
+        };
+        self.cache.insert(index, size);
+        size
+    }
+}
+
+pub(crate) fn primitive_size(
+    kind: pdb2::PrimitiveKind,
+    indirection: Option<pdb2::Indirection>,
+) -> Option<usize> {
+    if let Some(indirection) = indirection {
+        return match indirection {
+            pdb2::Indirection::Near16 => Some(2),
+            pdb2::Indirection::Far16 | pdb2::Indirection::Huge16 => Some(4),
+            pdb2::Indirection::Near32 => Some(4),
+            pdb2::Indirection::Far32 => Some(6),
+            pdb2::Indirection::Near64 => Some(8),
+            pdb2::Indirection::Near128 => Some(16),
+        };
+    }
+
+    match kind {
+        pdb2::PrimitiveKind::NoType | pdb2::PrimitiveKind::Void => None,
+        pdb2::PrimitiveKind::Char
+        | pdb2::PrimitiveKind::UChar
+        | pdb2::PrimitiveKind::RChar
+        | pdb2::PrimitiveKind::Char8
+        | pdb2::PrimitiveKind::I8
+        | pdb2::PrimitiveKind::U8
+        | pdb2::PrimitiveKind::Bool8 => Some(1),
+        pdb2::PrimitiveKind::WChar
+        | pdb2::PrimitiveKind::RChar16
+        | pdb2::PrimitiveKind::Short
+        | pdb2::PrimitiveKind::UShort
+        | pdb2::PrimitiveKind::I16
+        | pdb2::PrimitiveKind::U16
+        | pdb2::PrimitiveKind::F16
+        | pdb2::PrimitiveKind::Bool16 => Some(2),
+        pdb2::PrimitiveKind::RChar32
+        | pdb2::PrimitiveKind::Long
+        | pdb2::PrimitiveKind::ULong
+        | pdb2::PrimitiveKind::I32
+        | pdb2::PrimitiveKind::U32
+        | pdb2::PrimitiveKind::F32
+        | pdb2::PrimitiveKind::F32PP
+        | pdb2::PrimitiveKind::Bool32
+        | pdb2::PrimitiveKind::HRESULT => Some(4),
+        pdb2::PrimitiveKind::Quad
+        | pdb2::PrimitiveKind::UQuad
+        | pdb2::PrimitiveKind::I64
+        | pdb2::PrimitiveKind::U64
+        | pdb2::PrimitiveKind::F64
+        | pdb2::PrimitiveKind::Complex32
+        | pdb2::PrimitiveKind::Bool64 => Some(8),
+        pdb2::PrimitiveKind::F48 => Some(6),
+        pdb2::PrimitiveKind::F80 => Some(10),
+        pdb2::PrimitiveKind::Octa
+        | pdb2::PrimitiveKind::UOcta
+        | pdb2::PrimitiveKind::I128
+        | pdb2::PrimitiveKind::U128
+        | pdb2::PrimitiveKind::F128
+        | pdb2::PrimitiveKind::Complex64 => Some(16),
+        pdb2::PrimitiveKind::Complex80 => Some(20),
+        pdb2::PrimitiveKind::Complex128 => Some(32),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_incremental_trampoline_bytes_and_removes_linker_function() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1005, RawString::from(&b"linker-thunk"[..]), Some(5))
+            .unwrap();
+        symbols
+            .add_function_at_rva(0x1100, RawString::from(&b"body"[..]), Some(1))
+            .unwrap();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+
+        let mut text = vec![0; 0x101];
+        text[5..10].copy_from_slice(&[0xe9, 0xf6, 0x00, 0x00, 0x00]);
+        symbols
+            .validate_incremental_trampolines_in_text(0x1000, &text)
+            .unwrap();
+
+        assert_eq!(symbols.resolve_incremental_trampoline(0x1005), 0x1100);
+        assert_eq!(symbols.resolve_incremental_trampoline(0x1006), 0x1006);
+        assert!(!symbols.functions.contains_key(&0x1005));
+        assert!(!symbols.function_extents.contains_key(&0x1005));
+        assert!(symbols.functions.contains_key(&0x1100));
+    }
+
+    #[test]
+    fn rejects_incremental_trampoline_metadata_that_disagrees_with_the_image() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_function_at_rva(0x1100, RawString::from(&b"body"[..]), Some(1))
+            .unwrap();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let text = vec![0; 0x101];
+        assert!(
+            symbols
+                .validate_incremental_trampolines_in_text(0x1000, &text)
+                .unwrap_err()
+                .to_string()
+                .contains("is not JMP rel32")
+        );
+    }
+
+    #[test]
+    fn incremental_trampoline_needs_a_function_symbol_at_its_target() {
+        let mut text = vec![0; 0x101];
+        text[5..10].copy_from_slice(&[0xe9, 0xf6, 0x00, 0x00, 0x00]);
+
+        let mut public_only = PdbSymbols::default();
+        public_only
+            .add_function_at_rva(0x1100, RawString::from(&b"public-only"[..]), None)
+            .unwrap();
+        public_only
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        public_only
+            .validate_incremental_trampolines_in_text(0x1000, &text)
+            .unwrap();
+        assert_eq!(public_only.resolve_incremental_trampoline(0x1005), 0x1100);
+
+        let mut unnamed = PdbSymbols::default();
+        unnamed
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let error = unnamed
+            .validate_incremental_trampolines_in_text(0x1000, &text)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no exact target function"));
+    }
+
+    #[test]
+    fn rejects_conflicting_incremental_trampoline_records() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let error = symbols
+            .add_incremental_trampoline_at_rva(0x1005, 0x1200, 5)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("records at RVA 0x1005 disagree"));
+    }
+
+    #[test]
+    fn duplicate_function_records_must_agree_on_extent() {
+        let mut symbols = PdbSymbols::default();
+        symbols.record_function_extent(0x1000, 0x20).unwrap();
+        let error = symbols
+            .record_function_extent(0x1000, 0x24)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("RVA 0x1000 disagree on size: 32 and 36"));
+    }
+
+    #[test]
+    fn relocation_field_requires_a_known_complete_function_extent() {
+        let mut symbols = PdbSymbols::default();
+        symbols
+            .functions
+            .entry(0x1000)
+            .or_default()
+            .push(RawString::from(&b"known"[..]));
+        symbols.record_function_extent(0x1000, 0x10).unwrap();
+        symbols
+            .functions
+            .entry(0x2000)
+            .or_default()
+            .push(RawString::from(&b"public_only"[..]));
+
+        assert_eq!(
+            symbols.relocation_field_owner(0x100c),
+            FunctionRelocationField::Within {
+                function_rva: 0x1000
+            }
+        );
+        assert_eq!(
+            symbols.relocation_field_owner(0x100d),
+            FunctionRelocationField::OutsideExtent
+        );
+        assert_eq!(
+            symbols.relocation_field_owner(0x1010),
+            FunctionRelocationField::OutsideExtent
+        );
+        assert_eq!(
+            symbols.relocation_field_owner(0x2000),
+            FunctionRelocationField::UnknownExtent
+        );
+        assert_eq!(
+            symbols.relocation_field_in_function(0x3000, 0x3000),
+            FunctionRelocationField::MissingFunction
+        );
+        assert_eq!(
+            symbols.relocation_field_in_function(0x1000, usize::MAX - 2),
+            FunctionRelocationField::FieldOverflow
+        );
+    }
+
+    #[test]
+    fn known_data_size_rejects_the_end_boundary() {
+        let symbol = PdbDataSymbol::new(RawString::from(&b"table"[..]), Some(8));
+        assert!(symbol.contains(0x1000, 0x1000));
+        assert!(symbol.contains(0x1000, 0x1007));
+        assert!(!symbol.contains(0x1000, 0x0fff));
+        assert!(!symbol.contains(0x1000, 0x1008));
+    }
+
+    #[test]
+    fn unknown_data_size_does_not_restrict_the_fallback() {
+        let symbol = PdbDataSymbol::new(RawString::from(&b"table"[..]), None);
+        assert!(symbol.contains(0x1000, 0x1000));
+        assert!(symbol.contains(0x1000, 0x2000));
+    }
+
+    #[test]
+    fn data_record_adds_size_without_replacing_public_name() {
+        let mut public = PdbDataSymbol::new(RawString::from(&b"?table@@3PAHA"[..]), None);
+        let data = PdbDataSymbol::new(RawString::from(&b"table"[..]), Some(16));
+        public.fill_size_from(data);
+        assert_eq!(public.name.as_bytes(), b"?table@@3PAHA");
+        assert!(public.contains(0x1000, 0x100f));
+        assert!(!public.contains(0x1000, 0x1010));
+    }
+
+    #[test]
+    fn codeview_complex_sizes_cover_both_components() {
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex32, None),
+            Some(8)
+        );
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex64, None),
+            Some(16)
+        );
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex80, None),
+            Some(20)
+        );
+        assert_eq!(
+            primitive_size(pdb2::PrimitiveKind::Complex128, None),
+            Some(32)
+        );
     }
 }
