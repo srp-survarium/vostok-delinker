@@ -13,6 +13,10 @@ use std::path::Path;
 
 const HEADER: &[u8] = b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences";
 
+/// The same rows, each stating the evidence for its spelling.
+const PROVENANCE_HEADER: &[u8] =
+    b"function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\tprovenance";
+
 #[derive(Clone, Copy, Debug)]
 struct ManifestRow<'a> {
     function_rva: &'a [u8],
@@ -21,6 +25,7 @@ struct ManifestRow<'a> {
     owner: &'a [u8],
     addend: &'a [u8],
     occurrences: &'a [u8],
+    provenance: Option<&'a [u8]>,
 }
 
 fn manifest_lines(input: &[u8]) -> IResult<&[u8], Vec<&[u8]>> {
@@ -35,25 +40,40 @@ fn field(input: &[u8]) -> IResult<&[u8], &[u8]> {
     take_till(|byte| byte == b'\t').parse(input)
 }
 
+fn column(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    terminated(field, tag(&b"\t"[..])).parse(input)
+}
+
 fn manifest_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
-    let (input, fields) = (
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        terminated(field, tag(&b"\t"[..])),
-        field,
-    )
-        .parse(input)?;
+    let (input, (function_rva, target_rva, site_rva, owner, addend, occurrences)) =
+        (column, column, column, column, column, field).parse(input)?;
     Ok((
         input,
         ManifestRow {
-            function_rva: fields.0,
-            target_rva: fields.1,
-            site_rva: fields.2,
-            owner: fields.3,
-            addend: fields.4,
-            occurrences: fields.5,
+            function_rva,
+            target_rva,
+            site_rva,
+            owner,
+            addend,
+            occurrences,
+            provenance: None,
+        },
+    ))
+}
+
+fn provenance_row(input: &[u8]) -> IResult<&[u8], ManifestRow<'_>> {
+    let (input, (function_rva, target_rva, site_rva, owner, addend, occurrences, provenance)) =
+        (column, column, column, column, column, column, field).parse(input)?;
+    Ok((
+        input,
+        ManifestRow {
+            function_rva,
+            target_rva,
+            site_rva,
+            owner,
+            addend,
+            occurrences,
+            provenance: Some(provenance),
         },
     ))
 }
@@ -103,46 +123,63 @@ impl RelocAliasManifest {
         Self::parse(&std::fs::read(path)?, path)
     }
 
-    fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn parse(bytes: &[u8], path: &Path) -> anyhow::Result<Self> {
         let (_, lines) = all_consuming(manifest_lines)
             .parse(bytes)
             .map_err(|_| anyhow::anyhow!("{}: invalid line ending", path.display()))?;
         let mut aliases = BTreeMap::new();
-        let mut saw_header = false;
+        let mut with_provenance = None;
 
         for (line_index, line) in lines.into_iter().enumerate() {
             let line_number = line_index + 1;
             if line.is_empty() || line.starts_with(b"#") {
                 continue;
             }
-            if !saw_header {
-                if line != HEADER {
+            let is_header = line == HEADER || line == PROVENANCE_HEADER;
+            let Some(with_provenance) = with_provenance else {
+                if !is_header {
                     anyhow::bail!(
                         "{}:{}: invalid relocation alias manifest header",
                         path.display(),
                         line_number
                     );
                 }
-                saw_header = true;
+                with_provenance = Some(line == PROVENANCE_HEADER);
                 continue;
-            }
-            if line == HEADER {
+            };
+            if is_header {
                 anyhow::bail!(
                     "{}:{}: duplicate relocation alias manifest header",
                     path.display(),
                     line_number
                 );
             }
-            let (_, row) = all_consuming(manifest_row).parse(line).map_err(|_| {
+            let row = if with_provenance {
+                all_consuming(provenance_row).parse(line)
+            } else {
+                all_consuming(manifest_row).parse(line)
+            }
+            .map(|(_, row)| row)
+            .map_err(|_| {
                 anyhow::anyhow!(
-                    "{}:{}: expected exactly six tab-separated columns",
+                    "{}:{}: expected exactly {} tab-separated columns",
                     path.display(),
-                    line_number
+                    line_number,
+                    if with_provenance { "seven" } else { "six" }
                 )
             })?;
             if row.owner.is_empty() || row.owner.iter().any(|byte| byte.is_ascii_control()) {
                 anyhow::bail!(
                     "{}:{}: relocation owner must be non-empty printable bytes",
+                    path.display(),
+                    line_number
+                );
+            }
+            if let Some(provenance) = row.provenance
+                && (provenance.is_empty() || provenance.iter().any(|byte| byte.is_ascii_control()))
+            {
+                anyhow::bail!(
+                    "{}:{}: provenance must be non-empty printable text",
                     path.display(),
                     line_number
                 );
@@ -189,7 +226,7 @@ impl RelocAliasManifest {
                 );
             }
         }
-        if !saw_header {
+        if with_provenance.is_none() {
             anyhow::bail!(
                 "{}: missing relocation alias manifest header",
                 path.display()
@@ -354,6 +391,44 @@ mod tests {
         assert!(RelocAliasManifest::parse(duplicate.as_bytes(), Path::new("aliases.tsv")).is_err());
         let extra = format!("{HEADER_TEXT}0x2000\t0x1000\t*\ta\t0\t1\textra\n");
         assert!(RelocAliasManifest::parse(extra.as_bytes(), Path::new("aliases.tsv")).is_err());
+    }
+
+    #[test]
+    fn provenance_header_adds_a_required_evidence_column() {
+        let header = "function_rva\ttarget_rva\tsite_rva\towner\taddend\toccurrences\tprovenance\n";
+        let manifest = RelocAliasManifest::parse(
+            format!("# reviewed\n{header}0x2000\t0x1000\t0x2010\ta$S\t0x4\t1\tarray end\n")
+                .as_bytes(),
+            Path::new("aliases.tsv"),
+        )
+        .unwrap();
+        let mut observed = RelocAliasObservations::default();
+        let alias = manifest
+            .resolve(0x2000, 0x1000, 0x2010, &mut observed)
+            .unwrap();
+        assert_eq!((alias.owner.as_bytes(), alias.addend), (&b"a$S"[..], 4));
+
+        for row in [
+            "0x2000\t0x1000\t0x2010\ta\t0\t1\t\n",
+            "0x2000\t0x1000\t0x2010\ta\t0\t1\tbad\x01\n",
+        ] {
+            let error = RelocAliasManifest::parse(
+                format!("{header}{row}").as_bytes(),
+                Path::new("aliases.tsv"),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+            assert!(error.contains("provenance"), "{error}");
+        }
+        let error = RelocAliasManifest::parse(
+            format!("{header}0x2000\t0x1000\t0x2010\ta\t0\t1\n").as_bytes(),
+            Path::new("aliases.tsv"),
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("seven"), "{error}");
     }
 
     #[test]
