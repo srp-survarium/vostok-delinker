@@ -96,7 +96,11 @@ pub enum RelocationEncoding {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ManifestCoverage {
-    AllowPartial,
+    /// Recover an uncovered target from the nearest PDB symbol, unless that
+    /// symbol's name starts with one of the fence prefixes.
+    AllowPartial {
+        fences: &'static [Vec<u8>],
+    },
     RequireComplete,
 }
 
@@ -324,8 +328,10 @@ pub(crate) fn classify_exact_pdb_target<'s>(
         );
     }
 
-    if let ExactPdbDataTarget::Constant { symbol } | ExactPdbDataTarget::Static { symbol } = exact {
-        refuse_unprovisioned(symbol, reloc_rva, target_rva)?;
+    if let ExactPdbDataTarget::Constant { symbol } | ExactPdbDataTarget::Static { symbol } = exact
+        && let ManifestCoverage::AllowPartial { fences } = manifest_coverage
+    {
+        refuse_fence(fences, symbol, reloc_rva, target_rva)?;
     }
     let kind = match exact {
         ExactPdbDataTarget::ConstantString { symbol, data } => {
@@ -369,22 +375,23 @@ fn provisional_owner(
         })
 }
 
-/// A PDB synthesizer can place a fence symbol named `UNPROVISIONED_...` at a
-/// relocation target it knows the original identity of but cannot yet spell,
-/// so that nearest-symbol recovery cannot misattribute the address to a
-/// neighbour. Emitting the fence would invent an identity; fail instead.
-const UNPROVISIONED_PREFIX: &[u8] = b"UNPROVISIONED_";
-
-fn refuse_unprovisioned(
+/// A PDB synthesizer can place a fence symbol at a relocation target whose
+/// original identity it knows exists but cannot yet spell, so that
+/// nearest-symbol recovery cannot attribute the address to a neighbour.
+/// Emitting the fence would invent an identity; fail instead.
+fn refuse_fence(
+    fences: &[Vec<u8>],
     symbol: RawString<'_>,
     reloc_rva: usize,
     target_rva: usize,
 ) -> anyhow::Result<()> {
-    if symbol.as_bytes().starts_with(UNPROVISIONED_PREFIX) {
+    if fences
+        .iter()
+        .any(|prefix| symbol.as_bytes().starts_with(prefix))
+    {
         anyhow::bail!(
             "relocation at RVA {reloc_rva:#x} targets data RVA {target_rva:#x}, which resolves \
-             only to the fence {symbol}; provide its identity in the data manifest or the \
-             relocation alias manifest"
+             only to the fence {symbol}; the data manifest must provide its identity"
         );
     }
     Ok(())
@@ -946,7 +953,7 @@ fn resolve_absolute_site<'s>(
                          RVA {target_rva:#x}, which is not covered by the data manifest"
                     );
                 }
-                (ManifestCoverage::AllowPartial, None) => {
+                (ManifestCoverage::AllowPartial { fences }, None) => {
                     match symbols.strings.range(..=target_rva).next_back() {
                         Some((string_rva, (string_mangled_name, string)))
                             if target_rva - string_rva < string.len() =>
@@ -973,7 +980,7 @@ fn resolve_absolute_site<'s>(
                             if !constant.contains(*constant_rva, target_rva) {
                                 out_of_extent.constants += 1;
                             }
-                            refuse_unprovisioned(constant.name, reloc_rva, target_rva)?;
+                            refuse_fence(fences, constant.name, reloc_rva, target_rva)?;
                             let diff = u32::try_from(target_rva - *constant_rva)?;
                             coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
@@ -1048,7 +1055,7 @@ fn resolve_absolute_site<'s>(
                          RVA {target_rva:#x}, which is not covered by the data manifest"
                     );
                 }
-                (ManifestCoverage::AllowPartial, None) => {
+                (ManifestCoverage::AllowPartial { fences }, None) => {
                     let Some((static_rva, static_symbol)) =
                         symbols.statics.range(..=target_rva).next_back()
                     else {
@@ -1061,7 +1068,7 @@ fn resolve_absolute_site<'s>(
                     if !static_symbol.contains(*static_rva, target_rva) {
                         out_of_extent.statics += 1;
                     }
-                    refuse_unprovisioned(static_symbol.name, reloc_rva, target_rva)?;
+                    refuse_fence(fences, static_symbol.name, reloc_rva, target_rva)?;
                     let diff = u32::try_from(target_rva - *static_rva)?;
                     coff_data_reloc.copy_from_slice(&diff.to_le_bytes());
 
@@ -1204,7 +1211,7 @@ mod tests {
             &manifest,
             &aliases,
             &mut observed,
-            ManifestCoverage::AllowPartial,
+            ManifestCoverage::AllowPartial { fences: &[] },
             WritableExtent::all_initialized(),
             0x1000,
             0x1010,
@@ -1217,7 +1224,7 @@ mod tests {
             &manifest,
             &aliases,
             &mut observed,
-            ManifestCoverage::AllowPartial,
+            ManifestCoverage::AllowPartial { fences: &[] },
             WritableExtent::all_initialized(),
             0x1000,
             0x1012,
@@ -1234,7 +1241,7 @@ mod tests {
             &manifest,
             &aliases,
             &mut observed,
-            ManifestCoverage::AllowPartial,
+            ManifestCoverage::AllowPartial { fences: &[] },
             WritableExtent::all_initialized(),
             0x1000,
             0x1014,
@@ -1248,7 +1255,7 @@ mod tests {
                 &manifest,
                 &aliases,
                 &mut observed,
-                ManifestCoverage::AllowPartial,
+                ManifestCoverage::AllowPartial { fences: &[] },
                 WritableExtent::all_initialized(),
                 0x1000,
                 0x1018,
@@ -1364,8 +1371,10 @@ mod tests {
     }
 
     #[test]
-    fn unprovisioned_fences_are_refused_and_other_names_pass() {
-        let error = refuse_unprovisioned(
+    fn fence_symbols_are_refused_and_other_names_pass() {
+        let fences: &'static [Vec<u8>] = Box::leak(Box::new([b"UNPROVISIONED_".to_vec()]));
+        let error = refuse_fence(
+            fences,
             RawString::from(&b"UNPROVISIONED_00653c34"[..]),
             0x1010,
             0x253c34,
@@ -1378,8 +1387,17 @@ mod tests {
         );
         assert!(error.contains("UNPROVISIONED_00653c34"), "{error}");
         for name in [&b"DAT_005f0af0"[..], b"?g_cmdBitTable@@3PBGB"] {
-            assert!(refuse_unprovisioned(RawString::from(name), 0x1010, 0x1f0af0).is_ok());
+            assert!(refuse_fence(fences, RawString::from(name), 0x1010, 0x1f0af0).is_ok());
         }
+        assert!(
+            refuse_fence(
+                &[],
+                RawString::from(&b"UNPROVISIONED_00653c34"[..]),
+                0x1010,
+                0x253c34
+            )
+            .is_ok()
+        );
 
         let mut symbols = pdb_symbols::PdbSymbols::default();
         symbols.statics.insert(
@@ -1391,7 +1409,7 @@ mod tests {
             &DataManifest::default(),
             &RelocAliasManifest::default(),
             &mut RelocAliasObservations::default(),
-            ManifestCoverage::AllowPartial,
+            ManifestCoverage::AllowPartial { fences },
             WritableExtent::all_initialized(),
             0x1000,
             0x1010,

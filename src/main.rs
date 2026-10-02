@@ -97,6 +97,12 @@ pub struct Cli {
     #[arg(long, conflicts_with = "strict")]
     pub recover_data_relocs_from_pdb: bool,
 
+    /// Refuse to recover a data relocation through a PDB symbol whose name
+    /// starts with this prefix: a fence that a PDB synthesizer placed where it
+    /// knows an identity exists but cannot yet spell it. Repeatable.
+    #[arg(long, value_name = "PREFIX", conflicts_with = "strict")]
+    pub fence_prefix: Vec<String>,
+
     /// Reviewed list of absolute relocation sites (`site_rva`, `kind`), for an
     /// image whose `.reloc` directory is missing. Combines with
     /// `--rediscover-relocations-from-pdb`: manifest sites are authoritative and
@@ -189,6 +195,7 @@ fn main() -> anyhow::Result<()> {
         reloc_alias_manifest,
         strict,
         recover_data_relocs_from_pdb: _,
+        fence_prefix,
         reloc_manifest,
         rediscover_relocations_from_pdb,
         rediscovery_interior_bound,
@@ -228,7 +235,13 @@ fn main() -> anyhow::Result<()> {
     let manifest_coverage = if strict {
         relocs::ManifestCoverage::RequireComplete
     } else {
-        relocs::ManifestCoverage::AllowPartial
+        relocs::ManifestCoverage::AllowPartial {
+            fences: fence_prefix
+                .into_iter()
+                .map(String::into_bytes)
+                .collect::<Vec<_>>()
+                .leak(),
+        }
     };
 
     process_executable(
