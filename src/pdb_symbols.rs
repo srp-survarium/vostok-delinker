@@ -413,9 +413,11 @@ impl PdbSymbols {
                     "PDB incremental trampoline at RVA {thunk_rva:#x} targets another trampoline"
                 );
             }
-            if !self.function_extents.contains_key(&trampoline.target_rva) {
+            // A library function compiled without debug information has only a
+            // public symbol; it is still a valid relocation target.
+            if !self.functions.contains_key(&trampoline.target_rva) {
                 anyhow::bail!(
-                    "PDB incremental trampoline at RVA {thunk_rva:#x} has no exact target procedure"
+                    "PDB incremental trampoline at RVA {thunk_rva:#x} has no exact target function"
                 );
             }
             let offset = thunk_rva
@@ -455,6 +457,11 @@ impl PdbSymbols {
 
     pub fn is_incremental_trampoline(&self, rva: usize) -> bool {
         self.incremental_trampolines.contains_key(&rva)
+    }
+
+    /// The linker-created incremental trampolines, by RVA.
+    pub fn incremental_trampoline_rvas(&self) -> impl Iterator<Item = usize> + '_ {
+        self.incremental_trampolines.keys().copied()
     }
 
     /// The `.text` data record starting at `rva`, unless a function's extent
@@ -708,22 +715,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incremental_trampoline_to_public_symbol_without_procedure() {
-        let mut symbols = PdbSymbols::default();
-        symbols
-            .add_function_at_rva(0x1100, RawString::from(&b"public-only"[..]), None)
-            .unwrap();
-        symbols
-            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
-            .unwrap();
+    fn incremental_trampoline_needs_a_function_symbol_at_its_target() {
         let mut text = vec![0; 0x101];
         text[5..10].copy_from_slice(&[0xe9, 0xf6, 0x00, 0x00, 0x00]);
 
-        let error = symbols
+        let mut public_only = PdbSymbols::default();
+        public_only
+            .add_function_at_rva(0x1100, RawString::from(&b"public-only"[..]), None)
+            .unwrap();
+        public_only
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        public_only
+            .validate_incremental_trampolines_in_text(0x1000, &text)
+            .unwrap();
+        assert_eq!(public_only.resolve_incremental_trampoline(0x1005), 0x1100);
+
+        let mut unnamed = PdbSymbols::default();
+        unnamed
+            .add_incremental_trampoline_at_rva(0x1005, 0x1100, 5)
+            .unwrap();
+        let error = unnamed
             .validate_incremental_trampolines_in_text(0x1000, &text)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("has no exact target procedure"));
+        assert!(error.contains("has no exact target function"));
     }
 
     #[test]

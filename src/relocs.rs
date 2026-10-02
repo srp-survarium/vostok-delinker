@@ -10,7 +10,7 @@ use pdb2::RawString;
 use object::LittleEndian;
 use object::{Object, ObjectSection};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Copy, Clone, Debug)]
 pub enum RelocKind<'a> {
@@ -739,6 +739,18 @@ fn rediscover_absolute_sites_from_pdb<'s>(
         .chain(symbols.strings.keys())
         .copied()
         .collect();
+    // Named import slots and incremental trampolines are known only exactly:
+    // `call [__imp_X]` and a function pointer through the incremental-link
+    // table hold them. Another IAT slot has no name to give.
+    let exact = symbols
+        .imports
+        .keys()
+        .copied()
+        .chain(symbols.incremental_trampoline_rvas())
+        .collect::<BTreeSet<_>>();
+    let unnamed_import = |target_rva: usize| {
+        !exact.contains(&target_rva) && env.iat.is_some_and(|iat| iat.contains_rva(target_rva))
+    };
     starts.sort_unstable();
     starts.dedup();
 
@@ -752,7 +764,9 @@ fn rediscover_absolute_sites_from_pdb<'s>(
         while site + 4 <= end {
             let value = u32::from_le_bytes(exe_data[site..site + 4].try_into().unwrap()) as usize;
             if value >= image_base
-                && rediscovered_target_is_known(&starts, value - image_base, interior_bound)
+                && (exact.contains(&(value - image_base))
+                    || rediscovered_target_is_known(&starts, value - image_base, interior_bound)
+                        && !unnamed_import(value - image_base))
                 && !relocs_rva.contains_key(&site)
             {
                 resolve_absolute_site(
