@@ -1,5 +1,3 @@
-#![feature(os_string_truncate)]
-
 mod common_symbol_manifest;
 mod data_index;
 mod data_manifest;
@@ -8,6 +6,7 @@ mod manifest_tsv;
 mod missing_data_index;
 mod object_files;
 mod pdb_symbols;
+mod plan;
 mod reloc_alias_manifest;
 mod reloc_manifest;
 mod relocs;
@@ -360,7 +359,11 @@ fn process_executable<S: pdb2::Source<'static> + 'static>(
         code_relocation_recovery,
     )?;
     reloc_alias_manifest.validate_occurrences(&observed_aliases)?;
-    object_files.write(output_path)?;
+    let plans = object_files.into_plans();
+    plan::write_objects(
+        plans.iter().map(|(object, plan)| (*object, plan)),
+        output_path,
+    )?;
 
     // Target side: record the choices base will later try to reproduce.
     if let Some(path) = write_symbol_map {
